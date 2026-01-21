@@ -1,6 +1,6 @@
 # ProtoScript — ES1 Deviations Only
 
-This document lists only the remaining deviations from ECMA-262 Edition 1.
+This document lists only the remaining deviations from [ECMA-262 Edition 1](ECMA-262_1st_edition_june_1997.pdf).
 
 ## 1. String model (UTF-8 / glyphs)
 
@@ -22,7 +22,7 @@ Full `arguments` <-> parameter aliasing is enabled only when
 `PS_ENABLE_ARGUMENTS_ALIASING=1`. The default is `PS_ENABLE_ARGUMENTS_ALIASING=0`,
 set in `include/ps_config.h`.
 
-## 4. eval / with flags
+## 4. `eval` / `with` flags
 
 `eval` and `with` exist but are compile-time configurable. The defaults are
 `PS_ENABLE_EVAL=0` and `PS_ENABLE_WITH=0`, set in `include/ps_config.h`. When

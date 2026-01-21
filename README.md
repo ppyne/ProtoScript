@@ -1,19 +1,19 @@
 # ProtoScript
 
-ProtoScript est une réimplémentation en C d’un cœur ECMAScript 1, conçue comme un langage de script minimal et embarquable.
+ProtoScript is a C reimplementation of an ECMAScript 1 core, designed as a minimal, embeddable scripting language.
 
-Le moteur adopte une sémantique Unicode basée sur des glyphes (UTF-8), et non sur UTF-16.
-ProtoScript ne vise pas la compatibilité JavaScript moderne ni le navigateur.
+The engine uses a glyph-based Unicode model (UTF-8), not UTF-16.
+ProtoScript does not aim for modern JavaScript or browser compatibility.
 
-## Exemples
+## Examples
 
-Exécuter un exemple:
+Run an example:
 
 ```sh
 ./protoscript examples/hello.js
 ```
 
-Utilisation (fichier ou stdin):
+Usage (file or stdin):
 
 ```sh
 ./protoscript script.js
@@ -23,7 +23,7 @@ echo 'Io.print("Hello world");'| ./protoscript
 ./protoscript - < script.js
 ```
 
-Autres exemples:
+Other examples:
 
 - `examples/basics.js`
 - `examples/arrays.js`

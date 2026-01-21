@@ -251,3 +251,27 @@ Limitations:
 - No `toJSON` hook.
 - Circular structures throw a `TypeError`.
 - Non-finite numbers stringify as `null`.
+
+---
+
+## Io module
+
+ProtoScript exposes a host `Io` module for synchronous, explicit I/O.
+
+```js
+var path = Io.tempPath();
+var f = Io.open(path, "w");
+Io.writeLine(f, "hello");
+Io.close(f);
+```
+
+Core operations:
+- `Io.open(path, mode)` with `"r"`, `"w"`, `"a"`.
+- `Io.read(file)` to read the rest of a file.
+- `Io.readLines(file)` to read lines split on `Io.EOL` (`"\n"`).
+- `Io.write(file, data)` and `Io.writeLine(file, data)`.
+- `Io.close(file)` to release resources.
+- `Io.print(string)` writes to `Io.stdout` without an implicit newline.
+
+Standard streams:
+- `Io.stdin`, `Io.stdout`, `Io.stderr` are always open and cannot be closed.

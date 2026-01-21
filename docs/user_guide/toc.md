@@ -102,6 +102,7 @@ This document is the **main table of contents** for the ProtoScript documentatio
   - [RegExp](working_with_objects.md#predefined-core-objects)
   - [String](working_with_objects.md#string)
   - [JSON](working_with_objects.md#json)
+  - [Io module](working_with_objects.md#io-module)
 
 ### [Chapter 8 — Object Model and Prototypes](object_model_and_prototypes.md)
 - [Class-based vs. prototype-based languages](object_model_and_prototypes.md#class-based-vs-prototype-based-languages)
@@ -117,4 +118,3 @@ This document is the **main table of contents** for the ProtoScript documentatio
 
 - [ProtoScript Glossary](glossary.md)
 - [Index](index.md)
-

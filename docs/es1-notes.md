@@ -30,7 +30,7 @@ disabled, attempting to use them is rejected.
 
 ## 5. Host extension
 
-`Io.print` is a non-standard host extension.
+The `Io` module (print + file/stream I/O) is a non-standard host extension.
 
 ## 6. ES2015 default parameters
 

@@ -2,6 +2,7 @@
 #include "ps_env.h"
 #include "ps_ast.h"
 #include "ps_string.h"
+#include "ps_gc.h"
 
 #include <stdlib.h>
 
@@ -9,7 +10,7 @@ PSObject *ps_function_new_native(PSNativeFunc fn) {
     PSObject *obj = ps_object_new(NULL);
     if (!obj) return NULL;
 
-    PSFunction *func = (PSFunction *)calloc(1, sizeof(PSFunction));
+    PSFunction *func = (PSFunction *)ps_gc_alloc(PS_GC_FUNCTION, sizeof(PSFunction));
     if (!func) {
         ps_object_free(obj);
         return NULL;
@@ -30,7 +31,7 @@ PSObject *ps_function_new_script(PSAstNode **params,
     PSObject *obj = ps_object_new(NULL);
     if (!obj) return NULL;
 
-    PSFunction *func = (PSFunction *)calloc(1, sizeof(PSFunction));
+    PSFunction *func = (PSFunction *)ps_gc_alloc(PS_GC_FUNCTION, sizeof(PSFunction));
     if (!func) {
         ps_object_free(obj);
         return NULL;

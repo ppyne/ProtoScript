@@ -9,6 +9,7 @@
 #include "ps_env.h"
 #include "ps_function.h"
 #include "ps_config.h"
+#include "ps_gc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -87,6 +88,9 @@ static PSValue ps_eval_source(PSVM *vm, PSEnv *env, PSString *source, PSEvalCont
         return ctl->throw_value;
     }
 
+    PSAstNode *prev_ast = vm ? vm->current_ast : NULL;
+    if (vm) vm->current_ast = program;
+
     PSEvalControl inner = {0};
     PSValue last = ps_value_undefined();
     hoist_decls(vm, env, program);
@@ -101,10 +105,12 @@ static PSValue ps_eval_source(PSVM *vm, PSEnv *env, PSString *source, PSEvalCont
         ctl->did_throw = 1;
         ctl->throw_value = inner.throw_value;
         ps_ast_free(program);
+        if (vm) vm->current_ast = prev_ast;
         return ctl->throw_value;
     }
 
     ps_ast_free(program);
+    if (vm) vm->current_ast = prev_ast;
     return last;
 }
 
@@ -603,7 +609,10 @@ PSValue ps_eval_call_function(PSVM *vm,
     }
 
     PSEvalControl inner = {0};
+    PSEnv *prev_env = vm ? vm->env : NULL;
+    if (vm) vm->env = call_env;
     PSValue ret = eval_node(vm, call_env, func->body, &inner);
+    if (vm) vm->env = prev_env;
     ps_env_free(call_env);
     if (inner.did_throw) {
         if (did_throw) *did_throw = 1;
@@ -751,6 +760,7 @@ PSValue ps_eval(PSVM *vm, PSAstNode *program) {
     PSValue last = ps_value_undefined();
     PSEvalControl ctl = {0};
 
+    if (vm) vm->current_ast = program;
     hoist_decls(vm, vm->env, program);
 
     for (size_t i = 0; i < program->as.list.count; i++) {
@@ -760,9 +770,11 @@ PSValue ps_eval(PSVM *vm, PSAstNode *program) {
             exit(1);
         }
         if (ctl.did_return) {
+            if (vm) vm->current_ast = NULL;
             return last;
         }
     }
+    if (vm) vm->current_ast = NULL;
     return last;
 }
 
@@ -771,6 +783,10 @@ PSValue ps_eval(PSVM *vm, PSAstNode *program) {
 /* --------------------------------------------------------- */
 
 static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *ctl) {
+    if (vm) {
+        vm->env = env;
+        ps_gc_safe_point(vm);
+    }
     switch (node->kind) {
         case AST_BLOCK:
             return eval_block(vm, env, node, ctl);

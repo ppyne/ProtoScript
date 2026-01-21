@@ -275,3 +275,25 @@ Core operations:
 
 Standard streams:
 - `Io.stdin`, `Io.stdout`, `Io.stderr` are always open and cannot be closed.
+
+---
+
+## Gc module
+
+ProtoScript exposes a host `Gc` module for explicit garbage-collection control
+and introspection.
+
+```js
+Gc.collect();
+var stats = Gc.stats();
+Io.print(stats.collections + "\n");
+```
+
+`Gc.stats()` returns an object with:
+- `totalBytes`: current heap bytes tracked by the GC.
+- `liveBytes`: bytes live after the last collection.
+- `collections`: number of collections so far.
+- `freedLast`: objects freed in the last collection.
+- `threshold`: next automatic collection threshold.
+
+GC never closes external resources; `Io.close(...)` is always required.

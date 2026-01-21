@@ -186,3 +186,5 @@ run_case 128-json-parse 0
 run_case 129-json-stringify 0
 run_case 130-io-basic 0
 run_case 131-io-errors 0
+run_case 132-gc-collect 0
+run_case 133-gc-stats 0

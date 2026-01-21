@@ -75,6 +75,25 @@ Language examples in this documentation focus strictly on **language semantics**
 
 ---
 
+## Garbage Collection
+
+ProtoScript uses a **precise, stop-the-world mark-and-sweep GC** for objects,
+strings, functions, and environments. Collections run automatically when the
+heap crosses adaptive thresholds, and can also be triggered manually via the
+`Gc` module.
+
+```js
+Gc.collect();
+var stats = Gc.stats();
+Io.print(stats.totalBytes + "\n");
+```
+
+Notes:
+- GC never closes external resources; file handles must be closed explicitly.
+- `Gc.stats()` returns counters for heap usage and collection activity.
+
+---
+
 ## Program Termination
 
 A ProtoScript program terminates when:

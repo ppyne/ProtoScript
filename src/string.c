@@ -1,4 +1,5 @@
 #include "ps_string.h"
+#include "ps_gc.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -34,12 +35,12 @@ static uint32_t utf8_decode(const unsigned char *p, int len) {
 /* --------------------------------------------------------- */
 
 PSString *ps_string_from_utf8(const char *data, size_t byte_len) {
-    PSString *s = calloc(1, sizeof(PSString));
+    PSString *s = (PSString *)ps_gc_alloc(PS_GC_STRING, sizeof(PSString));
     if (!s) return NULL;
 
     s->utf8 = malloc(byte_len);
     if (!s->utf8) {
-        free(s);
+        ps_string_free(s);
         return NULL;
     }
 
@@ -255,6 +256,10 @@ void ps_string_debug_dump(const PSString *s) {
 
 void ps_string_free(PSString *s) {
     if (!s) return;
+    if (ps_gc_is_managed(s)) {
+        ps_gc_free(s);
+        return;
+    }
     free(s->utf8);
     free(s->glyph_offsets);
     free(s);

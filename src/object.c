@@ -1,4 +1,5 @@
 #include "ps_object.h"
+#include "ps_gc.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -35,7 +36,7 @@ static const PSProperty *find_prop_const(const PSObject *obj, const PSString *na
 /* --------------------------------------------------------- */
 
 PSObject *ps_object_new(PSObject *prototype) {
-    PSObject *o = (PSObject *)calloc(1, sizeof(PSObject));
+    PSObject *o = (PSObject *)ps_gc_alloc(PS_GC_OBJECT, sizeof(PSObject));
     if (!o) return NULL;
     o->prototype = prototype;
     o->props = NULL;
@@ -46,6 +47,10 @@ PSObject *ps_object_new(PSObject *prototype) {
 
 void ps_object_free(PSObject *obj) {
     if (!obj) return;
+    if (ps_gc_is_managed(obj)) {
+        ps_gc_free(obj);
+        return;
+    }
 
     PSProperty *p = obj->props;
     while (p) {

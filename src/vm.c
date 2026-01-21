@@ -7,6 +7,7 @@
 #include "ps_eval.h"
 #include "ps_parser.h"
 #include "ps_ast.h"
+#include "ps_regexp.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -467,14 +468,6 @@ typedef struct {
 
 typedef struct {
     PSString *source;
-    PSRegexNode *ast;
-    int capture_count;
-    int global;
-    int ignore_case;
-} PSRegex;
-
-typedef struct {
-    PSString *source;
     size_t pos;
     size_t length;
     int error;
@@ -876,6 +869,41 @@ static PSRegex *ps_re_compile(PSString *pattern, int global, int ignore_case) {
     re->global = global;
     re->ignore_case = ignore_case;
     return re;
+}
+
+static void ps_re_node_free(PSRegexNode *node) {
+    while (node) {
+        PSRegexNode *next = node->next;
+        switch (node->type) {
+            case PS_RE_NODE_CLASS:
+                if (node->as.cls) {
+                    free(node->as.cls->ranges);
+                    free(node->as.cls);
+                }
+                break;
+            case PS_RE_NODE_ALT:
+                ps_re_node_free(node->as.alt.left);
+                ps_re_node_free(node->as.alt.right);
+                break;
+            case PS_RE_NODE_REPEAT:
+                ps_re_node_free(node->as.rep.child);
+                break;
+            case PS_RE_NODE_GROUP:
+                ps_re_node_free(node->as.group.child);
+                break;
+            default:
+                break;
+        }
+        free(node);
+        node = next;
+    }
+}
+
+void ps_regex_free(PSRegex *re) {
+    if (!re) return;
+    ps_re_node_free(re->ast);
+    re->ast = NULL;
+    free(re);
 }
 
 static int ps_re_is_word(uint32_t ch) {
@@ -4811,6 +4839,41 @@ static PSValue ps_native_json_stringify(PSVM *vm, PSValue this_val, int argc, PS
     return ps_value_string(out);
 }
 
+static PSValue ps_native_gc_collect(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    if (vm) {
+        ps_gc_collect(vm);
+    }
+    return ps_value_undefined();
+}
+
+static PSValue ps_native_gc_stats(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    if (!vm) return ps_value_undefined();
+    PSObject *obj = ps_object_new(vm->object_proto);
+    if (!obj) return ps_value_undefined();
+    ps_object_define(obj, ps_string_from_cstr("totalBytes"),
+                     ps_value_number((double)vm->gc.heap_bytes),
+                     PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj, ps_string_from_cstr("liveBytes"),
+                     ps_value_number((double)vm->gc.live_bytes_last),
+                     PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj, ps_string_from_cstr("collections"),
+                     ps_value_number((double)vm->gc.collections),
+                     PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj, ps_string_from_cstr("freedLast"),
+                     ps_value_number((double)vm->gc.freed_last),
+                     PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj, ps_string_from_cstr("threshold"),
+                     ps_value_number((double)vm->gc.threshold),
+                     PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    return ps_value_object(obj);
+}
+
 /* --------------------------------------------------------- */
 /* VM lifecycle                                              */
 /* --------------------------------------------------------- */
@@ -4819,9 +4882,13 @@ PSVM *ps_vm_new(void) {
     PSVM *vm = (PSVM *)calloc(1, sizeof(PSVM));
     if (!vm) return NULL;
 
+    ps_gc_init(vm);
+    ps_gc_set_active_vm(vm);
+
     /* Create Global Object (no prototype for now) */
     vm->global = ps_object_new(NULL);
     if (!vm->global) {
+        ps_gc_destroy(vm);
         free(vm);
         return NULL;
     }
@@ -4829,6 +4896,10 @@ PSVM *ps_vm_new(void) {
     vm->env = ps_env_new(NULL, vm->global, 0);
     if (!vm->env) {
         ps_object_free(vm->global);
+        ps_gc_destroy(vm);
+        if (ps_gc_active_vm() == vm) {
+            ps_gc_set_active_vm(NULL);
+        }
         free(vm);
         return NULL;
     }
@@ -4837,6 +4908,7 @@ PSVM *ps_vm_new(void) {
     vm->pending_throw = ps_value_undefined();
     vm->current_callee = NULL;
     vm->is_constructing = 0;
+    vm->current_ast = NULL;
 
     /* Initialize built-ins and host extensions */
     ps_vm_init_builtins(vm);
@@ -4848,10 +4920,10 @@ PSVM *ps_vm_new(void) {
 void ps_vm_free(PSVM *vm) {
     if (!vm) return;
 
-    /* For now, only free the global object shell.
-       Properties, strings, values will later be handled by GC. */
-    ps_object_free(vm->global);
-    ps_env_free(vm->env);
+    ps_gc_destroy(vm);
+    if (ps_gc_active_vm() == vm) {
+        ps_gc_set_active_vm(NULL);
+    }
     free(vm);
 }
 
@@ -5974,6 +6046,28 @@ void ps_vm_init_builtins(PSVM *vm) {
         ps_object_define(vm->global,
                          ps_string_from_cstr("JSON"),
                          ps_value_object(json_obj),
+                         PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
+    }
+
+    PSObject *gc_obj = ps_object_new(vm->object_proto);
+    if (gc_obj) {
+        PSObject *collect_fn = ps_function_new_native(ps_native_gc_collect);
+        if (collect_fn) {
+            ps_function_setup(collect_fn, vm->function_proto, vm->object_proto, NULL);
+            ps_define_function_props(collect_fn, "collect", 0);
+            ps_object_define(gc_obj, ps_string_from_cstr("collect"),
+                             ps_value_object(collect_fn), PS_ATTR_DONTENUM);
+        }
+        PSObject *stats_fn = ps_function_new_native(ps_native_gc_stats);
+        if (stats_fn) {
+            ps_function_setup(stats_fn, vm->function_proto, vm->object_proto, NULL);
+            ps_define_function_props(stats_fn, "stats", 0);
+            ps_object_define(gc_obj, ps_string_from_cstr("stats"),
+                             ps_value_object(stats_fn), PS_ATTR_DONTENUM);
+        }
+        ps_object_define(vm->global,
+                         ps_string_from_cstr("Gc"),
+                         ps_value_object(gc_obj),
                          PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
     }
 }

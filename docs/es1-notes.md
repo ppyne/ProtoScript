@@ -32,13 +32,18 @@ disabled, attempting to use them is rejected.
 
 The `Io` module (print + file/stream I/O) is a non-standard host extension.
 
-## 6. ES2015 default parameters
+## 6. GC module (host extension)
+
+ProtoScript exposes a non-standard `Gc` object with `Gc.collect()` and
+`Gc.stats()` to force and inspect garbage collection. This is outside ES1.
+
+## 7. ES2015 default parameters
 
 ProtoScript supports ES2015-style default parameter values in function
 declarations (for example `function f(x, y = 10) { ... }`). This is an ES6
 extension beyond ES1.
 
-## 7. JSON (ES5)
+## 8. JSON (ES5)
 
 ProtoScript exposes a global `JSON` object with `JSON.parse` and
 `JSON.stringify`. This is an ES5 feature (not part of ES1). The implementation

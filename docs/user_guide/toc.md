@@ -10,6 +10,7 @@ This document is the **main table of contents** for the ProtoScript documentatio
 - [What Is ProtoScript?](execution_model.md#running-a-protoscript-program)
 - [ProtoScript and Java](execution_model.md#compatibility-scope)
 - [ProtoScript and the ECMA Specification (historical context)](execution_model.md#compatibility-scope)
+- [Garbage collection](execution_model.md#garbage-collection)
 
 ### [Chapter 2 — Values, Variables, and Literals](values_variables_and_literals.md)
 - [Values](values_variables_and_literals.md#values)
@@ -103,6 +104,7 @@ This document is the **main table of contents** for the ProtoScript documentatio
   - [String](working_with_objects.md#string)
   - [JSON](working_with_objects.md#json)
   - [Io module](working_with_objects.md#io-module)
+  - [Gc module](working_with_objects.md#gc-module)
 
 ### [Chapter 8 — Object Model and Prototypes](object_model_and_prototypes.md)
 - [Class-based vs. prototype-based languages](object_model_and_prototypes.md#class-based-vs-prototype-based-languages)

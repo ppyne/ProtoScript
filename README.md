@@ -14,6 +14,7 @@ ProtoScript does not aim for modern JavaScript or browser compatibility.
 - ES1 deviations: [`docs/es1-notes.md`](docs/es1-notes.md)
 - String model spec: [`docs/string-spec.md`](docs/string-spec.md)
 - Io module spec: [`docs/io_spec.md`](docs/io_spec.md)
+- GC spec: [`docs/gc_spec.md`](docs/gc_spec.md)
 - ECMA-262 Edition 1 (June 1997): [`docs/ECMA-262_1st_edition_june_1997.pdf`](docs/ECMA-262_1st_edition_june_1997.pdf)
 - License (BSD-3-Clause): [`LICENSE`](LICENSE)
 

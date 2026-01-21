@@ -1,12 +1,13 @@
 #include "ps_env.h"
 #include "ps_config.h"
+#include "ps_gc.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
 PSEnv *ps_env_new(PSEnv *parent, PSObject *record, int owns_record) {
-    PSEnv *env = (PSEnv *)calloc(1, sizeof(PSEnv));
+    PSEnv *env = (PSEnv *)ps_gc_alloc(PS_GC_ENV, sizeof(PSEnv));
     if (!env) return NULL;
     env->parent = parent;
     env->record = record;
@@ -25,6 +26,9 @@ PSEnv *ps_env_new_object(PSEnv *parent) {
 
 void ps_env_free(PSEnv *env) {
     if (!env) return;
+    if (ps_gc_is_managed(env)) {
+        return;
+    }
     if (env->owns_record) {
         ps_object_free(env->record);
     }

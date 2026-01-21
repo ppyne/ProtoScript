@@ -4,6 +4,9 @@
 #include "ps_object.h"
 #include "ps_value.h"
 #include "ps_env.h"
+#include "ps_gc.h"
+
+struct PSAstNode;
 
 /*
  * ProtoScript Virtual Machine
@@ -36,6 +39,8 @@ typedef struct PSVM {
     PSValue pending_throw;
     PSObject *current_callee;
     int is_constructing;
+    struct PSAstNode *current_ast;
+    PSGC gc;
 } PSVM;
 
 /* VM lifecycle */

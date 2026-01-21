@@ -152,6 +152,8 @@ var a = new Foo();
 Io.print((a instanceof Foo) + "\n");
 ```
 
+To differentiate whether we are dealing with an object or an array, since typeof always says object, here is the trick.
+
 ```js
 if ([] instanceof Array) Io.print("Is an array\n");
 else Io.print("Is not an array\n"); // Is an array

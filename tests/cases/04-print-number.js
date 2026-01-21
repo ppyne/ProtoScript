@@ -1,1 +1,1 @@
-Io.print(42);
+Io.print((42 )+ "\n");

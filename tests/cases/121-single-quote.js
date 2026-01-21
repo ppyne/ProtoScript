@@ -1,2 +1,2 @@
-Io.print('Hello world');
-Io.print('it\'s ok');
+Io.print(('Hello world' )+ "\n");
+Io.print(('it\'s ok' )+ "\n");

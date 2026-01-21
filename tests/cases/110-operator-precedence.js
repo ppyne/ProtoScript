@@ -1,8 +1,8 @@
-Io.print(1 + 2 * 3);
-Io.print((1 + 2) * 3);
-Io.print(1 << 2 + 1);
-Io.print(((5 & 3) == 1) ? 1 : 0);
-Io.print((1 < 2 << 1) ? 1 : 0);
+Io.print((1 + 2 * 3 )+ "\n");
+Io.print((1 + 2) * 3 + "\n");
+Io.print((1 << 2 + 1 )+ "\n");
+Io.print((((5 & 3) == 1) ? 1 : 0) + "\n");
+Io.print(((1 < 2 << 1) ? 1 : 0) + "\n");
 
 var t = 0;
 function bump() { t = t + 1; return 1; }
@@ -10,12 +10,12 @@ function bump() { t = t + 1; return 1; }
 1 && bump();
 1 || bump();
 0 || bump();
-Io.print(t);
+Io.print((t )+ "\n");
 
 var a, b, c;
 a = b = c = 5;
-Io.print(a + b + c);
+Io.print((a + b + c )+ "\n");
 
 var x = 0;
 x = (x = 1, x + 2);
-Io.print(x);
+Io.print((x )+ "\n");

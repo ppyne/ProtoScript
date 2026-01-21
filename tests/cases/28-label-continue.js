@@ -5,4 +5,4 @@ outer: for (var i = 0; i < 3; i = i + 1) {
     }
     sum = sum + 1;
 }
-Io.print(sum);
+Io.print((sum )+ "\n");

@@ -1,7 +1,7 @@
 function show(a, b) {
-    Io.print(this.x);
-    Io.print(a);
-    Io.print(b);
+    Io.print((this.x )+ "\n");
+    Io.print((a )+ "\n");
+    Io.print((b )+ "\n");
 }
 var o = new Object();
 o.x = 7;
@@ -20,10 +20,10 @@ var bx = new Object();
 bx.x = 1;
 var B = C.bind(bx, 5);
 var inst = new B(9);
-Io.print(inst.x);
-Io.print(inst.get());
+Io.print((inst.x )+ "\n");
+Io.print((inst.get() )+ "\n");
 try {
     Function.prototype.bind.call(null, o);
 } catch (e) {
-    Io.print(e.name);
+    Io.print((e.name )+ "\n");
 }

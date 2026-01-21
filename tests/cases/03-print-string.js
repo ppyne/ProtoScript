@@ -1,1 +1,1 @@
-Io.print("Hello ProtoScript");
+Io.print(("Hello ProtoScript" )+ "\n");

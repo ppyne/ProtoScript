@@ -1,17 +1,17 @@
 var e = new Error("oops");
-Io.print(e.name);
-Io.print(e.message);
-Io.print(e.toString());
+Io.print((e.name )+ "\n");
+Io.print((e.message )+ "\n");
+Io.print((e.toString() )+ "\n");
 
 var t = TypeError("bad");
-Io.print(t.toString());
+Io.print((t.toString() )+ "\n");
 
 var r = new ReferenceError();
-Io.print(r.toString());
+Io.print((r.toString() )+ "\n");
 
 var s = new SyntaxError("x");
-Io.print(s.name);
-Io.print(s.toString());
+Io.print((s.name )+ "\n");
+Io.print((s.toString() )+ "\n");
 
 var v = EvalError("no");
-Io.print(v.toString());
+Io.print((v.toString() )+ "\n");

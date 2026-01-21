@@ -7,5 +7,5 @@ function RetFuncProps() {
 }
 var B = RetFuncProps.bind(null);
 var inst = new B();
-Io.print(inst.value);
-Io.print(inst());
+Io.print((inst.value )+ "\n");
+Io.print((inst() )+ "\n");

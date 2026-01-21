@@ -11,7 +11,7 @@ function RetFuncProtoInherited() {
 }
 var B = RetFuncProtoInherited.bind(null);
 var inst = new B();
-Io.print(inst.prototype.base);
-Io.print(inst.prototype.child);
-Io.print(inst());
+Io.print((inst.prototype.base )+ "\n");
+Io.print((inst.prototype.child )+ "\n");
+Io.print((inst() )+ "\n");
 Object.prototype.base = _save;

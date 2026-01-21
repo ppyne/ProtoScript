@@ -1,11 +1,11 @@
 var x = 2;
 switch (x) {
     case 1:
-        Io.print("a");
+        Io.print(("a" )+ "\n");
         break;
     case 2:
-        Io.print("b");
+        Io.print(("b" )+ "\n");
         break;
     default:
-        Io.print("c");
+        Io.print(("c" )+ "\n");
 }

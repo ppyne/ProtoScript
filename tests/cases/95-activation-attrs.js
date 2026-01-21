@@ -7,14 +7,14 @@ function f(a) {
     if (k == "length") hasLength = true;
     if (k == "callee") hasCallee = true;
   }
-  Io.print(has0);
-  Io.print(hasLength);
-  Io.print(hasCallee);
-  Io.print(delete arguments.length);
-  Io.print(delete arguments.callee);
+  Io.print((has0 )+ "\n");
+  Io.print((hasLength )+ "\n");
+  Io.print((hasCallee )+ "\n");
+  Io.print((delete arguments.length )+ "\n");
+  Io.print((delete arguments.callee )+ "\n");
   var before = arguments.callee;
   arguments.callee = 1;
-  Io.print(arguments.callee == before);
+  Io.print((arguments.callee == before )+ "\n");
 }
 
 f(1);

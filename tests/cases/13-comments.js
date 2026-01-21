@@ -1,5 +1,5 @@
 // single-line comment
-Io.print("line");
+Io.print(("line" )+ "\n");
 /* block
    comment */
-Io.print("block");
+Io.print(("block" )+ "\n");

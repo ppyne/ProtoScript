@@ -1,6 +1,6 @@
 var s = new String("hello");
-Io.print(s.substring(-2, 2));
-Io.print(s.substring(2, -1));
-Io.print(s.indexOf(""));
-Io.print(s.indexOf("", 3));
-Io.print(s.indexOf("", 100));
+Io.print((s.substring(-2, 2) )+ "\n");
+Io.print((s.substring(2, -1) )+ "\n");
+Io.print((s.indexOf("") )+ "\n");
+Io.print((s.indexOf("", 3) )+ "\n");
+Io.print((s.indexOf("", 100) )+ "\n");

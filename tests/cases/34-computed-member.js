@@ -1,2 +1,2 @@
 var obj = Io;
-Io.print(obj["print"]("ok"));
+Io.print((obj["print"]("ok\n")) + "\n");

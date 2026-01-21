@@ -1,17 +1,17 @@
 var n = 7;
-Io.print(Number.prototype.valueOf.call(n));
+Io.print((Number.prototype.valueOf.call(n) )+ "\n");
 
 var s = "hi";
-Io.print(String.prototype.valueOf.call(s));
+Io.print((String.prototype.valueOf.call(s) )+ "\n");
 
 var b = true;
-Io.print(Boolean.prototype.valueOf.call(b));
+Io.print((Boolean.prototype.valueOf.call(b) )+ "\n");
 
 var r = Function.prototype.call.call(Number.prototype.valueOf, 5);
-Io.print(r);
+Io.print((r )+ "\n");
 
 var arr = new Array();
 arr.push(1);
 arr.push(2);
 var res = Array.prototype.join.call(arr, ",");
-Io.print(res);
+Io.print((res )+ "\n");

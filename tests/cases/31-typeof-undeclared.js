@@ -1,1 +1,1 @@
-Io.print(typeof missing);
+Io.print((typeof missing )+ "\n");

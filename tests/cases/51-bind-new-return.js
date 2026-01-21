@@ -5,4 +5,4 @@ function Ret() {
 }
 var B = Ret.bind(null);
 var inst = new B();
-Io.print(inst.x);
+Io.print((inst.x )+ "\n");

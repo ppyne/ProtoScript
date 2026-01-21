@@ -1,1 +1,1 @@
-Io.print(delete ("x").y);
+Io.print((delete ("x").y )+ "\n");

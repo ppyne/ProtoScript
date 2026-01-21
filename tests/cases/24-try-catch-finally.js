@@ -1,7 +1,7 @@
 try {
     throw "err";
 } catch (e) {
-    Io.print(e);
+    Io.print((e )+ "\n");
 } finally {
-    Io.print("done");
+    Io.print(("done" )+ "\n");
 }

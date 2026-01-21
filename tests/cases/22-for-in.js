@@ -4,4 +4,4 @@ for (var k in Io) {
         count = count + 1;
     }
 }
-Io.print(count);
+Io.print((count )+ "\n");

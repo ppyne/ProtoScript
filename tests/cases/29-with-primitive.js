@@ -1,3 +1,3 @@
 with ("x") {
-    Io.print("ok");
+    Io.print(("ok" )+ "\n");
 }

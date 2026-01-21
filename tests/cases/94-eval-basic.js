@@ -1,9 +1,9 @@
 var x = 1;
 var y = eval("x + 4;");
-Io.print(y);
+Io.print((y )+ "\n");
 eval("x = 9;");
-Io.print(x);
-Io.print(eval(3));
+Io.print((x )+ "\n");
+Io.print((eval(3) )+ "\n");
 
 function add(a) {
     var z = 10;
@@ -11,6 +11,6 @@ function add(a) {
     return z;
 }
 
-Io.print(add(5));
+Io.print((add(5) )+ "\n");
 eval("var e = 7;");
-Io.print(e);
+Io.print((e )+ "\n");

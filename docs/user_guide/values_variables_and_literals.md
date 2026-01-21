@@ -295,8 +295,8 @@ This represents a single Unicode character.
 Unicode characters can be included directly in source files saved as UTF-8:
 
 ```js
-Io.print("cafe\u0301");
-Io.print("café");
+Io.print("cafe\u0301\n");
+Io.print("café\n");
 ```
 
 Both lines print the same visible text if your terminal supports combining

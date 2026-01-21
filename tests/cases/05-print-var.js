@@ -1,2 +1,2 @@
 var x = 7;
-Io.print(x);
+Io.print((x )+ "\n");

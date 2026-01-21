@@ -1,3 +1,3 @@
 with (null) {
-    Io.print("nope");
+    Io.print(("nope" )+ "\n");
 }

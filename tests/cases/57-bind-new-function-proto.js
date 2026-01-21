@@ -8,6 +8,6 @@ function RetFuncProto() {
 }
 var B = RetFuncProto.bind(null);
 var inst = new B();
-Io.print(typeof inst);
-Io.print(inst.prototype.tag);
-Io.print(inst());
+Io.print((typeof inst )+ "\n");
+Io.print((inst.prototype.tag )+ "\n");
+Io.print((inst() )+ "\n");

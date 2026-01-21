@@ -4,4 +4,4 @@ while (i < 3) {
     sum = sum + 1;
     i = i + 1;
 }
-Io.print(sum);
+Io.print((sum )+ "\n");

@@ -6,5 +6,5 @@ function RetFunc() {
 }
 var B = RetFunc.bind(null);
 var inst = new B();
-Io.print(typeof inst);
-Io.print(inst());
+Io.print((typeof inst )+ "\n");
+Io.print((inst() )+ "\n");

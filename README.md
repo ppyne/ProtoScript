@@ -43,7 +43,7 @@ Usage (file or stdin):
 ```sh
 ./protoscript script.js
 cat script.js | ./protoscript
-echo 'Io.print("Hello world");'| ./protoscript
+echo 'Io.print("Hello world\n");'| ./protoscript
 ./protoscript < script.js
 ./protoscript - < script.js
 ```

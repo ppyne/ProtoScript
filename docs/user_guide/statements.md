@@ -174,7 +174,7 @@ Example:
 ```js
 function dumpProps(obj) {
     for (var p in obj) {
-        Io.print(p + " = " + obj[p]);
+        Io.print(p + " = " + obj[p] + "\n");
     }
 }
 ```

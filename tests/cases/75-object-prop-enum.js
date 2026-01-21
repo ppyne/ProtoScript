@@ -1,9 +1,9 @@
 var o = new Object();
 o.a = 1;
-Io.print(o.propertyIsEnumerable("a"));
-Io.print(o.propertyIsEnumerable("b"));
-Io.print(o.propertyIsEnumerable("toString"));
-Io.print(o.toLocaleString());
+Io.print((o.propertyIsEnumerable("a") )+ "\n");
+Io.print((o.propertyIsEnumerable("b") )+ "\n");
+Io.print((o.propertyIsEnumerable("toString") )+ "\n");
+Io.print((o.toLocaleString() )+ "\n");
 
 var d = new Date(0);
-Io.print(d.toLocaleString() == d.toLocaleString());
+Io.print((d.toLocaleString() == d.toLocaleString() )+ "\n");

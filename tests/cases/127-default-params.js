@@ -1,10 +1,10 @@
 function f(x, y = 10) {
     return x + y;
 }
-Io.print(f(5));
-Io.print(f(5, 2));
-Io.print(f(5, undefined));
+Io.print((f(5) )+ "\n");
+Io.print((f(5, 2) )+ "\n");
+Io.print((f(5, undefined) )+ "\n");
 function g(x, y = x + 1) {
     return y;
 }
-Io.print(g(2));
+Io.print((g(2) )+ "\n");

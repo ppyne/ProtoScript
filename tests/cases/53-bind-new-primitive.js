@@ -3,5 +3,5 @@ function RetPrim() {
 }
 var B = RetPrim.bind(null);
 var inst = new B();
-Io.print(typeof inst);
-Io.print(inst.toString());
+Io.print((typeof inst )+ "\n");
+Io.print((inst.toString() )+ "\n");

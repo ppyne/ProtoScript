@@ -1,9 +1,9 @@
-Io.print(Object.prototype.propertyIsEnumerable.call(Function.prototype, "call"));
-Io.print(Object.prototype.propertyIsEnumerable.call(Array.prototype, "push"));
-Io.print(Object.prototype.propertyIsEnumerable.call(String.prototype, "toString"));
-Io.print(Object.prototype.propertyIsEnumerable.call(Number.prototype, "toFixed"));
-Io.print(Object.prototype.propertyIsEnumerable.call(Boolean.prototype, "valueOf"));
-Io.print(Object.prototype.propertyIsEnumerable.call(Date.prototype, "getTime"));
-Io.print(Object.prototype.propertyIsEnumerable.call(RegExp.prototype, "exec"));
-Io.print(Object.prototype.propertyIsEnumerable.call(Math, "PI"));
-Io.print(Object.prototype.propertyIsEnumerable.call(Math, "abs"));
+Io.print((Object.prototype.propertyIsEnumerable.call(Function.prototype, "call") )+ "\n");
+Io.print((Object.prototype.propertyIsEnumerable.call(Array.prototype, "push") )+ "\n");
+Io.print((Object.prototype.propertyIsEnumerable.call(String.prototype, "toString") )+ "\n");
+Io.print((Object.prototype.propertyIsEnumerable.call(Number.prototype, "toFixed") )+ "\n");
+Io.print((Object.prototype.propertyIsEnumerable.call(Boolean.prototype, "valueOf") )+ "\n");
+Io.print((Object.prototype.propertyIsEnumerable.call(Date.prototype, "getTime") )+ "\n");
+Io.print((Object.prototype.propertyIsEnumerable.call(RegExp.prototype, "exec") )+ "\n");
+Io.print((Object.prototype.propertyIsEnumerable.call(Math, "PI") )+ "\n");
+Io.print((Object.prototype.propertyIsEnumerable.call(Math, "abs") )+ "\n");

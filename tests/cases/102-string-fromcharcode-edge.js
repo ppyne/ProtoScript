@@ -1,2 +1,2 @@
-Io.print(String.fromCharCode());
-Io.print(String.fromCharCode(65601));
+Io.print((String.fromCharCode() )+ "\n");
+Io.print((String.fromCharCode(65601) )+ "\n");

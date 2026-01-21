@@ -8,7 +8,7 @@ switch (2) {
   default:
     x = x + 10;
 }
-Io.print(x);
+Io.print((x )+ "\n");
 
 outer:
 for (var i = 0; i < 3; i = i + 1) {
@@ -16,7 +16,7 @@ for (var i = 0; i < 3; i = i + 1) {
     if (i == 1 && j == 1) break outer;
   }
 }
-Io.print(i + "," + j);
+Io.print((i + "," + j )+ "\n");
 
 var k = 0;
 loop:
@@ -26,4 +26,4 @@ for (var ii = 0; ii < 3; ii = ii + 1) {
     k = k + 1;
   }
 }
-Io.print(k);
+Io.print((k )+ "\n");

@@ -22,7 +22,6 @@ static PSValue ps_native_print(PSVM *vm, PSValue this_val, int argc, PSValue *ar
             fwrite(s->utf8, 1, s->byte_len, stdout);
         }
     }
-    fputc('\n', stdout);
     return ps_value_undefined();
 }
 

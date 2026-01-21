@@ -39,7 +39,9 @@ typedef struct PSVM {
     PSValue pending_throw;
     PSObject *current_callee;
     int is_constructing;
+    struct PSAstNode *root_ast;
     struct PSAstNode *current_ast;
+    struct PSAstNode *current_node;
     PSGC gc;
 } PSVM;
 

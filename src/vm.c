@@ -4917,7 +4917,9 @@ PSVM *ps_vm_new(void) {
     vm->pending_throw = ps_value_undefined();
     vm->current_callee = NULL;
     vm->is_constructing = 0;
+    vm->root_ast = NULL;
     vm->current_ast = NULL;
+    vm->current_node = NULL;
 
     /* Initialize built-ins and host extensions */
     ps_vm_init_builtins(vm);

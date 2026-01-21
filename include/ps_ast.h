@@ -33,6 +33,7 @@ typedef enum {
     AST_THROW,
     AST_TRY,
     AST_FUNCTION_DECL,
+    AST_FUNCTION_EXPR,
 
     /* Expressions */
     AST_IDENTIFIER,
@@ -61,6 +62,8 @@ typedef struct PSAstNode PSAstNode;
 
 struct PSAstNode {
     PSAstKind kind;
+    size_t line;
+    size_t column;
 
     union {
         /* Program / Block */
@@ -187,6 +190,15 @@ struct PSAstNode {
             PSAstNode  *body;
         } func_decl;
 
+        /* function (params) { body } */
+        struct {
+            PSAstNode  *id; /* optional name */
+            PSAstNode **params;
+            PSAstNode **param_defaults;
+            size_t      param_count;
+            PSAstNode  *body;
+        } func_expr;
+
         /* identifier */
         struct {
             const char *name;
@@ -301,6 +313,11 @@ PSAstNode *ps_ast_try(PSAstNode *try_block,
                       PSAstNode *catch_block,
                       PSAstNode *finally_block);
 PSAstNode *ps_ast_func_decl(PSAstNode *id,
+                            PSAstNode **params,
+                            PSAstNode **param_defaults,
+                            size_t param_count,
+                            PSAstNode *body);
+PSAstNode *ps_ast_func_expr(PSAstNode *id,
                             PSAstNode **params,
                             PSAstNode **param_defaults,
                             size_t param_count,

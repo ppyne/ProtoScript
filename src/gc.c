@@ -182,6 +182,16 @@ static void ps_gc_mark_ast_node(PSVM *vm, PSAstNode *node) {
             }
             ps_gc_mark_ast_node(vm, node->as.func_decl.body);
             break;
+        case AST_FUNCTION_EXPR:
+            ps_gc_mark_ast_node(vm, node->as.func_expr.id);
+            for (size_t i = 0; i < node->as.func_expr.param_count; i++) {
+                ps_gc_mark_ast_node(vm, node->as.func_expr.params[i]);
+                if (node->as.func_expr.param_defaults) {
+                    ps_gc_mark_ast_node(vm, node->as.func_expr.param_defaults[i]);
+                }
+            }
+            ps_gc_mark_ast_node(vm, node->as.func_expr.body);
+            break;
         case AST_IDENTIFIER:
             break;
         case AST_LITERAL:
@@ -345,7 +355,11 @@ static void ps_gc_mark_roots(PSVM *vm) {
     if (vm->has_pending_throw) {
         ps_gc_mark_value(vm, vm->pending_throw);
     }
-    ps_gc_mark_ast_node(vm, vm->current_ast);
+    if (vm->root_ast) {
+        ps_gc_mark_ast_node(vm, vm->root_ast);
+    } else {
+        ps_gc_mark_ast_node(vm, vm->current_ast);
+    }
     for (size_t i = 0; i < vm->gc.root_count; i++) {
         PSGCRoot *root = &vm->gc.roots[i];
         switch (root->type) {

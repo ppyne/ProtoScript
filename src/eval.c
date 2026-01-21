@@ -90,7 +90,12 @@ static PSValue ps_eval_source(PSVM *vm, PSEnv *env, PSString *source, PSEvalCont
     }
 
     PSAstNode *prev_ast = vm ? vm->current_ast : NULL;
-    if (vm) vm->current_ast = program;
+    PSAstNode *prev_root = vm ? vm->root_ast : NULL;
+    PSAstNode *prev_node = vm ? vm->current_node : NULL;
+    if (vm) {
+        vm->current_ast = program;
+        vm->root_ast = program;
+    }
 
     PSEvalControl inner = {0};
     PSValue last = ps_value_undefined();
@@ -106,12 +111,20 @@ static PSValue ps_eval_source(PSVM *vm, PSEnv *env, PSString *source, PSEvalCont
         ctl->did_throw = 1;
         ctl->throw_value = inner.throw_value;
         ps_ast_free(program);
-        if (vm) vm->current_ast = prev_ast;
+        if (vm) {
+            vm->current_ast = prev_ast;
+            vm->root_ast = prev_root;
+            vm->current_node = prev_node;
+        }
         return ctl->throw_value;
     }
 
     ps_ast_free(program);
-    if (vm) vm->current_ast = prev_ast;
+    if (vm) {
+        vm->current_ast = prev_ast;
+        vm->root_ast = prev_root;
+        vm->current_node = prev_node;
+    }
     return last;
 }
 
@@ -830,21 +843,38 @@ PSValue ps_eval(PSVM *vm, PSAstNode *program) {
     PSValue last = ps_value_undefined();
     PSEvalControl ctl = {0};
 
-    if (vm) vm->current_ast = program;
+    if (vm) {
+        vm->current_ast = program;
+        vm->root_ast = program;
+    }
     hoist_decls(vm, vm->env, program);
 
     for (size_t i = 0; i < program->as.list.count; i++) {
         last = eval_node(vm, vm->env, program->as.list.items[i], &ctl);
         if (ctl.did_throw) {
-            fprintf(stderr, "Uncaught exception\n");
+            if (vm && vm->current_node && vm->current_node->line && vm->current_node->column) {
+                fprintf(stderr, "%zu:%zu Uncaught exception\n",
+                        vm->current_node->line,
+                        vm->current_node->column);
+            } else {
+                fprintf(stderr, "Uncaught exception\n");
+            }
             exit(1);
         }
         if (ctl.did_return) {
-            if (vm) vm->current_ast = NULL;
+            if (vm) {
+                vm->current_ast = NULL;
+                vm->root_ast = NULL;
+                vm->current_node = NULL;
+            }
             return last;
         }
     }
-    if (vm) vm->current_ast = NULL;
+    if (vm) {
+        vm->current_ast = NULL;
+        vm->root_ast = NULL;
+        vm->current_node = NULL;
+    }
     return last;
 }
 
@@ -855,6 +885,7 @@ PSValue ps_eval(PSVM *vm, PSAstNode *program) {
 static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *ctl) {
     if (vm) {
         vm->env = env;
+        vm->current_node = node;
         ps_gc_safe_point(vm);
     }
     switch (node->kind) {
@@ -1447,10 +1478,36 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
 /* --------------------------------------------------------- */
 
 static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *ctl) {
+    if (vm) {
+        vm->current_node = node;
+    }
     switch (node->kind) {
 
         case AST_LITERAL:
             return node->as.literal.value;
+
+        case AST_FUNCTION_EXPR: {
+            PSString *name = NULL;
+            if (node->as.func_expr.id) {
+                name = ps_string_from_utf8(
+                    node->as.func_expr.id->as.identifier.name,
+                    node->as.func_expr.id->as.identifier.length
+                );
+            }
+            PSObject *fn_obj = ps_function_new_script(
+                node->as.func_expr.params,
+                node->as.func_expr.param_defaults,
+                node->as.func_expr.param_count,
+                node->as.func_expr.body,
+                env
+            );
+            if (fn_obj) {
+                ps_function_setup(fn_obj, vm->function_proto, vm->object_proto, NULL);
+                ps_define_script_function_props(fn_obj, name, node->as.func_expr.param_count);
+                return ps_value_object(fn_obj);
+            }
+            return ps_value_undefined();
+        }
 
         case AST_ARRAY_LITERAL: {
             PSObject *arr = ps_object_new(vm->array_proto ? vm->array_proto : vm->object_proto);

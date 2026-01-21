@@ -19,13 +19,58 @@ typedef struct {
 } PSParser;
 
 static jmp_buf *g_parse_jmp = NULL;
+static PSParser *g_parse_parser = NULL;
+static size_t g_parse_error_line = 0;
+static size_t g_parse_error_column = 0;
 
 static void parse_error(const char *msg) {
-    fprintf(stderr, "%s\n", msg);
+    size_t line = 0;
+    size_t column = 0;
+    if (g_parse_parser) {
+        if (g_parse_parser->lexer.error) {
+            line = g_parse_parser->lexer.error_line;
+            column = g_parse_parser->lexer.error_column;
+        } else if (g_parse_error_line || g_parse_error_column) {
+            line = g_parse_error_line;
+            column = g_parse_error_column;
+        } else {
+            line = g_parse_parser->current.line;
+            column = g_parse_parser->current.column;
+        }
+    }
+    g_parse_error_line = 0;
+    g_parse_error_column = 0;
+    if (line > 0 && column > 0) {
+        fprintf(stderr, "%zu:%zu %s\n", line, column, msg);
+    } else {
+        fprintf(stderr, "%s\n", msg);
+    }
     if (g_parse_jmp) {
         longjmp(*g_parse_jmp, 1);
     }
     exit(1);
+}
+
+static void parse_error_at(size_t line, size_t column, const char *msg) {
+    g_parse_error_line = line;
+    g_parse_error_column = column;
+    parse_error(msg);
+}
+
+static PSAstNode *set_pos(PSAstNode *node, PSToken tok) {
+    if (node) {
+        node->line = tok.line;
+        node->column = tok.column;
+    }
+    return node;
+}
+
+static PSAstNode *set_pos_from_node(PSAstNode *node, PSAstNode *source) {
+    if (node && source) {
+        node->line = source->line;
+        node->column = source->column;
+    }
+    return node;
 }
 
 /* --------------------------------------------------------- */
@@ -81,10 +126,12 @@ static size_t append_utf8(char *buf, size_t pos, uint32_t codepoint) {
     return pos;
 }
 
-static char *decode_identifier(const char *start, size_t len, size_t *out_len) {
+static char *decode_identifier(const char *start, size_t len, size_t *out_len, size_t line, size_t column) {
     size_t cap = len * 4 + 1;
     char *buf = (char *)malloc(cap);
-    if (!buf) return NULL;
+    if (!buf) {
+        parse_error_at(line, column, "Parse error: out of memory");
+    }
     size_t out = 0;
     for (size_t i = 0; i < len; i++) {
         unsigned char c = (unsigned char)start[i];
@@ -94,7 +141,7 @@ static char *decode_identifier(const char *start, size_t len, size_t *out_len) {
         }
         if (i + 5 >= len || start[i + 1] != 'u') {
             free(buf);
-            parse_error("Parse error: invalid identifier escape");
+            parse_error_at(line, column, "Parse error: invalid identifier escape");
         }
         int h1 = hex_value((unsigned char)start[i + 2]);
         int h2 = hex_value((unsigned char)start[i + 3]);
@@ -102,7 +149,7 @@ static char *decode_identifier(const char *start, size_t len, size_t *out_len) {
         int h4 = hex_value((unsigned char)start[i + 5]);
         if (h1 < 0 || h2 < 0 || h3 < 0 || h4 < 0) {
             free(buf);
-            parse_error("Parse error: invalid identifier escape");
+            parse_error_at(line, column, "Parse error: invalid identifier escape");
         }
         uint32_t value = (uint32_t)((h1 << 12) | (h2 << 8) | (h3 << 4) | h4);
         out = append_utf8(buf, out, value);
@@ -116,21 +163,22 @@ static char *decode_identifier(const char *start, size_t len, size_t *out_len) {
 static PSAstNode *parse_identifier_token(PSToken tok) {
     if (memchr(tok.start, '\\', tok.length)) {
         size_t out_len = 0;
-        char *decoded = decode_identifier(tok.start, tok.length, &out_len);
+        char *decoded = decode_identifier(tok.start, tok.length, &out_len, tok.line, tok.column);
         if (!decoded) {
             parse_error("Parse error: out of memory");
         }
         PSAstNode *node = ps_ast_identifier(decoded, out_len);
+        set_pos(node, tok);
         free(decoded);
         return node;
     }
-    return ps_ast_identifier(tok.start, tok.length);
+    return set_pos(ps_ast_identifier(tok.start, tok.length), tok);
 }
 
 static PSString *parse_object_key(PSToken tok) {
     if (memchr(tok.start, '\\', tok.length)) {
         size_t out_len = 0;
-        char *decoded = decode_identifier(tok.start, tok.length, &out_len);
+        char *decoded = decode_identifier(tok.start, tok.length, &out_len, tok.line, tok.column);
         if (!decoded) {
             parse_error("Parse error: out of memory");
         }
@@ -244,13 +292,13 @@ static PSAstNode *parse_unary(PSParser *p);
 static PSAstNode *parse_postfix(PSParser *p);
 static PSAstNode *parse_primary(PSParser *p);
 static PSAstNode *parse_primary_atom(PSParser *p);
-static PSAstNode *parse_regex_literal(PSParser *p);
-static PSAstNode *parse_array_literal(PSParser *p);
-static PSAstNode *parse_object_literal(PSParser *p);
+static PSAstNode *parse_regex_literal(PSParser *p, PSToken start_tok);
+static PSAstNode *parse_array_literal(PSParser *p, PSToken start_tok);
+static PSAstNode *parse_object_literal(PSParser *p, PSToken start_tok);
 static PSAstNode *parse_member_base(PSParser *p);
 static PSAstNode *parse_member(PSParser *p);
-static PSAstNode *parse_block(PSParser *p);
-static PSAstNode *parse_switch(PSParser *p);
+static PSAstNode *parse_block(PSParser *p, PSToken start_tok);
+static PSAstNode *parse_switch(PSParser *p, PSToken switch_tok);
 
 /* --------------------------------------------------------- */
 /* Entry point                                               */
@@ -261,8 +309,10 @@ PSAstNode *ps_parse(const char *source) {
     ps_lexer_init(&p.lexer, source);
     jmp_buf jmp_env;
     g_parse_jmp = &jmp_env;
+    g_parse_parser = &p;
     if (setjmp(jmp_env) != 0) {
         g_parse_jmp = NULL;
+        g_parse_parser = NULL;
         return NULL;
     }
 
@@ -277,6 +327,7 @@ PSAstNode *ps_parse(const char *source) {
     }
 
     g_parse_jmp = NULL;
+    g_parse_parser = NULL;
     return ps_ast_program(items, count);
 }
 
@@ -299,6 +350,7 @@ static PSAstNode *parse_var_decl_list(PSParser *p) {
         }
 
         PSAstNode *decl = ps_ast_var_decl(id_node, init);
+        set_pos(decl, id);
         decls = realloc(decls, sizeof(PSAstNode *) * (count + 1));
         decls[count++] = decl;
     } while (match(p, TOK_COMMA));
@@ -309,7 +361,8 @@ static PSAstNode *parse_var_decl_list(PSParser *p) {
         return only;
     }
 
-    return ps_ast_block(decls, count);
+    PSAstNode *block = ps_ast_block(decls, count);
+    return set_pos_from_node(block, count > 0 ? decls[0] : NULL);
 }
 
 static PSAstNode *parse_statement(PSParser *p) {
@@ -341,26 +394,32 @@ static PSAstNode *parse_statement(PSParser *p) {
                     stmt->as.switch_stmt.label = label_node;
                     return stmt;
                 default:
-                    return ps_ast_label(label_node, stmt);
+                    return set_pos(ps_ast_label(label_node, stmt), label);
             }
         }
         *p = saved;
     }
 
     /* block */
-    if (match(p, TOK_LBRACE)) {
-        return parse_block(p);
+    if (p->current.type == TOK_LBRACE) {
+        PSToken tok = p->current;
+        advance(p);
+        return parse_block(p, tok);
     }
 
     /* var declaration */
-    if (match(p, TOK_VAR)) {
+    if (p->current.type == TOK_VAR) {
+        PSToken tok = p->current;
+        advance(p);
         PSAstNode *decls = parse_var_decl_list(p);
         expect(p, TOK_SEMI, "';'");
-        return decls;
+        return set_pos(decls, tok);
     }
 
     /* function declaration */
-    if (match(p, TOK_FUNCTION)) {
+    if (p->current.type == TOK_FUNCTION) {
+        PSToken tok = p->current;
+        advance(p);
         PSToken id = p->current;
         expect(p, TOK_IDENTIFIER, "function name");
         PSAstNode *id_node = parse_identifier_token(id);
@@ -385,13 +444,16 @@ static PSAstNode *parse_statement(PSParser *p) {
         }
         expect(p, TOK_RPAREN, "')'");
 
+        PSToken body_tok = p->current;
         expect(p, TOK_LBRACE, "'{'");
-        PSAstNode *body = parse_block(p);
-        return ps_ast_func_decl(id_node, params, param_defaults, param_count, body);
+        PSAstNode *body = parse_block(p, body_tok);
+        return set_pos(ps_ast_func_decl(id_node, params, param_defaults, param_count, body), tok);
     }
 
     /* if statement */
-    if (match(p, TOK_IF)) {
+    if (p->current.type == TOK_IF) {
+        PSToken tok = p->current;
+        advance(p);
         expect(p, TOK_LPAREN, "'('");
         PSAstNode *cond = parse_expression(p);
         expect(p, TOK_RPAREN, "')'");
@@ -400,31 +462,37 @@ static PSAstNode *parse_statement(PSParser *p) {
         if (match(p, TOK_ELSE)) {
             else_branch = parse_statement(p);
         }
-        return ps_ast_if(cond, then_branch, else_branch);
+        return set_pos(ps_ast_if(cond, then_branch, else_branch), tok);
     }
 
     /* while statement */
-    if (match(p, TOK_WHILE)) {
+    if (p->current.type == TOK_WHILE) {
+        PSToken tok = p->current;
+        advance(p);
         expect(p, TOK_LPAREN, "'('");
         PSAstNode *cond = parse_expression(p);
         expect(p, TOK_RPAREN, "')'");
         PSAstNode *body = parse_statement(p);
-        return ps_ast_while(cond, body);
+        return set_pos(ps_ast_while(cond, body), tok);
     }
 
     /* do/while statement */
-    if (match(p, TOK_DO)) {
+    if (p->current.type == TOK_DO) {
+        PSToken tok = p->current;
+        advance(p);
         PSAstNode *body = parse_statement(p);
         expect(p, TOK_WHILE, "'while'");
         expect(p, TOK_LPAREN, "'('");
         PSAstNode *cond = parse_expression(p);
         expect(p, TOK_RPAREN, "')'");
         expect(p, TOK_SEMI, "';'");
-        return ps_ast_do_while(body, cond);
+        return set_pos(ps_ast_do_while(body, cond), tok);
     }
 
     /* for statement */
-    if (match(p, TOK_FOR)) {
+    if (p->current.type == TOK_FOR) {
+        PSToken tok = p->current;
+        advance(p);
         expect(p, TOK_LPAREN, "'('");
         PSParser saved = *p;
 
@@ -436,13 +504,13 @@ static PSAstNode *parse_statement(PSParser *p) {
                 PSAstNode *obj = parse_expression(p);
                 expect(p, TOK_RPAREN, "')'");
                 PSAstNode *body = parse_statement(p);
-                return ps_ast_for_in(id_node, obj, body, 1);
+                return set_pos(ps_ast_for_in(id_node, obj, body, 1), tok);
             }
             if (match(p, TOK_OF)) {
                 PSAstNode *obj = parse_expression(p);
                 expect(p, TOK_RPAREN, "')'");
                 PSAstNode *body = parse_statement(p);
-                return ps_ast_for_of(id_node, obj, body, 1);
+                return set_pos(ps_ast_for_of(id_node, obj, body, 1), tok);
             }
         } else {
             PSAstNode *left = parse_member(p);
@@ -450,13 +518,13 @@ static PSAstNode *parse_statement(PSParser *p) {
                 PSAstNode *obj = parse_expression(p);
                 expect(p, TOK_RPAREN, "')'");
                 PSAstNode *body = parse_statement(p);
-                return ps_ast_for_in(left, obj, body, 0);
+                return set_pos(ps_ast_for_in(left, obj, body, 0), tok);
             }
             if (match(p, TOK_OF)) {
                 PSAstNode *obj = parse_expression(p);
                 expect(p, TOK_RPAREN, "')'");
                 PSAstNode *body = parse_statement(p);
-                return ps_ast_for_of(left, obj, body, 0);
+                return set_pos(ps_ast_for_of(left, obj, body, 0), tok);
             }
         }
 
@@ -472,7 +540,7 @@ static PSAstNode *parse_statement(PSParser *p) {
         } else {
             PSAstNode *expr = parse_expression(p);
             expect(p, TOK_SEMI, "';'");
-            init = ps_ast_expr_stmt(expr);
+            init = set_pos_from_node(ps_ast_expr_stmt(expr), expr);
         }
 
         PSAstNode *test = NULL;
@@ -488,16 +556,20 @@ static PSAstNode *parse_statement(PSParser *p) {
         expect(p, TOK_RPAREN, "')'");
 
         PSAstNode *body = parse_statement(p);
-        return ps_ast_for(init, test, update, body);
+        return set_pos(ps_ast_for(init, test, update, body), tok);
     }
 
     /* switch statement */
-    if (match(p, TOK_SWITCH)) {
-        return parse_switch(p);
+    if (p->current.type == TOK_SWITCH) {
+        PSToken tok = p->current;
+        advance(p);
+        return parse_switch(p, tok);
     }
 
     /* break statement */
-    if (match(p, TOK_BREAK)) {
+    if (p->current.type == TOK_BREAK) {
+        PSToken tok = p->current;
+        advance(p);
         PSAstNode *label = NULL;
         if (p->current.type == TOK_IDENTIFIER) {
             PSToken id = p->current;
@@ -505,11 +577,13 @@ static PSAstNode *parse_statement(PSParser *p) {
             label = parse_identifier_token(id);
         }
         expect(p, TOK_SEMI, "';'");
-        return ps_ast_break(label);
+        return set_pos(ps_ast_break(label), tok);
     }
 
     /* continue statement */
-    if (match(p, TOK_CONTINUE)) {
+    if (p->current.type == TOK_CONTINUE) {
+        PSToken tok = p->current;
+        advance(p);
         PSAstNode *label = NULL;
         if (p->current.type == TOK_IDENTIFIER) {
             PSToken id = p->current;
@@ -517,42 +591,51 @@ static PSAstNode *parse_statement(PSParser *p) {
             label = parse_identifier_token(id);
         }
         expect(p, TOK_SEMI, "';'");
-        return ps_ast_continue(label);
+        return set_pos(ps_ast_continue(label), tok);
     }
 
     /* with statement */
-    if (match(p, TOK_WITH)) {
+    if (p->current.type == TOK_WITH) {
 #if !PS_ENABLE_WITH
         parse_error("Parse error: 'with' is disabled");
 #endif
+        PSToken tok = p->current;
+        advance(p);
         expect(p, TOK_LPAREN, "'('");
         PSAstNode *obj = parse_expression(p);
         expect(p, TOK_RPAREN, "')'");
         PSAstNode *body = parse_statement(p);
-        return ps_ast_with(obj, body);
+        return set_pos(ps_ast_with(obj, body), tok);
     }
 
     /* return statement */
-    if (match(p, TOK_RETURN)) {
+    if (p->current.type == TOK_RETURN) {
+        PSToken tok = p->current;
+        advance(p);
         PSAstNode *expr = NULL;
         if (p->current.type != TOK_SEMI) {
             expr = parse_expression(p);
         }
         expect(p, TOK_SEMI, "';'");
-        return ps_ast_return(expr);
+        return set_pos(ps_ast_return(expr), tok);
     }
 
     /* throw statement */
-    if (match(p, TOK_THROW)) {
+    if (p->current.type == TOK_THROW) {
+        PSToken tok = p->current;
+        advance(p);
         PSAstNode *expr = parse_expression(p);
         expect(p, TOK_SEMI, "';'");
-        return ps_ast_throw(expr);
+        return set_pos(ps_ast_throw(expr), tok);
     }
 
     /* try/catch/finally */
-    if (match(p, TOK_TRY)) {
+    if (p->current.type == TOK_TRY) {
+        PSToken tok = p->current;
+        advance(p);
+        PSToken try_tok = p->current;
         expect(p, TOK_LBRACE, "'{'");
-        PSAstNode *try_block = parse_block(p);
+        PSAstNode *try_block = parse_block(p, try_tok);
 
         PSAstNode *catch_param = NULL;
         PSAstNode *catch_block = NULL;
@@ -564,26 +647,28 @@ static PSAstNode *parse_statement(PSParser *p) {
             expect(p, TOK_IDENTIFIER, "identifier");
             catch_param = parse_identifier_token(id);
             expect(p, TOK_RPAREN, "')'");
+            PSToken catch_tok = p->current;
             expect(p, TOK_LBRACE, "'{'");
-            catch_block = parse_block(p);
+            catch_block = parse_block(p, catch_tok);
         }
 
         if (match(p, TOK_FINALLY)) {
+            PSToken finally_tok = p->current;
             expect(p, TOK_LBRACE, "'{'");
-            finally_block = parse_block(p);
+            finally_block = parse_block(p, finally_tok);
         }
 
         if (!catch_block && !finally_block) {
             parse_error("Parse error: try must have catch or finally");
         }
 
-        return ps_ast_try(try_block, catch_param, catch_block, finally_block);
+        return set_pos(ps_ast_try(try_block, catch_param, catch_block, finally_block), tok);
     }
 
     /* expression statement */
     PSAstNode *expr = parse_expression(p);
     expect(p, TOK_SEMI, "';'");
-    return ps_ast_expr_stmt(expr);
+    return set_pos_from_node(ps_ast_expr_stmt(expr), expr);
 }
 
 /* --------------------------------------------------------- */
@@ -596,9 +681,11 @@ static PSAstNode *parse_expression(PSParser *p) {
 
 static PSAstNode *parse_comma(PSParser *p) {
     PSAstNode *left = parse_assignment(p);
-    while (match(p, TOK_COMMA)) {
+    while (p->current.type == TOK_COMMA) {
+        PSToken tok = p->current;
+        advance(p);
         PSAstNode *right = parse_assignment(p);
-        left = ps_ast_binary(TOK_COMMA, left, right);
+        left = set_pos(ps_ast_binary(TOK_COMMA, left, right), tok);
     }
     return left;
 }
@@ -618,13 +705,14 @@ static PSAstNode *parse_assignment(PSParser *p) {
         p->current.type == TOK_SHL_ASSIGN ||
         p->current.type == TOK_SHR_ASSIGN ||
         p->current.type == TOK_USHR_ASSIGN) {
+        PSToken tok = p->current;
         int op = p->current.type;
         advance(p);
         if (left->kind != AST_IDENTIFIER && left->kind != AST_MEMBER) {
             parse_error("Parse error: invalid assignment target");
         }
         PSAstNode *value = parse_assignment(p);
-        return ps_ast_assign(op, left, value);
+        return set_pos(ps_ast_assign(op, left, value), tok);
     }
 
     return left;
@@ -632,11 +720,13 @@ static PSAstNode *parse_assignment(PSParser *p) {
 
 static PSAstNode *parse_conditional(PSParser *p) {
     PSAstNode *cond = parse_logical_or(p);
-    if (match(p, TOK_QUESTION)) {
+    if (p->current.type == TOK_QUESTION) {
+        PSToken tok = p->current;
+        advance(p);
         PSAstNode *then_expr = parse_assignment(p);
         expect(p, TOK_COLON, "':'");
         PSAstNode *else_expr = parse_assignment(p);
-        return ps_ast_conditional(cond, then_expr, else_expr);
+        return set_pos(ps_ast_conditional(cond, then_expr, else_expr), tok);
     }
     return cond;
 }
@@ -644,10 +734,11 @@ static PSAstNode *parse_conditional(PSParser *p) {
 static PSAstNode *parse_logical_or(PSParser *p) {
     PSAstNode *left = parse_logical_and(p);
     while (p->current.type == TOK_OR_OR) {
+        PSToken tok = p->current;
         int op = p->current.type;
         advance(p);
         PSAstNode *right = parse_logical_and(p);
-        left = ps_ast_binary(op, left, right);
+        left = set_pos(ps_ast_binary(op, left, right), tok);
     }
     return left;
 }
@@ -655,10 +746,11 @@ static PSAstNode *parse_logical_or(PSParser *p) {
 static PSAstNode *parse_logical_and(PSParser *p) {
     PSAstNode *left = parse_bitwise_or(p);
     while (p->current.type == TOK_AND_AND) {
+        PSToken tok = p->current;
         int op = p->current.type;
         advance(p);
         PSAstNode *right = parse_bitwise_or(p);
-        left = ps_ast_binary(op, left, right);
+        left = set_pos(ps_ast_binary(op, left, right), tok);
     }
     return left;
 }
@@ -666,10 +758,11 @@ static PSAstNode *parse_logical_and(PSParser *p) {
 static PSAstNode *parse_bitwise_or(PSParser *p) {
     PSAstNode *left = parse_bitwise_xor(p);
     while (p->current.type == TOK_OR) {
+        PSToken tok = p->current;
         int op = p->current.type;
         advance(p);
         PSAstNode *right = parse_bitwise_xor(p);
-        left = ps_ast_binary(op, left, right);
+        left = set_pos(ps_ast_binary(op, left, right), tok);
     }
     return left;
 }
@@ -677,10 +770,11 @@ static PSAstNode *parse_bitwise_or(PSParser *p) {
 static PSAstNode *parse_bitwise_xor(PSParser *p) {
     PSAstNode *left = parse_bitwise_and(p);
     while (p->current.type == TOK_XOR) {
+        PSToken tok = p->current;
         int op = p->current.type;
         advance(p);
         PSAstNode *right = parse_bitwise_and(p);
-        left = ps_ast_binary(op, left, right);
+        left = set_pos(ps_ast_binary(op, left, right), tok);
     }
     return left;
 }
@@ -688,10 +782,11 @@ static PSAstNode *parse_bitwise_xor(PSParser *p) {
 static PSAstNode *parse_bitwise_and(PSParser *p) {
     PSAstNode *left = parse_equality(p);
     while (p->current.type == TOK_AND) {
+        PSToken tok = p->current;
         int op = p->current.type;
         advance(p);
         PSAstNode *right = parse_equality(p);
-        left = ps_ast_binary(op, left, right);
+        left = set_pos(ps_ast_binary(op, left, right), tok);
     }
     return left;
 }
@@ -702,10 +797,11 @@ static PSAstNode *parse_equality(PSParser *p) {
            p->current.type == TOK_NEQ ||
            p->current.type == TOK_STRICT_EQ ||
            p->current.type == TOK_STRICT_NEQ) {
+        PSToken tok = p->current;
         int op = p->current.type;
         advance(p);
         PSAstNode *right = parse_relational(p);
-        left = ps_ast_binary(op, left, right);
+        left = set_pos(ps_ast_binary(op, left, right), tok);
     }
     return left;
 }
@@ -717,10 +813,11 @@ static PSAstNode *parse_relational(PSParser *p) {
            p->current.type == TOK_LTE ||
            p->current.type == TOK_GT ||
            p->current.type == TOK_GTE) {
+        PSToken tok = p->current;
         int op = p->current.type;
         advance(p);
         PSAstNode *right = parse_shift(p);
-        left = ps_ast_binary(op, left, right);
+        left = set_pos(ps_ast_binary(op, left, right), tok);
     }
 
     return left;
@@ -731,10 +828,11 @@ static PSAstNode *parse_shift(PSParser *p) {
     while (p->current.type == TOK_SHL ||
            p->current.type == TOK_SHR ||
            p->current.type == TOK_USHR) {
+        PSToken tok = p->current;
         int op = p->current.type;
         advance(p);
         PSAstNode *right = parse_additive(p);
-        left = ps_ast_binary(op, left, right);
+        left = set_pos(ps_ast_binary(op, left, right), tok);
     }
     return left;
 }
@@ -743,10 +841,11 @@ static PSAstNode *parse_additive(PSParser *p) {
     PSAstNode *left = parse_multiplicative(p);
 
     while (p->current.type == TOK_PLUS || p->current.type == TOK_MINUS) {
+        PSToken tok = p->current;
         int op = p->current.type;
         advance(p);
         PSAstNode *right = parse_multiplicative(p);
-        left = ps_ast_binary(op, left, right);
+        left = set_pos(ps_ast_binary(op, left, right), tok);
     }
 
     return left;
@@ -757,10 +856,11 @@ static PSAstNode *parse_multiplicative(PSParser *p) {
     while (p->current.type == TOK_STAR ||
            p->current.type == TOK_SLASH ||
            p->current.type == TOK_PERCENT) {
+        PSToken tok = p->current;
         int op = p->current.type;
         advance(p);
         PSAstNode *right = parse_unary(p);
-        left = ps_ast_binary(op, left, right);
+        left = set_pos(ps_ast_binary(op, left, right), tok);
     }
     return left;
 }
@@ -773,18 +873,20 @@ static PSAstNode *parse_unary(PSParser *p) {
         p->current.type == TOK_TYPEOF ||
         p->current.type == TOK_VOID ||
         p->current.type == TOK_DELETE) {
+        PSToken tok = p->current;
         int op = p->current.type;
         advance(p);
         PSAstNode *expr = parse_unary(p);
-        return ps_ast_unary(op, expr);
+        return set_pos(ps_ast_unary(op, expr), tok);
     }
 
     if (p->current.type == TOK_PLUS_PLUS ||
         p->current.type == TOK_MINUS_MINUS) {
+        PSToken tok = p->current;
         int op = p->current.type;
         advance(p);
         PSAstNode *expr = parse_unary(p);
-        return ps_ast_update(op, 1, expr);
+        return set_pos(ps_ast_update(op, 1, expr), tok);
     }
 
     return parse_postfix(p);
@@ -794,9 +896,10 @@ static PSAstNode *parse_postfix(PSParser *p) {
     PSAstNode *expr = parse_member(p);
     if (p->current.type == TOK_PLUS_PLUS ||
         p->current.type == TOK_MINUS_MINUS) {
+        PSToken tok = p->current;
         int op = p->current.type;
         advance(p);
-        return ps_ast_update(op, 0, expr);
+        return set_pos(ps_ast_update(op, 0, expr), tok);
     }
     return expr;
 }
@@ -810,25 +913,31 @@ static PSAstNode *parse_member(PSParser *p) {
 
     for (;;) {
         /* obj.prop */
-        if (match(p, TOK_DOT)) {
+        if (p->current.type == TOK_DOT) {
+            PSToken tok = p->current;
+            advance(p);
             PSToken id = p->current;
             expect(p, TOK_IDENTIFIER, "property identifier");
             PSAstNode *prop =
                 parse_identifier_token(id);
-            expr = ps_ast_member(expr, prop, 0);
+            expr = set_pos(ps_ast_member(expr, prop, 0), tok);
             continue;
         }
 
         /* obj[expr] */
-        if (match(p, TOK_LBRACKET)) {
+        if (p->current.type == TOK_LBRACKET) {
+            PSToken tok = p->current;
+            advance(p);
             PSAstNode *prop = parse_expression(p);
             expect(p, TOK_RBRACKET, "']'");
-            expr = ps_ast_member(expr, prop, 1);
+            expr = set_pos(ps_ast_member(expr, prop, 1), tok);
             continue;
         }
 
         /* call */
-        if (match(p, TOK_LPAREN)) {
+        if (p->current.type == TOK_LPAREN) {
+            PSToken tok = p->current;
+            advance(p);
             PSAstNode **args = NULL;
             size_t argc = 0;
 
@@ -840,7 +949,7 @@ static PSAstNode *parse_member(PSParser *p) {
             }
 
             expect(p, TOK_RPAREN, "')'");
-            expr = ps_ast_call(expr, args, argc);
+            expr = set_pos(ps_ast_call(expr, args, argc), tok);
             continue;
         }
 
@@ -855,12 +964,15 @@ static PSAstNode *parse_member(PSParser *p) {
 /* --------------------------------------------------------- */
 
 static PSAstNode *parse_primary(PSParser *p) {
-    if (match(p, TOK_NEW)) {
+    if (p->current.type == TOK_NEW) {
+        PSToken tok = p->current;
+        advance(p);
         PSAstNode *callee = parse_member_base(p);
         PSAstNode **args = NULL;
         size_t argc = 0;
 
-        if (match(p, TOK_LPAREN)) {
+        if (p->current.type == TOK_LPAREN) {
+            advance(p);
             if (p->current.type != TOK_RPAREN) {
                 do {
                     args = realloc(args, sizeof(PSAstNode *) * (argc + 1));
@@ -870,7 +982,7 @@ static PSAstNode *parse_primary(PSParser *p) {
             expect(p, TOK_RPAREN, "')'");
         }
 
-        return ps_ast_new(callee, args, argc);
+        return set_pos(ps_ast_new(callee, args, argc), tok);
     }
 
     return parse_primary_atom(p);
@@ -880,18 +992,22 @@ static PSAstNode *parse_member_base(PSParser *p) {
     PSAstNode *expr = parse_primary_atom(p);
 
     for (;;) {
-        if (match(p, TOK_DOT)) {
+        if (p->current.type == TOK_DOT) {
+            PSToken tok = p->current;
+            advance(p);
             PSToken id = p->current;
             expect(p, TOK_IDENTIFIER, "property identifier");
             PSAstNode *prop = parse_identifier_token(id);
-            expr = ps_ast_member(expr, prop, 0);
+            expr = set_pos(ps_ast_member(expr, prop, 0), tok);
             continue;
         }
 
-        if (match(p, TOK_LBRACKET)) {
+        if (p->current.type == TOK_LBRACKET) {
+            PSToken tok = p->current;
+            advance(p);
             PSAstNode *prop = parse_expression(p);
             expect(p, TOK_RBRACKET, "']'");
-            expr = ps_ast_member(expr, prop, 1);
+            expr = set_pos(ps_ast_member(expr, prop, 1), tok);
             continue;
         }
 
@@ -911,40 +1027,76 @@ static PSAstNode *parse_primary_atom(PSParser *p) {
 
     /* number literal */
     if (match(p, TOK_NUMBER)) {
-        return ps_ast_literal(ps_value_number(tok.number));
+        return set_pos(ps_ast_literal(ps_value_number(tok.number)), tok);
     }
 
     if (match(p, TOK_TRUE)) {
-        return ps_ast_literal(ps_value_boolean(1));
+        return set_pos(ps_ast_literal(ps_value_boolean(1)), tok);
     }
 
     if (match(p, TOK_FALSE)) {
-        return ps_ast_literal(ps_value_boolean(0));
+        return set_pos(ps_ast_literal(ps_value_boolean(0)), tok);
     }
 
     if (match(p, TOK_NULL)) {
-        return ps_ast_literal(ps_value_null());
+        return set_pos(ps_ast_literal(ps_value_null()), tok);
+    }
+
+    /* function expression */
+    if (match(p, TOK_FUNCTION)) {
+        PSToken func_tok = tok;
+        PSAstNode *id_node = NULL;
+        if (p->current.type == TOK_IDENTIFIER) {
+            PSToken id = p->current;
+            advance(p);
+            id_node = parse_identifier_token(id);
+        }
+
+        expect(p, TOK_LPAREN, "'('");
+        PSAstNode **params = NULL;
+        PSAstNode **param_defaults = NULL;
+        size_t param_count = 0;
+        if (p->current.type != TOK_RPAREN) {
+            do {
+                PSToken param = p->current;
+                expect(p, TOK_IDENTIFIER, "parameter name");
+                params = realloc(params, sizeof(PSAstNode *) * (param_count + 1));
+                param_defaults = realloc(param_defaults, sizeof(PSAstNode *) * (param_count + 1));
+                params[param_count] = parse_identifier_token(param);
+                param_defaults[param_count] = NULL;
+                if (match(p, TOK_ASSIGN)) {
+                    param_defaults[param_count] = parse_assignment(p);
+                }
+                param_count++;
+            } while (match(p, TOK_COMMA));
+        }
+        expect(p, TOK_RPAREN, "')'");
+
+        PSToken body_tok = p->current;
+        expect(p, TOK_LBRACE, "'{'");
+        PSAstNode *body = parse_block(p, body_tok);
+        return set_pos(ps_ast_func_expr(id_node, params, param_defaults, param_count, body), func_tok);
     }
 
     /* string literal */
     if (match(p, TOK_STRING)) {
         PSString *s = parse_string_literal(tok.start, tok.length);
-        return ps_ast_literal(ps_value_string(s));
+        return set_pos(ps_ast_literal(ps_value_string(s)), tok);
     }
 
     /* array literal */
     if (match(p, TOK_LBRACKET)) {
-        return parse_array_literal(p);
+        return parse_array_literal(p, tok);
     }
 
     /* object literal */
     if (match(p, TOK_LBRACE)) {
-        return parse_object_literal(p);
+        return parse_object_literal(p, tok);
     }
 
     /* regex literal */
     if (p->current.type == TOK_SLASH) {
-        return parse_regex_literal(p);
+        return parse_regex_literal(p, tok);
     }
 
     /* parenthesized */
@@ -955,15 +1107,15 @@ static PSAstNode *parse_primary_atom(PSParser *p) {
     }
 
     parse_error("Parse error: unexpected token");
-    return ps_ast_literal(ps_value_undefined());
+    return set_pos(ps_ast_literal(ps_value_undefined()), tok);
 }
 
-static PSAstNode *parse_array_literal(PSParser *p) {
+static PSAstNode *parse_array_literal(PSParser *p, PSToken start_tok) {
     PSAstNode **items = NULL;
     size_t count = 0;
 
     if (match(p, TOK_RBRACKET)) {
-        return ps_ast_array_literal(items, count);
+        return set_pos(ps_ast_array_literal(items, count), start_tok);
     }
 
     while (1) {
@@ -980,15 +1132,15 @@ static PSAstNode *parse_array_literal(PSParser *p) {
         break;
     }
 
-    return ps_ast_array_literal(items, count);
+    return set_pos(ps_ast_array_literal(items, count), start_tok);
 }
 
-static PSAstNode *parse_object_literal(PSParser *p) {
+static PSAstNode *parse_object_literal(PSParser *p, PSToken start_tok) {
     PSAstProperty *props = NULL;
     size_t count = 0;
 
     if (match(p, TOK_RBRACE)) {
-        return ps_ast_object_literal(props, count);
+        return set_pos(ps_ast_object_literal(props, count), start_tok);
     }
 
     while (1) {
@@ -1023,10 +1175,10 @@ static PSAstNode *parse_object_literal(PSParser *p) {
         break;
     }
 
-    return ps_ast_object_literal(props, count);
+    return set_pos(ps_ast_object_literal(props, count), start_tok);
 }
 
-static PSAstNode *parse_regex_literal(PSParser *p) {
+static PSAstNode *parse_regex_literal(PSParser *p, PSToken start_tok) {
     const char *src = p->lexer.src;
     size_t start_pos = p->lexer.pos;
     size_t pos = start_pos;
@@ -1065,17 +1217,18 @@ static PSAstNode *parse_regex_literal(PSParser *p) {
 
     PSString *pattern = ps_string_from_utf8(src + start_pos, pattern_len);
     PSAstNode *callee = ps_ast_identifier("RegExp", 6);
+    set_pos(callee, start_tok);
     size_t argc = flags_len > 0 ? 2 : 1;
     PSAstNode **args = (PSAstNode **)malloc(sizeof(PSAstNode *) * argc);
-    args[0] = ps_ast_literal(ps_value_string(pattern));
+    args[0] = set_pos(ps_ast_literal(ps_value_string(pattern)), start_tok);
     if (flags_len > 0) {
         PSString *flags = ps_string_from_utf8(src + flags_start, flags_len);
-        args[1] = ps_ast_literal(ps_value_string(flags));
+        args[1] = set_pos(ps_ast_literal(ps_value_string(flags)), start_tok);
     }
-    return ps_ast_new(callee, args, argc);
+    return set_pos(ps_ast_new(callee, args, argc), start_tok);
 }
 
-static PSAstNode *parse_block(PSParser *p) {
+static PSAstNode *parse_block(PSParser *p, PSToken start_tok) {
     PSAstNode **items = NULL;
     size_t count = 0;
 
@@ -1085,10 +1238,10 @@ static PSAstNode *parse_block(PSParser *p) {
     }
 
     expect(p, TOK_RBRACE, "'}'");
-    return ps_ast_block(items, count);
+    return set_pos(ps_ast_block(items, count), start_tok);
 }
 
-static PSAstNode *parse_switch(PSParser *p) {
+static PSAstNode *parse_switch(PSParser *p, PSToken switch_tok) {
     expect(p, TOK_LPAREN, "'('");
     PSAstNode *expr = parse_expression(p);
     expect(p, TOK_RPAREN, "')'");
@@ -1099,30 +1252,47 @@ static PSAstNode *parse_switch(PSParser *p) {
 
     while (p->current.type != TOK_RBRACE && p->current.type != TOK_EOF) {
         PSAstNode *test = NULL;
-        if (match(p, TOK_CASE)) {
+        if (p->current.type == TOK_CASE) {
+            PSToken case_tok = p->current;
+            advance(p);
             test = parse_expression(p);
             expect(p, TOK_COLON, "':'");
-        } else if (match(p, TOK_DEFAULT)) {
+            PSAstNode **items = NULL;
+            size_t count = 0;
+            while (p->current.type != TOK_CASE &&
+                   p->current.type != TOK_DEFAULT &&
+                   p->current.type != TOK_RBRACE) {
+                items = realloc(items, sizeof(PSAstNode *) * (count + 1));
+                items[count++] = parse_statement(p);
+            }
+
+            PSAstNode *case_node = set_pos(ps_ast_case(test, items, count), case_tok);
+            cases = realloc(cases, sizeof(PSAstNode *) * (case_count + 1));
+            cases[case_count++] = case_node;
+            continue;
+        } else if (p->current.type == TOK_DEFAULT) {
+            PSToken case_tok = p->current;
+            advance(p);
             test = NULL;
             expect(p, TOK_COLON, "':'");
+            PSAstNode **items = NULL;
+            size_t count = 0;
+            while (p->current.type != TOK_CASE &&
+                   p->current.type != TOK_DEFAULT &&
+                   p->current.type != TOK_RBRACE) {
+                items = realloc(items, sizeof(PSAstNode *) * (count + 1));
+                items[count++] = parse_statement(p);
+            }
+
+            PSAstNode *case_node = set_pos(ps_ast_case(test, items, count), case_tok);
+            cases = realloc(cases, sizeof(PSAstNode *) * (case_count + 1));
+            cases[case_count++] = case_node;
+            continue;
         } else {
             parse_error("Parse error: expected case/default");
         }
-
-        PSAstNode **items = NULL;
-        size_t count = 0;
-        while (p->current.type != TOK_CASE &&
-               p->current.type != TOK_DEFAULT &&
-               p->current.type != TOK_RBRACE) {
-            items = realloc(items, sizeof(PSAstNode *) * (count + 1));
-            items[count++] = parse_statement(p);
-        }
-
-        PSAstNode *case_node = ps_ast_case(test, items, count);
-        cases = realloc(cases, sizeof(PSAstNode *) * (case_count + 1));
-        cases[case_count++] = case_node;
     }
 
     expect(p, TOK_RBRACE, "'}'");
-    return ps_ast_switch(expr, cases, case_count);
+    return set_pos(ps_ast_switch(expr, cases, case_count), switch_tok);
 }

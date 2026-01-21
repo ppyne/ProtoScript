@@ -27,7 +27,7 @@ if (window.CodeMirror) {
 runBtn.disabled = true;
 
 const appendOut = (text) => {
-  outputEl.textContent += text + "\n";
+  outputEl.textContent += text;
 };
 
 const clearOut = () => {

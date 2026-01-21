@@ -93,13 +93,19 @@ typedef struct {
     const char *start;   /* pointer into source */
     size_t      length;  /* byte length */
     double      number;  /* for TOK_NUMBER */
+    size_t      line;    /* 1-based */
+    size_t      column;  /* 1-based */
 } PSToken;
 
 typedef struct {
     const char *src;
     size_t      pos;
+    size_t      line;
+    size_t      column;
     int         error;
     const char *error_msg;
+    size_t      error_line;
+    size_t      error_column;
 } PSLexer;
 
 /* API */

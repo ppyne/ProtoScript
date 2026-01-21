@@ -180,6 +180,20 @@ PSAstNode *ps_ast_func_decl(PSAstNode *id,
     return n;
 }
 
+PSAstNode *ps_ast_func_expr(PSAstNode *id,
+                            PSAstNode **params,
+                            PSAstNode **param_defaults,
+                            size_t param_count,
+                            PSAstNode *body) {
+    PSAstNode *n = alloc_node(AST_FUNCTION_EXPR);
+    n->as.func_expr.id = id;
+    n->as.func_expr.params = params;
+    n->as.func_expr.param_defaults = param_defaults;
+    n->as.func_expr.param_count = param_count;
+    n->as.func_expr.body = body;
+    return n;
+}
+
 PSAstNode *ps_ast_identifier(const char *name, size_t length) {
     PSAstNode *n = alloc_node(AST_IDENTIFIER);
     char *copy = (char *)malloc(length + 1);
@@ -393,6 +407,18 @@ void ps_ast_free(PSAstNode *node) {
             free(node->as.func_decl.params);
             free(node->as.func_decl.param_defaults);
             ps_ast_free(node->as.func_decl.body);
+            break;
+        case AST_FUNCTION_EXPR:
+            ps_ast_free(node->as.func_expr.id);
+            for (size_t i = 0; i < node->as.func_expr.param_count; i++) {
+                ps_ast_free(node->as.func_expr.params[i]);
+                if (node->as.func_expr.param_defaults) {
+                    ps_ast_free(node->as.func_expr.param_defaults[i]);
+                }
+            }
+            free(node->as.func_expr.params);
+            free(node->as.func_expr.param_defaults);
+            ps_ast_free(node->as.func_expr.body);
             break;
 
         case AST_BINARY:

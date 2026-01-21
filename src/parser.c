@@ -348,20 +348,27 @@ static PSAstNode *parse_statement(PSParser *p) {
 
         expect(p, TOK_LPAREN, "'('");
         PSAstNode **params = NULL;
+        PSAstNode **param_defaults = NULL;
         size_t param_count = 0;
         if (p->current.type != TOK_RPAREN) {
             do {
                 PSToken param = p->current;
                 expect(p, TOK_IDENTIFIER, "parameter name");
                 params = realloc(params, sizeof(PSAstNode *) * (param_count + 1));
-                params[param_count++] = parse_identifier_token(param);
+                param_defaults = realloc(param_defaults, sizeof(PSAstNode *) * (param_count + 1));
+                params[param_count] = parse_identifier_token(param);
+                param_defaults[param_count] = NULL;
+                if (match(p, TOK_ASSIGN)) {
+                    param_defaults[param_count] = parse_assignment(p);
+                }
+                param_count++;
             } while (match(p, TOK_COMMA));
         }
         expect(p, TOK_RPAREN, "')'");
 
         expect(p, TOK_LBRACE, "'{'");
         PSAstNode *body = parse_block(p);
-        return ps_ast_func_decl(id_node, params, param_count, body);
+        return ps_ast_func_decl(id_node, params, param_defaults, param_count, body);
     }
 
     /* if statement */

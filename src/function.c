@@ -23,6 +23,7 @@ PSObject *ps_function_new_native(PSNativeFunc fn) {
 }
 
 PSObject *ps_function_new_script(PSAstNode **params,
+                                 PSAstNode **param_defaults,
                                  size_t param_count,
                                  PSAstNode *body,
                                  PSEnv *env) {
@@ -37,6 +38,7 @@ PSObject *ps_function_new_script(PSAstNode **params,
 
     func->is_native = 0;
     func->params = params;
+    func->param_defaults = param_defaults;
     func->param_count = param_count;
     func->body = body;
     func->env = env;

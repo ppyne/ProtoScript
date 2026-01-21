@@ -17,12 +17,14 @@ typedef struct PSFunction {
     PSNativeFunc     native;
     struct PSAstNode *body;
     struct PSAstNode **params;
+    struct PSAstNode **param_defaults;
     size_t           param_count;
     struct PSEnv    *env;
 } PSFunction;
 
 PSObject   *ps_function_new_native(PSNativeFunc fn);
 PSObject   *ps_function_new_script(struct PSAstNode **params,
+                                   struct PSAstNode **param_defaults,
                                    size_t param_count,
                                    struct PSAstNode *body,
                                    struct PSEnv *env);

@@ -195,13 +195,16 @@ Integers may be written in:
 - decimal (base 10)
 - hexadecimal (base 16, `0x` prefix)
 - octal (base 8, leading `0`)
+- exponent notation (base-10, `e`/`E` with optional sign)
 
 Examples:
 
 ```js
 42
 0xFFF
+012
 -345
+2E-12
 ```
 
 ---

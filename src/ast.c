@@ -158,11 +158,13 @@ PSAstNode *ps_ast_try(PSAstNode *try_block,
 
 PSAstNode *ps_ast_func_decl(PSAstNode *id,
                             PSAstNode **params,
+                            PSAstNode **param_defaults,
                             size_t param_count,
                             PSAstNode *body) {
     PSAstNode *n = alloc_node(AST_FUNCTION_DECL);
     n->as.func_decl.id = id;
     n->as.func_decl.params = params;
+    n->as.func_decl.param_defaults = param_defaults;
     n->as.func_decl.param_count = param_count;
     n->as.func_decl.body = body;
     return n;
@@ -355,8 +357,12 @@ void ps_ast_free(PSAstNode *node) {
             ps_ast_free(node->as.func_decl.id);
             for (size_t i = 0; i < node->as.func_decl.param_count; i++) {
                 ps_ast_free(node->as.func_decl.params[i]);
+                if (node->as.func_decl.param_defaults) {
+                    ps_ast_free(node->as.func_decl.param_defaults[i]);
+                }
             }
             free(node->as.func_decl.params);
+            free(node->as.func_decl.param_defaults);
             ps_ast_free(node->as.func_decl.body);
             break;
 

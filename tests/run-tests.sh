@@ -181,3 +181,4 @@ run_case 123-regexp-static-captures 0
 run_case 124-regexp-static-captures-dot 0
 run_case 125-numeric-literals 0
 run_case 126-unicode-identifiers 0
+run_case 127-default-params 0

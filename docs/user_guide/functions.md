@@ -13,6 +13,14 @@ A function definition consists of:
 - A list of parameters, enclosed in parentheses and separated by commas
 - A block of statements enclosed in curly braces `{ }`
 
+ProtoScript also supports ES2015-style default parameter values:
+
+```js
+function f(x, y = 10) {
+    return x + y;
+}
+```
+
 ```js
 function square(number) {
     return number * number;

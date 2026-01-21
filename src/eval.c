@@ -577,6 +577,31 @@ PSValue ps_eval_call_function(PSVM *vm,
     }
 #endif
 
+    for (size_t i = 0; i < func->param_count; i++) {
+        PSAstNode *default_expr = func->param_defaults ? func->param_defaults[i] : NULL;
+        if (!default_expr) continue;
+        PSValue current = ((int)i < argc) ? argv[i] : ps_value_undefined();
+        if (current.type != PS_T_UNDEFINED) continue;
+        PSEvalControl default_ctl = {0};
+        PSValue default_val = eval_expression(vm, call_env, default_expr, &default_ctl);
+        if (default_ctl.did_throw) {
+            ps_env_free(call_env);
+            if (did_throw) *did_throw = 1;
+            if (throw_value) *throw_value = default_ctl.throw_value;
+            return throw_value ? *throw_value : ps_value_undefined();
+        }
+        PSAstNode *param = func->params[i];
+        PSString *name = ps_string_from_utf8(
+            param->as.identifier.name,
+            param->as.identifier.length
+        );
+        if ((int)i < argc) {
+            ps_env_set(call_env, name, default_val);
+        } else {
+            ps_object_put(call_env->record, name, default_val);
+        }
+    }
+
     PSEvalControl inner = {0};
     PSValue ret = eval_node(vm, call_env, func->body, &inner);
     ps_env_free(call_env);
@@ -648,6 +673,7 @@ static void hoist_decls(PSVM *vm, PSEnv *env, PSAstNode *node) {
             );
             PSObject *fn_obj = ps_function_new_script(
                 node->as.func_decl.params,
+                node->as.func_decl.param_defaults,
                 node->as.func_decl.param_count,
                 node->as.func_decl.body,
                 env

@@ -169,6 +169,7 @@ struct PSAstNode {
         struct {
             PSAstNode  *id;
             PSAstNode **params;
+            PSAstNode **param_defaults;
             size_t      param_count;
             PSAstNode  *body;
         } func_decl;
@@ -270,6 +271,7 @@ PSAstNode *ps_ast_try(PSAstNode *try_block,
                       PSAstNode *finally_block);
 PSAstNode *ps_ast_func_decl(PSAstNode *id,
                             PSAstNode **params,
+                            PSAstNode **param_defaults,
                             size_t param_count,
                             PSAstNode *body);
 

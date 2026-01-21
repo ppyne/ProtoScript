@@ -31,3 +31,9 @@ disabled, attempting to use them is rejected.
 ## 5. Host extension
 
 `Io.print` is a non-standard host extension.
+
+## 6. ES2015 default parameters
+
+ProtoScript supports ES2015-style default parameter values in function
+declarations (for example `function f(x, y = 10) { ... }`). This is an ES6
+extension beyond ES1.

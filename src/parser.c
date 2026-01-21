@@ -812,7 +812,8 @@ static PSAstNode *parse_relational(PSParser *p) {
     while (p->current.type == TOK_LT ||
            p->current.type == TOK_LTE ||
            p->current.type == TOK_GT ||
-           p->current.type == TOK_GTE) {
+           p->current.type == TOK_GTE ||
+           p->current.type == TOK_INSTANCEOF) {
         PSToken tok = p->current;
         int op = p->current.type;
         advance(p);

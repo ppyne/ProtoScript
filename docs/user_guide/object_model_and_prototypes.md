@@ -142,17 +142,22 @@ If a property exists locally, it shadows any inherited property of the same name
 
 ## Determining Prototype Relationships
 
-ProtoScript does not provide a built-in `instanceof` operator. Prototype relationships can be tested manually:
+ProtoScript provides the `instanceof` operator to test prototype relationships.
+The right-hand side must be a function (a constructor), and its `prototype`
+is used for the lookup.
 
 ```js
-function instanceOf(object, constructor) {
-    while (object != null) {
-        if (object == constructor.prototype)
-            return true;
-        object = object.__proto__;
-    }
-    return false;
-}
+function Foo() {}
+var a = new Foo();
+Io.print((a instanceof Foo) + "\n");
+```
+
+```js
+if ([] instanceof Array) Io.print("Is an array\n");
+else Io.print("Is not an array\n"); // Is an array
+
+if ({} instanceof Array) Io.print("Is an array\n");
+else Io.print("Is not an array\n"); // Is not an array
 ```
 
 ---
@@ -166,4 +171,3 @@ Constructors that modify global state (such as counters) must be designed carefu
 ## No Multiple Inheritance
 
 ProtoScript supports **single inheritance only**. An object has exactly one prototype. While a constructor may call multiple other constructors, this does not establish multiple prototype chains.
-

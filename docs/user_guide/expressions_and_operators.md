@@ -191,6 +191,8 @@ The `+=` operator may also be used for concatenation.
 
 ### Conditional Operator
 
+ProtoScript supports the ternary `?:` operator and uses the standard truthiness rules.
+
 ```js
 condition ? value1 : value2
 ```
@@ -199,6 +201,7 @@ Example:
 
 ```js
 status = (age >= 18) ? "adult" : "minor";
+Io.print((age >= 18 ? "adult" : "minor") + "\n");
 ```
 
 ---
@@ -293,4 +296,3 @@ From lowest to highest precedence:
 15. function call
 16. `new`
 17. member access (`.` `[]`)
-

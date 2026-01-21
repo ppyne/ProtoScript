@@ -143,6 +143,7 @@ static PSTokenType keyword_type(const char *s, size_t len) {
     if (len == 7 && strncmp(s, "finally", 7) == 0) return TOK_FINALLY;
     if (len == 5 && strncmp(s, "throw", 5) == 0) return TOK_THROW;
     if (len == 3 && strncmp(s, "new", 3) == 0) return TOK_NEW;
+    if (len == 10 && strncmp(s, "instanceof", 10) == 0) return TOK_INSTANCEOF;
     if (len == 4 && strncmp(s, "true", 4) == 0) return TOK_TRUE;
     if (len == 5 && strncmp(s, "false", 5) == 0) return TOK_FALSE;
     if (len == 4 && strncmp(s, "null", 4) == 0) return TOK_NULL;

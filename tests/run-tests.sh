@@ -193,3 +193,5 @@ run_case 135-for-of-array 0
 run_case 136-for-of-object 0
 run_case 137-for-of-string 0
 run_case 138-function-expr-closure 0
+run_case 139-instanceof 0
+run_case 140-instanceof-array 0

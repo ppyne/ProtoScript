@@ -59,3 +59,9 @@ ProtoScript supports a simplified `for...of` loop (ES2015/ES6). It iterates:
 - glyphs of UTF-8 strings.
 
 This is an ES6 extension beyond ES1 and does not use the ES6 iterator protocol.
+
+## 10. `instanceof` (ES3)
+
+ProtoScript supports the `instanceof` operator (added in ES3). The right-hand
+side must be a function with a valid `prototype`, otherwise a `TypeError` is
+raised.

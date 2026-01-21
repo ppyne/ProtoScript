@@ -1822,6 +1822,34 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                     if (node->as.binary.op == TOK_GT) return ps_value_boolean(ln > rn);
                     return ps_value_boolean(ln >= rn);
                 }
+                case TOK_INSTANCEOF: {
+                    if (right.type != PS_T_OBJECT || !right.as.object ||
+                        right.as.object->kind != PS_OBJ_KIND_FUNCTION) {
+                        ctl->did_throw = 1;
+                        ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Right-hand side of instanceof is not callable");
+                        return ctl->throw_value;
+                    }
+                    if (left.type != PS_T_OBJECT || !left.as.object) {
+                        return ps_value_boolean(0);
+                    }
+                    PSString *proto_key = ps_string_from_cstr("prototype");
+                    int found = 0;
+                    PSValue proto_val = ps_object_get(right.as.object, proto_key, &found);
+                    if (!found || proto_val.type != PS_T_OBJECT || !proto_val.as.object) {
+                        ctl->did_throw = 1;
+                        ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Function has invalid prototype");
+                        return ctl->throw_value;
+                    }
+                    PSObject *target = proto_val.as.object;
+                    PSObject *obj = left.as.object;
+                    while (obj) {
+                        if (obj->prototype == target) {
+                            return ps_value_boolean(1);
+                        }
+                        obj = obj->prototype;
+                    }
+                    return ps_value_boolean(0);
+                }
                 case TOK_EQ:
                 {
                     int eq = ps_abstract_equals(vm, &left, &right, ctl);

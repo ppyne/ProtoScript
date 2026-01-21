@@ -33,6 +33,7 @@ typedef enum {
     TOK_FINALLY,
     TOK_THROW,
     TOK_NEW,
+    TOK_INSTANCEOF,
     TOK_TRUE,
     TOK_FALSE,
     TOK_NULL,

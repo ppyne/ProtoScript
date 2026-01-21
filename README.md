@@ -1,3 +1,5 @@
+![ProtoScript](header.png)
+
 # ProtoScript
 
 ProtoScript is a C reimplementation of an ECMAScript 1 core (almost JavaScript 1.3), designed as a minimal, embeddable scripting language.

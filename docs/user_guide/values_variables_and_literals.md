@@ -1,3 +1,5 @@
+![ProtoScript](../../header.png)
+
 # Chapter 2 — Values, Variables, and Literals
 
 This chapter describes the **fundamental data elements** of ProtoScript: values, variables, and literals.

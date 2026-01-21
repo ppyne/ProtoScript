@@ -1,3 +1,5 @@
+![ProtoScript](../../header.png)
+
 # Chapter 3 — Expressions and Operators
 
 This chapter describes **ProtoScript expressions and operators**, including assignment, comparison, arithmetic, bitwise, logical, string, and special operators.

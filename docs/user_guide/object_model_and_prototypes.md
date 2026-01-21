@@ -1,3 +1,5 @@
+![ProtoScript](../../header.png)
+
 # Chapter 8 — Object Model and Prototypes
 
 ProtoScript is a **prototype-based language**, not a class-based one. Objects inherit properties directly from other objects through the prototype chain. This chapter explains in detail how constructor functions, prototypes, and inheritance work in ProtoScript.

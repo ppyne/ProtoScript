@@ -1,3 +1,5 @@
+![ProtoScript](../../header.png)
+
 # Chapter 6 — Functions
 
 Functions are one of the fundamental building blocks in **ProtoScript**. A function is a procedure—a set of statements that performs a specific task. To use a function, you must first define it; then your script can call it.

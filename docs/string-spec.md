@@ -1,3 +1,5 @@
+![ProtoScript](../header.png)
+
 # ProtoScript — Internal String Specification
 
 ## 1. Definition

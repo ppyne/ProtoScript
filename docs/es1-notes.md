@@ -1,3 +1,5 @@
+![ProtoScript](../header.png)
+
 # ProtoScript — ES1 Deviations Only
 
 This document lists only the remaining deviations from [ECMA-262 Edition 1](ECMA-262_1st_edition_june_1997.pdf).

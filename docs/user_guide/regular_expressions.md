@@ -1,3 +1,5 @@
+![ProtoScript](../../header.png)
+
 # Chapter 4 — Regular Expressions
 
 Regular expressions are patterns used to match character combinations in strings. In ProtoScript, regular expressions are objects.

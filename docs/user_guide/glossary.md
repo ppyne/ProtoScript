@@ -1,3 +1,5 @@
+![ProtoScript](../../header.png)
+
 # ProtoScript Glossary
 
 This glossary defines terms useful for understanding **ProtoScript** programs.

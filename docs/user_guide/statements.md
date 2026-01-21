@@ -1,3 +1,5 @@
+![ProtoScript](../../header.png)
+
 # Chapter 5 — Statements
 
 ProtoScript supports a compact set of **statements** used to control program flow, repeat operations, manipulate objects, and document code. This chapter provides an overview of all core statements.

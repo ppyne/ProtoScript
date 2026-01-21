@@ -1,3 +1,5 @@
+![ProtoScript](../../header.png)
+
 # Index
 
 This index lists core **ProtoScript language concepts**, operators, statements, objects, and functions.

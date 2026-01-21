@@ -1,3 +1,5 @@
+![ProtoScript](../../header.png)
+
 # Chapter 7 — Working with Objects
 
 ProtoScript is designed around a simple **object-based paradigm**. An object is a collection of properties, where each property is either a value or another object. Objects can also have associated functions, called **methods**.

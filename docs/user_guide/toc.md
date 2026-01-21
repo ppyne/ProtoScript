@@ -1,3 +1,5 @@
+![ProtoScript](../../header.png)
+
 # ProtoScript — User Guide
 
 This document is the **main table of contents** for the ProtoScript documentation.

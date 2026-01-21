@@ -1,3 +1,5 @@
+![ProtoScript](../../header.png)
+
 # ProtoScript Execution Model
 
 ProtoScript is a **standalone scripting language** designed to be executed from the command line.

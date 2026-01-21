@@ -1,3 +1,5 @@
+![ProtoScript](../header.png)
+
 # ProtoScript Garbage Collector Specification (v1)
 
 ## 1. Goals

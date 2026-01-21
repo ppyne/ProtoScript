@@ -5,6 +5,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static char *read_file(const char *path, size_t *out_len) {
     FILE *fp = fopen(path, "rb");
@@ -34,16 +35,54 @@ static char *read_file(const char *path, size_t *out_len) {
     return buf;
 }
 
-int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <file.js>\n", argv[0]);
-        return 1;
+static char *read_stream(FILE *fp, size_t *out_len) {
+    size_t cap = 4096;
+    size_t len = 0;
+    char *buf = (char *)malloc(cap + 1);
+    if (!buf) return NULL;
+
+    for (;;) {
+        size_t space = cap - len;
+        size_t n = fread(buf + len, 1, space, fp);
+        len += n;
+        if (n == 0) {
+            if (ferror(fp)) {
+                free(buf);
+                return NULL;
+            }
+            break;
+        }
+        if (len == cap) {
+            size_t new_cap = cap * 2;
+            char *next = (char *)realloc(buf, new_cap + 1);
+            if (!next) {
+                free(buf);
+                return NULL;
+            }
+            buf = next;
+            cap = new_cap;
+        }
     }
 
+    buf[len] = '\0';
+    if (out_len) *out_len = len;
+    return buf;
+}
+
+int main(int argc, char **argv) {
     size_t source_len = 0;
-    char *source = read_file(argv[1], &source_len);
+    char *source = NULL;
+    if (argc < 2 || strcmp(argv[1], "-") == 0) {
+        source = read_stream(stdin, &source_len);
+    } else {
+        source = read_file(argv[1], &source_len);
+    }
     if (!source) {
-        fprintf(stderr, "Could not read file: %s\n", argv[1]);
+        if (argc < 2 || strcmp(argv[1], "-") == 0) {
+            fprintf(stderr, "Could not read from stdin\n");
+        } else {
+            fprintf(stderr, "Could not read file: %s\n", argv[1]);
+        }
         return 1;
     }
 

@@ -13,6 +13,16 @@ Exécuter un exemple:
 ./protoscript examples/hello.js
 ```
 
+Utilisation (fichier ou stdin):
+
+```sh
+./protoscript script.js
+cat script.js | ./protoscript
+echo 'Io.print("Hello world");'| ./protoscript
+./protoscript < script.js
+./protoscript - < script.js
+```
+
 Autres exemples:
 
 - `examples/basics.js`

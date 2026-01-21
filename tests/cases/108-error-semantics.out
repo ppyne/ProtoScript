@@ -3,4 +3,4 @@ TypeError:bad
 TypeError
 RangeError
 SyntaxError
-SyntaxError
+EvalError

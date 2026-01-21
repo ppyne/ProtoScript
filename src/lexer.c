@@ -205,10 +205,11 @@ PSToken ps_lexer_next(PSLexer *lx) {
     }
 
     /* Strings */
-    if (c == '"') {
+    if (c == '"' || c == '\'') {
+        char quote = c;
         start = lx->src + lx->pos;
         while (peek(lx)) {
-            if (peek(lx) == '"') break;
+            if (peek(lx) == quote) break;
             if (peek(lx) == '\\') {
                 advance(lx);
                 if (peek(lx)) advance(lx);
@@ -217,7 +218,7 @@ PSToken ps_lexer_next(PSLexer *lx) {
             advance(lx);
         }
         size_t len = lx->src + lx->pos - start;
-        match(lx, '"');
+        match(lx, quote);
         return make_token(TOK_STRING, start, len);
     }
 

@@ -19,8 +19,15 @@ support full Unicode case-folding or multi-character folds.
 ## 3. Arguments aliasing default
 
 Full `arguments` <-> parameter aliasing is enabled only when
-`PS_ENABLE_ARGUMENTS_ALIASING=1`. Default behavior is configurable.
+`PS_ENABLE_ARGUMENTS_ALIASING=1`. The default is `PS_ENABLE_ARGUMENTS_ALIASING=0`,
+set in `include/ps_config.h`.
 
-## 4. Host extension
+## 4. eval / with flags
+
+`eval` and `with` exist but are compile-time configurable. The defaults are
+`PS_ENABLE_EVAL=0` and `PS_ENABLE_WITH=0`, set in `include/ps_config.h`. When
+disabled, attempting to use them is rejected.
+
+## 5. Host extension
 
 `Io.print` is a non-standard host extension.

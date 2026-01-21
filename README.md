@@ -18,7 +18,7 @@ ProtoScript does not aim for modern JavaScript or browser compatibility.
 
 You can test ProtoScript immediately thanks to a demo running on the web via WebAssembly (compiled with emscripten):
 
-**Try it now:** [`ppyne.github.io/protolex/`](https://ppyne.github.io/ProtoScript/)
+**Try it now:** [`ppyne.github.io/ProtoScript/`](https://ppyne.github.io/ProtoScript/)
 
 ## Documentation
 

@@ -1,10 +1,10 @@
-# ProtoScript Guide
+# ProtoScript — User Guide
 
 This document is the **main table of contents** for the ProtoScript documentation.
 
 ---
 
-## Part 1 — Core Language Fundamentals
+## Core Language Fundamentals
 
 ### [Chapter 1 — Introduction to ProtoScript](execution_model.md)
 - [What Is ProtoScript?](execution_model.md#running-a-protoscript-program)

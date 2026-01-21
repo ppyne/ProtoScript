@@ -36,7 +36,7 @@ static char *read_file(const char *path, size_t *out_len) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <file.ps>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <file.js>\n", argv[0]);
         return 1;
     }
 

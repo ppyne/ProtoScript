@@ -11,7 +11,7 @@ run_case() {
 
     out=$(mktemp)
     rc=0
-    if ./protoscript "tests/cases/$name.ps" >"$out" 2>/dev/null; then
+    if ./protoscript "tests/cases/$name.js" >"$out" 2>/dev/null; then
         rc=0
     else
         rc=$?

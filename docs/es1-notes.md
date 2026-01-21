@@ -7,7 +7,7 @@ This document lists only the remaining deviations from ECMA-262 Edition 1.
 ProtoScript uses UTF-8 with glyph-based length and indexing:
 - `length` counts glyphs (not UTF-16 code units).
 - `charCodeAt` returns full Unicode code points.
-- Glyph length is validated by `tests/cases/117-glyph-length.ps`.
+- Glyph length is validated by `tests/cases/117-glyph-length.js`.
 
 ## 2. RegExp ignoreCase
 

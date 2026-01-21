@@ -2,6 +2,14 @@
 
 ProtoScript is a **standalone scripting language** designed to be executed from the command line.
 
+ProtoScript is a C reimplementation of an ECMAScript 1 core (almost JavaScript 1.3), designed as a minimal, embeddable scripting language.
+
+It is a standalone command-line interpreter and does not target browsers, the DOM, HTML, or any client-side runtime.
+
+The engine uses a glyph-based Unicode model (UTF-8), not UTF-16.
+
+ProtoScript does not aim for modern JavaScript or browser compatibility.
+
 ---
 
 ## Running a ProtoScript Program

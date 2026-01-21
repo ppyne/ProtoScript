@@ -178,3 +178,6 @@ run_case 120-regexp-ignorecase-extended 0
 run_case 121-single-quote 0
 run_case 122-string-search 0
 run_case 123-regexp-static-captures 0
+run_case 124-regexp-static-captures-dot 0
+run_case 125-numeric-literals 0
+run_case 126-unicode-identifiers 0

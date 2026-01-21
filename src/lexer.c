@@ -163,13 +163,14 @@ PSToken ps_lexer_next(PSLexer *lx) {
     }
 
     /* Identifiers / keywords */
-    if (isalpha((unsigned char)c) || c == '_' ||
+    if (isalpha((unsigned char)c) || c == '_' || c == '$' || (unsigned char)c >= 128 ||
         (c == '\\' && unicode_escape_after_backslash(lx))) {
         if (c == '\\') {
             consume_unicode_escape_after_backslash(lx);
         }
         for (;;) {
-            if (isalnum((unsigned char)peek(lx)) || peek(lx) == '_') {
+            if (isalnum((unsigned char)peek(lx)) || peek(lx) == '_' || peek(lx) == '$' ||
+                (unsigned char)peek(lx) >= 128) {
                 advance(lx);
                 continue;
             }
@@ -192,15 +193,45 @@ PSToken ps_lexer_next(PSLexer *lx) {
     }
 
     /* Numbers */
-    if (isdigit((unsigned char)c)) {
-        while (isdigit((unsigned char)peek(lx))) advance(lx);
-        if (peek(lx) == '.') {
+    if (isdigit((unsigned char)c) || (c == '.' && isdigit((unsigned char)peek(lx)))) {
+        int saw_dot = 0;
+        int saw_exp = 0;
+        int has_octal_invalid = 0;
+        if (c == '0' && (peek(lx) == 'x' || peek(lx) == 'X')) {
             advance(lx);
+            while (is_hex_digit(peek(lx))) advance(lx);
+            size_t len = lx->src + lx->pos - start;
+            PSToken t = make_token(TOK_NUMBER, start, len);
+            t.number = (double)strtoul(start, NULL, 16);
+            return t;
+        }
+        if (isdigit((unsigned char)c)) {
+            while (isdigit((unsigned char)peek(lx))) {
+                if (peek(lx) >= '8') has_octal_invalid = 1;
+                advance(lx);
+            }
+        } else {
+            saw_dot = 1;
+            while (isdigit((unsigned char)peek(lx))) advance(lx);
+        }
+        if (peek(lx) == '.') {
+            saw_dot = 1;
+            advance(lx);
+            while (isdigit((unsigned char)peek(lx))) advance(lx);
+        }
+        if (peek(lx) == 'e' || peek(lx) == 'E') {
+            saw_exp = 1;
+            advance(lx);
+            if (peek(lx) == '+' || peek(lx) == '-') advance(lx);
             while (isdigit((unsigned char)peek(lx))) advance(lx);
         }
         size_t len = lx->src + lx->pos - start;
         PSToken t = make_token(TOK_NUMBER, start, len);
-        t.number = strtod(start, NULL);
+        if (start[0] == '0' && len > 1 && !saw_dot && !saw_exp && !has_octal_invalid) {
+            t.number = (double)strtoul(start, NULL, 8);
+        } else {
+            t.number = strtod(start, NULL);
+        }
         return t;
     }
 

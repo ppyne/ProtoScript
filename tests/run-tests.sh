@@ -195,3 +195,4 @@ run_case 137-for-of-string 0
 run_case 138-function-expr-closure 0
 run_case 139-instanceof 0
 run_case 140-instanceof-array 0
+run_case 141-global-nan 0

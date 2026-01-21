@@ -5025,6 +5025,10 @@ void ps_vm_init_builtins(PSVM *vm) {
                          ps_string_from_cstr("undefined"),
                          ps_value_undefined(),
                          PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+        ps_object_define(vm->global,
+                         ps_string_from_cstr("NaN"),
+                         ps_value_number(NAN),
+                         PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
     }
 
     PSObject *error_ctor = ps_function_new_native(ps_native_error);

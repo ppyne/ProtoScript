@@ -1,0 +1,11 @@
+Io.print(/(\w)\1/.test("book"));
+Io.print(/ab|a/.exec("ab")[0]);
+Io.print(/a|ab/.exec("ab")[0]);
+Io.print(/a{2,3}/.test("aa"));
+Io.print(/a{2,3}/.test("a"));
+Io.print(/\bword\b/.test("word!"));
+Io.print(/\bword\b/.test("sword"));
+Io.print(/a.b/.test("a\nb"));
+Io.print(/a.b/.test("acb"));
+Io.print(/[a-c]/.test("b"));
+Io.print(/a|/.test(""));

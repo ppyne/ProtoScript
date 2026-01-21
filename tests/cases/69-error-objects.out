@@ -1,0 +1,8 @@
+Error
+oops
+Error: oops
+TypeError: bad
+ReferenceError
+SyntaxError
+SyntaxError: x
+EvalError: no

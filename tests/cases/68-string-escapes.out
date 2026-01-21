@@ -1,0 +1,15 @@
+a\b
+quote:"
+line1
+line2
+hex:A
+unicode:B
+octal:A
+13
+9
+11
+bad:q
+badhex:x4G
+baduni:u12Z4
+bad8:8
+bad9:9

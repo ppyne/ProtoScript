@@ -1,0 +1,17 @@
+Io.print("a\\b");
+Io.print("quote:\"");
+Io.print("line1\nline2");
+Io.print("hex:\x41");
+Io.print("unicode:\u0042");
+Io.print("octal:\101");
+var s1 = "A\rB";
+Io.print(s1.charCodeAt(1));
+var s2 = "A\tB";
+Io.print(s2.charCodeAt(1));
+var s3 = "A\vB";
+Io.print(s3.charCodeAt(1));
+Io.print("bad:\q");
+Io.print("badhex:\x4G");
+Io.print("baduni:\u12Z4");
+Io.print("bad8:\8");
+Io.print("bad9:\9");

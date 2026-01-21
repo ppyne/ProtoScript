@@ -1,0 +1,15 @@
+Io.print("a".concat("b", "c"));
+Io.print("ababa".lastIndexOf("ba"));
+Io.print("ababa".lastIndexOf("ba", 2));
+Io.print("ababa".lastIndexOf("ba", -1));
+Io.print("a,b,c".split(",").toString());
+Io.print("abc".split("").toString());
+Io.print("ab1c2".split(new RegExp("[0-9]")).toString());
+Io.print("abab".replace("ab", "x"));
+Io.print("a1a2".replace(new RegExp("a", "g"), "b"));
+Io.print("abc".replace(new RegExp("b"), "[$&]"));
+Io.print("abc".replace(new RegExp("(b)"), "$1$1"));
+var m = "abab".match(new RegExp("ab"));
+Io.print(m.toString());
+var mg = "aba".match(new RegExp("a", "g"));
+Io.print(mg.toString());

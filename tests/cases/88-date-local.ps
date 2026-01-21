@@ -1,0 +1,17 @@
+var d = new Date(0);
+Io.print(d.toUTCString());
+Io.print(d.toString());
+Io.print(d.getTimezoneOffset() == d.getTimezoneOffset());
+d.setHours(5);
+Io.print(d.getHours());
+d.setMinutes(30);
+Io.print(d.getMinutes());
+d.setSeconds(10);
+Io.print(d.getSeconds());
+d.setMilliseconds(250);
+Io.print(d.getMilliseconds());
+d.setFullYear(2000, 0, 2);
+Io.print(d.getFullYear());
+Io.print(d.getMonth());
+Io.print(d.getDate());
+Io.print(d.toLocaleString() == d.toLocaleString());

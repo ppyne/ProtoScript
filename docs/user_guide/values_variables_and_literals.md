@@ -142,8 +142,6 @@ function example() {
 }
 ```
 
-All browser-specific scope mechanisms (frames, windows) are intentionally excluded.
-
 ---
 
 ## Literals

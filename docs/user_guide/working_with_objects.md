@@ -101,8 +101,6 @@ car1.owner = owner;
 
 Properties created with string names must always be accessed using string keys. Properties created using numeric indices must always be accessed using numeric indices.
 
-Browser-specific exceptions related to HTML-reflected objects have been intentionally removed.
-
 ---
 
 ## Defining Properties on an Object Type

@@ -126,6 +126,20 @@ static PSAstNode *parse_identifier_token(PSToken tok) {
     }
     return ps_ast_identifier(tok.start, tok.length);
 }
+
+static PSString *parse_object_key(PSToken tok) {
+    if (memchr(tok.start, '\\', tok.length)) {
+        size_t out_len = 0;
+        char *decoded = decode_identifier(tok.start, tok.length, &out_len);
+        if (!decoded) {
+            parse_error("Parse error: out of memory");
+        }
+        PSString *key = ps_string_from_utf8(decoded, out_len);
+        free(decoded);
+        return key;
+    }
+    return ps_string_from_utf8(tok.start, tok.length);
+}
 static PSString *parse_string_literal(const char *start, size_t len) {
     size_t cap = len * 4 + 1;
     char *buf = (char *)malloc(cap);
@@ -231,6 +245,8 @@ static PSAstNode *parse_postfix(PSParser *p);
 static PSAstNode *parse_primary(PSParser *p);
 static PSAstNode *parse_primary_atom(PSParser *p);
 static PSAstNode *parse_regex_literal(PSParser *p);
+static PSAstNode *parse_array_literal(PSParser *p);
+static PSAstNode *parse_object_literal(PSParser *p);
 static PSAstNode *parse_member_base(PSParser *p);
 static PSAstNode *parse_member(PSParser *p);
 static PSAstNode *parse_block(PSParser *p);
@@ -901,6 +917,16 @@ static PSAstNode *parse_primary_atom(PSParser *p) {
         return ps_ast_literal(ps_value_string(s));
     }
 
+    /* array literal */
+    if (match(p, TOK_LBRACKET)) {
+        return parse_array_literal(p);
+    }
+
+    /* object literal */
+    if (match(p, TOK_LBRACE)) {
+        return parse_object_literal(p);
+    }
+
     /* regex literal */
     if (p->current.type == TOK_SLASH) {
         return parse_regex_literal(p);
@@ -915,6 +941,74 @@ static PSAstNode *parse_primary_atom(PSParser *p) {
 
     parse_error("Parse error: unexpected token");
     return ps_ast_literal(ps_value_undefined());
+}
+
+static PSAstNode *parse_array_literal(PSParser *p) {
+    PSAstNode **items = NULL;
+    size_t count = 0;
+
+    if (match(p, TOK_RBRACKET)) {
+        return ps_ast_array_literal(items, count);
+    }
+
+    while (1) {
+        items = realloc(items, sizeof(PSAstNode *) * (count + 1));
+        items[count++] = parse_assignment(p);
+
+        if (match(p, TOK_COMMA)) {
+            if (match(p, TOK_RBRACKET)) {
+                break;
+            }
+            continue;
+        }
+        expect(p, TOK_RBRACKET, "']'");
+        break;
+    }
+
+    return ps_ast_array_literal(items, count);
+}
+
+static PSAstNode *parse_object_literal(PSParser *p) {
+    PSAstProperty *props = NULL;
+    size_t count = 0;
+
+    if (match(p, TOK_RBRACE)) {
+        return ps_ast_object_literal(props, count);
+    }
+
+    while (1) {
+        PSString *key = NULL;
+        if (p->current.type == TOK_IDENTIFIER) {
+            PSToken key_tok = p->current;
+            match(p, TOK_IDENTIFIER);
+            key = parse_object_key(key_tok);
+        } else if (p->current.type == TOK_STRING) {
+            PSToken key_tok = p->current;
+            match(p, TOK_STRING);
+            key = parse_string_literal(key_tok.start, key_tok.length);
+        } else {
+            parse_error("Parse error: expected object key");
+        }
+
+        expect(p, TOK_COLON, "':'");
+        PSAstNode *value = parse_assignment(p);
+
+        props = realloc(props, sizeof(PSAstProperty) * (count + 1));
+        props[count].key = key;
+        props[count].value = value;
+        count++;
+
+        if (match(p, TOK_COMMA)) {
+            if (match(p, TOK_RBRACE)) {
+                break;
+            }
+            continue;
+        }
+        expect(p, TOK_RBRACE, "'}'");
+        break;
+    }
+
+    return ps_ast_object_literal(props, count);
 }
 
 static PSAstNode *parse_regex_literal(PSParser *p) {

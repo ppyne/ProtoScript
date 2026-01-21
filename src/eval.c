@@ -1181,6 +1181,35 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
         case AST_LITERAL:
             return node->as.literal.value;
 
+        case AST_ARRAY_LITERAL: {
+            PSObject *arr = ps_object_new(vm->array_proto ? vm->array_proto : vm->object_proto);
+            if (!arr) return ps_value_undefined();
+            arr->kind = PS_OBJ_KIND_ARRAY;
+            for (size_t i = 0; i < node->as.array_literal.count; i++) {
+                PSValue v = eval_expression(vm, env, node->as.array_literal.items[i], ctl);
+                if (ctl->did_throw) return v;
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%zu", i);
+                ps_object_define(arr, ps_string_from_cstr(buf), v, PS_ATTR_NONE);
+            }
+            ps_object_define(arr,
+                             ps_string_from_cstr("length"),
+                             ps_value_number((double)node->as.array_literal.count),
+                             PS_ATTR_NONE);
+            return ps_value_object(arr);
+        }
+
+        case AST_OBJECT_LITERAL: {
+            PSObject *obj = ps_object_new(vm->object_proto);
+            if (!obj) return ps_value_undefined();
+            for (size_t i = 0; i < node->as.object_literal.count; i++) {
+                PSValue v = eval_expression(vm, env, node->as.object_literal.props[i].value, ctl);
+                if (ctl->did_throw) return v;
+                ps_object_define(obj, node->as.object_literal.props[i].key, v, PS_ATTR_NONE);
+            }
+            return ps_value_object(obj);
+        }
+
         case AST_IDENTIFIER: {
             PSString *name = ps_string_from_utf8(
                 node->as.identifier.name,

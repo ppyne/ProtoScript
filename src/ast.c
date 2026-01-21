@@ -253,6 +253,20 @@ PSAstNode *ps_ast_new(PSAstNode *callee, PSAstNode **args, size_t argc) {
     return n;
 }
 
+PSAstNode *ps_ast_array_literal(PSAstNode **items, size_t count) {
+    PSAstNode *n = alloc_node(AST_ARRAY_LITERAL);
+    n->as.array_literal.items = items;
+    n->as.array_literal.count = count;
+    return n;
+}
+
+PSAstNode *ps_ast_object_literal(PSAstProperty *props, size_t count) {
+    PSAstNode *n = alloc_node(AST_OBJECT_LITERAL);
+    n->as.object_literal.props = props;
+    n->as.object_literal.count = count;
+    return n;
+}
+
 /* --------------------------------------------------------- */
 /* Destruction                                               */
 /* --------------------------------------------------------- */
@@ -409,6 +423,20 @@ void ps_ast_free(PSAstNode *node) {
                 ps_ast_free(node->as.new_expr.args[i]);
             }
             free(node->as.new_expr.args);
+            break;
+
+        case AST_ARRAY_LITERAL:
+            for (size_t i = 0; i < node->as.array_literal.count; i++) {
+                ps_ast_free(node->as.array_literal.items[i]);
+            }
+            free(node->as.array_literal.items);
+            break;
+
+        case AST_OBJECT_LITERAL:
+            for (size_t i = 0; i < node->as.object_literal.count; i++) {
+                ps_ast_free(node->as.object_literal.props[i].value);
+            }
+            free(node->as.object_literal.props);
             break;
 
         case AST_IDENTIFIER:

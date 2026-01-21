@@ -233,3 +233,21 @@ String methods such as `substring`, `split`, `match`, and `replace` operate on b
 Note: ProtoScript uses a glyph-based UTF-8 string model (not ES1/JS1.x UTF-16).
 `length` counts glyphs and `charCodeAt` returns full Unicode code points.
 
+---
+
+## JSON
+
+ProtoScript provides a global `JSON` object with `parse` and `stringify`
+(an ES5 feature, not part of ES1).
+
+```js
+var data = JSON.parse("{\"a\":1,\"b\":[true,\"x\"]}");
+Io.print((JSON.stringify(data)) + "\n");
+```
+
+Limitations:
+- No `reviver` for `JSON.parse`.
+- No `replacer` or `space` for `JSON.stringify`.
+- No `toJSON` hook.
+- Circular structures throw a `TypeError`.
+- Non-finite numbers stringify as `null`.

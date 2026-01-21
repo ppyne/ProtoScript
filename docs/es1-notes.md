@@ -37,3 +37,9 @@ disabled, attempting to use them is rejected.
 ProtoScript supports ES2015-style default parameter values in function
 declarations (for example `function f(x, y = 10) { ... }`). This is an ES6
 extension beyond ES1.
+
+## 7. JSON (ES5)
+
+ProtoScript exposes a global `JSON` object with `JSON.parse` and
+`JSON.stringify`. This is an ES5 feature (not part of ES1). The implementation
+does not support revivers, replacers, spacing, or `toJSON`.

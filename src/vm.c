@@ -4168,6 +4168,650 @@ static PSValue ps_native_function_bind(PSVM *vm, PSValue this_val, int argc, PSV
 }
 
 /* --------------------------------------------------------- */
+/* JSON                                                      */
+/* --------------------------------------------------------- */
+
+typedef struct {
+    PSVM *vm;
+    const char *buf;
+    size_t len;
+    size_t pos;
+    int error;
+} PSJsonParser;
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} PSJsonBuilder;
+
+typedef struct {
+    PSObject **items;
+    size_t len;
+    size_t cap;
+} PSJsonStack;
+
+static void json_builder_init(PSJsonBuilder *b) {
+    if (!b) return;
+    b->data = NULL;
+    b->len = 0;
+    b->cap = 0;
+}
+
+static void json_builder_free(PSJsonBuilder *b) {
+    if (!b) return;
+    free(b->data);
+    b->data = NULL;
+    b->len = 0;
+    b->cap = 0;
+}
+
+static int json_builder_reserve(PSJsonBuilder *b, size_t extra) {
+    if (!b) return 0;
+    size_t needed = b->len + extra;
+    if (needed <= b->cap) return 1;
+    size_t cap = b->cap ? b->cap * 2 : 64;
+    while (cap < needed) cap *= 2;
+    char *next = (char *)realloc(b->data, cap);
+    if (!next) return 0;
+    b->data = next;
+    b->cap = cap;
+    return 1;
+}
+
+static int json_builder_append(PSJsonBuilder *b, const char *src, size_t len) {
+    if (!b || !src) return 0;
+    if (!json_builder_reserve(b, len)) return 0;
+    memcpy(b->data + b->len, src, len);
+    b->len += len;
+    return 1;
+}
+
+static int json_builder_append_char(PSJsonBuilder *b, char c) {
+    return json_builder_append(b, &c, 1);
+}
+
+static int json_builder_append_cstr(PSJsonBuilder *b, const char *s) {
+    return json_builder_append(b, s, strlen(s));
+}
+
+static void json_stack_free(PSJsonStack *s) {
+    if (!s) return;
+    free(s->items);
+    s->items = NULL;
+    s->len = 0;
+    s->cap = 0;
+}
+
+static int json_stack_contains(PSJsonStack *s, PSObject *obj) {
+    if (!s || !obj) return 0;
+    for (size_t i = 0; i < s->len; i++) {
+        if (s->items[i] == obj) return 1;
+    }
+    return 0;
+}
+
+static int json_stack_push(PSVM *vm, PSJsonStack *s, PSObject *obj) {
+    if (!s || !obj) return 0;
+    if (json_stack_contains(s, obj)) {
+        ps_vm_throw_type_error(vm, "Converting circular structure to JSON");
+        return 0;
+    }
+    if (s->len + 1 > s->cap) {
+        size_t cap = s->cap ? s->cap * 2 : 16;
+        PSObject **next = (PSObject **)realloc(s->items, cap * sizeof(PSObject *));
+        if (!next) return 0;
+        s->items = next;
+        s->cap = cap;
+    }
+    s->items[s->len++] = obj;
+    return 1;
+}
+
+static void json_stack_pop(PSJsonStack *s) {
+    if (!s || s->len == 0) return;
+    s->len--;
+}
+
+static void json_parse_error(PSJsonParser *p, const char *message) {
+    if (!p || p->error) return;
+    ps_vm_throw_syntax_error(p->vm, message ? message : "Invalid JSON");
+    p->error = 1;
+}
+
+static void json_skip_ws(PSJsonParser *p) {
+    if (!p) return;
+    while (p->pos < p->len) {
+        char c = p->buf[p->pos];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            p->pos++;
+        } else {
+            break;
+        }
+    }
+}
+
+static int json_hex_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+static int json_utf8_encode(uint32_t cp, char out[4]) {
+    if (cp <= 0x7F) {
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp <= 0x7FF) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp <= 0xFFFF) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    if (cp <= 0x10FFFF) {
+        out[0] = (char)(0xF0 | (cp >> 18));
+        out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[3] = (char)(0x80 | (cp & 0x3F));
+        return 4;
+    }
+    return 0;
+}
+
+static int json_parse_string(PSJsonParser *p, PSString **out) {
+    if (!p || p->pos >= p->len || p->buf[p->pos] != '"') {
+        json_parse_error(p, "Invalid JSON string");
+        return 0;
+    }
+    p->pos++;
+    PSJsonBuilder b;
+    json_builder_init(&b);
+    while (p->pos < p->len) {
+        unsigned char c = (unsigned char)p->buf[p->pos++];
+        if (c == '"') {
+            PSString *s = (b.len == 0)
+                ? ps_string_from_cstr("")
+                : ps_string_from_utf8(b.data, b.len);
+            json_builder_free(&b);
+            if (out) *out = s;
+            return 1;
+        }
+        if (c == '\\') {
+            if (p->pos >= p->len) {
+                json_builder_free(&b);
+                json_parse_error(p, "Invalid JSON escape");
+                return 0;
+            }
+            char esc = p->buf[p->pos++];
+            switch (esc) {
+                case '"': json_builder_append_char(&b, '"'); break;
+                case '\\': json_builder_append_char(&b, '\\'); break;
+                case '/': json_builder_append_char(&b, '/'); break;
+                case 'b': json_builder_append_char(&b, '\b'); break;
+                case 'f': json_builder_append_char(&b, '\f'); break;
+                case 'n': json_builder_append_char(&b, '\n'); break;
+                case 'r': json_builder_append_char(&b, '\r'); break;
+                case 't': json_builder_append_char(&b, '\t'); break;
+                case 'u': {
+                    if (p->pos + 4 > p->len) {
+                        json_builder_free(&b);
+                        json_parse_error(p, "Invalid JSON unicode escape");
+                        return 0;
+                    }
+                    int h1 = json_hex_val(p->buf[p->pos]);
+                    int h2 = json_hex_val(p->buf[p->pos + 1]);
+                    int h3 = json_hex_val(p->buf[p->pos + 2]);
+                    int h4 = json_hex_val(p->buf[p->pos + 3]);
+                    if (h1 < 0 || h2 < 0 || h3 < 0 || h4 < 0) {
+                        json_builder_free(&b);
+                        json_parse_error(p, "Invalid JSON unicode escape");
+                        return 0;
+                    }
+                    uint32_t code = (uint32_t)((h1 << 12) | (h2 << 8) | (h3 << 4) | h4);
+                    p->pos += 4;
+                    if (code >= 0xD800 && code <= 0xDBFF) {
+                        if (p->pos + 6 > p->len ||
+                            p->buf[p->pos] != '\\' || p->buf[p->pos + 1] != 'u') {
+                            json_builder_free(&b);
+                            json_parse_error(p, "Invalid JSON surrogate");
+                            return 0;
+                        }
+                        p->pos += 2;
+                        int l1 = json_hex_val(p->buf[p->pos]);
+                        int l2 = json_hex_val(p->buf[p->pos + 1]);
+                        int l3 = json_hex_val(p->buf[p->pos + 2]);
+                        int l4 = json_hex_val(p->buf[p->pos + 3]);
+                        if (l1 < 0 || l2 < 0 || l3 < 0 || l4 < 0) {
+                            json_builder_free(&b);
+                            json_parse_error(p, "Invalid JSON surrogate");
+                            return 0;
+                        }
+                        uint32_t low = (uint32_t)((l1 << 12) | (l2 << 8) | (l3 << 4) | l4);
+                        if (low < 0xDC00 || low > 0xDFFF) {
+                            json_builder_free(&b);
+                            json_parse_error(p, "Invalid JSON surrogate");
+                            return 0;
+                        }
+                        p->pos += 4;
+                        code = 0x10000 + (((code - 0xD800) << 10) | (low - 0xDC00));
+                    } else if (code >= 0xDC00 && code <= 0xDFFF) {
+                        json_builder_free(&b);
+                        json_parse_error(p, "Invalid JSON surrogate");
+                        return 0;
+                    }
+                    char utf8[4];
+                    int utf8_len = json_utf8_encode(code, utf8);
+                    if (utf8_len == 0) {
+                        json_builder_free(&b);
+                        json_parse_error(p, "Invalid JSON unicode");
+                        return 0;
+                    }
+                    json_builder_append(&b, utf8, (size_t)utf8_len);
+                    break;
+                }
+                default:
+                    json_builder_free(&b);
+                    json_parse_error(p, "Invalid JSON escape");
+                    return 0;
+            }
+            continue;
+        }
+        if (c < 0x20) {
+            json_builder_free(&b);
+            json_parse_error(p, "Invalid JSON string");
+            return 0;
+        }
+        json_builder_append_char(&b, (char)c);
+    }
+    json_builder_free(&b);
+    json_parse_error(p, "Unterminated JSON string");
+    return 0;
+}
+
+static int json_is_digit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+static PSValue json_parse_number(PSJsonParser *p) {
+    size_t start = p->pos;
+    if (p->buf[p->pos] == '-') p->pos++;
+    if (p->pos >= p->len) {
+        json_parse_error(p, "Invalid JSON number");
+        return ps_value_undefined();
+    }
+    if (p->buf[p->pos] == '0') {
+        p->pos++;
+        if (p->pos < p->len && json_is_digit(p->buf[p->pos])) {
+            json_parse_error(p, "Invalid JSON number");
+            return ps_value_undefined();
+        }
+    } else if (json_is_digit(p->buf[p->pos])) {
+        while (p->pos < p->len && json_is_digit(p->buf[p->pos])) p->pos++;
+    } else {
+        json_parse_error(p, "Invalid JSON number");
+        return ps_value_undefined();
+    }
+    if (p->pos < p->len && p->buf[p->pos] == '.') {
+        p->pos++;
+        if (p->pos >= p->len || !json_is_digit(p->buf[p->pos])) {
+            json_parse_error(p, "Invalid JSON number");
+            return ps_value_undefined();
+        }
+        while (p->pos < p->len && json_is_digit(p->buf[p->pos])) p->pos++;
+    }
+    if (p->pos < p->len && (p->buf[p->pos] == 'e' || p->buf[p->pos] == 'E')) {
+        p->pos++;
+        if (p->pos < p->len && (p->buf[p->pos] == '+' || p->buf[p->pos] == '-')) p->pos++;
+        if (p->pos >= p->len || !json_is_digit(p->buf[p->pos])) {
+            json_parse_error(p, "Invalid JSON number");
+            return ps_value_undefined();
+        }
+        while (p->pos < p->len && json_is_digit(p->buf[p->pos])) p->pos++;
+    }
+    size_t end = p->pos;
+    size_t len = end - start;
+    char *tmp = (char *)malloc(len + 1);
+    if (!tmp) return ps_value_undefined();
+    memcpy(tmp, p->buf + start, len);
+    tmp[len] = '\0';
+    double num = strtod(tmp, NULL);
+    free(tmp);
+    return ps_value_number(num);
+}
+
+static PSValue json_parse_value(PSJsonParser *p);
+
+static PSValue json_parse_array(PSJsonParser *p) {
+    if (!p || p->buf[p->pos] != '[') {
+        json_parse_error(p, "Invalid JSON array");
+        return ps_value_undefined();
+    }
+    p->pos++;
+    PSObject *arr = ps_object_new(p->vm->array_proto ? p->vm->array_proto : p->vm->object_proto);
+    if (!arr) return ps_value_undefined();
+    arr->kind = PS_OBJ_KIND_ARRAY;
+    size_t index = 0;
+    json_skip_ws(p);
+    if (p->pos < p->len && p->buf[p->pos] == ']') {
+        p->pos++;
+        ps_object_set_length(arr, 0);
+        return ps_value_object(arr);
+    }
+    while (p->pos < p->len) {
+        json_skip_ws(p);
+        PSValue val = json_parse_value(p);
+        if (p->error) return ps_value_undefined();
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%zu", index);
+        ps_object_define(arr, ps_string_from_cstr(buf), val, PS_ATTR_NONE);
+        index++;
+        json_skip_ws(p);
+        if (p->pos >= p->len) break;
+        if (p->buf[p->pos] == ',') {
+            p->pos++;
+            continue;
+        }
+        if (p->buf[p->pos] == ']') {
+            p->pos++;
+            ps_object_set_length(arr, index);
+            return ps_value_object(arr);
+        }
+        break;
+    }
+    json_parse_error(p, "Invalid JSON array");
+    return ps_value_undefined();
+}
+
+static PSValue json_parse_object(PSJsonParser *p) {
+    if (!p || p->buf[p->pos] != '{') {
+        json_parse_error(p, "Invalid JSON object");
+        return ps_value_undefined();
+    }
+    p->pos++;
+    PSObject *obj = ps_object_new(p->vm->object_proto);
+    if (!obj) return ps_value_undefined();
+    json_skip_ws(p);
+    if (p->pos < p->len && p->buf[p->pos] == '}') {
+        p->pos++;
+        return ps_value_object(obj);
+    }
+    while (p->pos < p->len) {
+        json_skip_ws(p);
+        PSString *key = NULL;
+        if (!json_parse_string(p, &key)) return ps_value_undefined();
+        json_skip_ws(p);
+        if (p->pos >= p->len || p->buf[p->pos] != ':') {
+            json_parse_error(p, "Invalid JSON object");
+            return ps_value_undefined();
+        }
+        p->pos++;
+        json_skip_ws(p);
+        PSValue val = json_parse_value(p);
+        if (p->error) return ps_value_undefined();
+        ps_object_define(obj, key, val, PS_ATTR_NONE);
+        json_skip_ws(p);
+        if (p->pos >= p->len) break;
+        if (p->buf[p->pos] == ',') {
+            p->pos++;
+            continue;
+        }
+        if (p->buf[p->pos] == '}') {
+            p->pos++;
+            return ps_value_object(obj);
+        }
+        break;
+    }
+    json_parse_error(p, "Invalid JSON object");
+    return ps_value_undefined();
+}
+
+static PSValue json_parse_value(PSJsonParser *p) {
+    json_skip_ws(p);
+    if (p->pos >= p->len) {
+        json_parse_error(p, "Invalid JSON");
+        return ps_value_undefined();
+    }
+    char c = p->buf[p->pos];
+    if (c == '"') {
+        PSString *s = NULL;
+        if (!json_parse_string(p, &s)) return ps_value_undefined();
+        return ps_value_string(s);
+    }
+    if (c == '{') {
+        return json_parse_object(p);
+    }
+    if (c == '[') {
+        return json_parse_array(p);
+    }
+    if (c == 't' && p->pos + 4 <= p->len &&
+        memcmp(p->buf + p->pos, "true", 4) == 0) {
+        p->pos += 4;
+        return ps_value_boolean(1);
+    }
+    if (c == 'f' && p->pos + 5 <= p->len &&
+        memcmp(p->buf + p->pos, "false", 5) == 0) {
+        p->pos += 5;
+        return ps_value_boolean(0);
+    }
+    if (c == 'n' && p->pos + 4 <= p->len &&
+        memcmp(p->buf + p->pos, "null", 4) == 0) {
+        p->pos += 4;
+        return ps_value_null();
+    }
+    if (c == '-' || json_is_digit(c)) {
+        return json_parse_number(p);
+    }
+    json_parse_error(p, "Invalid JSON");
+    return ps_value_undefined();
+}
+
+static int json_stringify_string(PSJsonBuilder *b, PSString *s) {
+    if (!b) return 0;
+    if (!json_builder_append_char(b, '"')) return 0;
+    if (s && s->utf8 && s->byte_len > 0) {
+        for (size_t i = 0; i < s->byte_len; i++) {
+            unsigned char c = (unsigned char)s->utf8[i];
+            switch (c) {
+                case '"':  if (!json_builder_append_cstr(b, "\\\"")) return 0; break;
+                case '\\': if (!json_builder_append_cstr(b, "\\\\")) return 0; break;
+                case '\b': if (!json_builder_append_cstr(b, "\\b")) return 0; break;
+                case '\f': if (!json_builder_append_cstr(b, "\\f")) return 0; break;
+                case '\n': if (!json_builder_append_cstr(b, "\\n")) return 0; break;
+                case '\r': if (!json_builder_append_cstr(b, "\\r")) return 0; break;
+                case '\t': if (!json_builder_append_cstr(b, "\\t")) return 0; break;
+                default:
+                    if (c < 0x20) {
+                        char buf[7];
+                        snprintf(buf, sizeof(buf), "\\u%04x", (unsigned int)c);
+                        if (!json_builder_append_cstr(b, buf)) return 0;
+                    } else {
+                        if (!json_builder_append_char(b, (char)c)) return 0;
+                    }
+                    break;
+            }
+        }
+    }
+    return json_builder_append_char(b, '"');
+}
+
+static int json_value_should_omit(PSValue v) {
+    if (v.type == PS_T_UNDEFINED) return 1;
+    if (v.type == PS_T_OBJECT && v.as.object &&
+        v.as.object->kind == PS_OBJ_KIND_FUNCTION) {
+        return 1;
+    }
+    return 0;
+}
+
+static int json_stringify_value(PSVM *vm, PSValue v, PSJsonBuilder *b, PSJsonStack *stack);
+
+typedef struct {
+    PSVM *vm;
+    PSJsonBuilder *builder;
+    PSJsonStack *stack;
+    int first;
+    int failed;
+} PSJsonObjectBuild;
+
+static int json_stringify_object_prop(PSString *name, PSValue value, uint8_t attrs, void *user) {
+    (void)attrs;
+    PSJsonObjectBuild *ctx = (PSJsonObjectBuild *)user;
+    if (!ctx || ctx->failed) return 1;
+    if (json_value_should_omit(value)) return 0;
+    if (!ctx->first) {
+        if (!json_builder_append_char(ctx->builder, ',')) {
+            ctx->failed = 1;
+            return 1;
+        }
+    }
+    if (!json_stringify_string(ctx->builder, name)) {
+        ctx->failed = 1;
+        return 1;
+    }
+    if (!json_builder_append_char(ctx->builder, ':')) {
+        ctx->failed = 1;
+        return 1;
+    }
+    int rc = json_stringify_value(ctx->vm, value, ctx->builder, ctx->stack);
+    if (rc <= 0) {
+        ctx->failed = 1;
+        return 1;
+    }
+    ctx->first = 0;
+    return 0;
+}
+
+static int json_stringify_array(PSVM *vm, PSObject *obj, PSJsonBuilder *b, PSJsonStack *stack) {
+    if (!json_builder_append_char(b, '[')) return -1;
+    size_t len = ps_object_length(obj);
+    for (size_t i = 0; i < len; i++) {
+        if (i > 0) {
+            if (!json_builder_append_char(b, ',')) return -1;
+        }
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%zu", i);
+        int found = 0;
+        PSValue val = ps_object_get(obj, ps_string_from_cstr(buf), &found);
+        if (!found) val = ps_value_undefined();
+        int rc = json_stringify_value(vm, val, b, stack);
+        if (rc < 0) return -1;
+        if (rc == 0) {
+            if (!json_builder_append_cstr(b, "null")) return -1;
+        }
+    }
+    if (!json_builder_append_char(b, ']')) return -1;
+    return 1;
+}
+
+static int json_stringify_object(PSVM *vm, PSObject *obj, PSJsonBuilder *b, PSJsonStack *stack) {
+    if (!json_builder_append_char(b, '{')) return -1;
+    PSJsonObjectBuild ctx;
+    ctx.vm = vm;
+    ctx.builder = b;
+    ctx.stack = stack;
+    ctx.first = 1;
+    ctx.failed = 0;
+    if (ps_object_enum_own(obj, json_stringify_object_prop, &ctx) != 0 || ctx.failed) {
+        return -1;
+    }
+    if (!json_builder_append_char(b, '}')) return -1;
+    return 1;
+}
+
+static int json_stringify_value(PSVM *vm, PSValue v, PSJsonBuilder *b, PSJsonStack *stack) {
+    if (v.type == PS_T_UNDEFINED) return 0;
+    if (v.type == PS_T_NULL) return json_builder_append_cstr(b, "null") ? 1 : -1;
+    if (v.type == PS_T_BOOLEAN) {
+        return json_builder_append_cstr(b, v.as.boolean ? "true" : "false") ? 1 : -1;
+    }
+    if (v.type == PS_T_NUMBER) {
+        if (isnan(v.as.number) || isinf(v.as.number)) {
+            return json_builder_append_cstr(b, "null") ? 1 : -1;
+        }
+        char buf[64];
+        if (v.as.number == 0.0) {
+            snprintf(buf, sizeof(buf), "0");
+        } else {
+            snprintf(buf, sizeof(buf), "%.15g", v.as.number);
+        }
+        return json_builder_append_cstr(b, buf) ? 1 : -1;
+    }
+    if (v.type == PS_T_STRING) {
+        return json_stringify_string(b, v.as.string) ? 1 : -1;
+    }
+    if (v.type == PS_T_OBJECT) {
+        PSObject *obj = v.as.object;
+        if (!obj) return json_builder_append_cstr(b, "null") ? 1 : -1;
+        if (obj->kind == PS_OBJ_KIND_FUNCTION) return 0;
+        if ((obj->kind == PS_OBJ_KIND_STRING ||
+             obj->kind == PS_OBJ_KIND_NUMBER ||
+             obj->kind == PS_OBJ_KIND_BOOLEAN) && obj->internal) {
+            PSValue *inner = (PSValue *)obj->internal;
+            return json_stringify_value(vm, *inner, b, stack);
+        }
+        if (!json_stack_push(vm, stack, obj)) return -1;
+        int rc = (obj->kind == PS_OBJ_KIND_ARRAY)
+            ? json_stringify_array(vm, obj, b, stack)
+            : json_stringify_object(vm, obj, b, stack);
+        json_stack_pop(stack);
+        return rc;
+    }
+    return 0;
+}
+
+static PSValue ps_native_json_parse(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    PSString *input = ps_string_from_cstr("undefined");
+    if (argc > 0) {
+        input = ps_to_string(vm, argv[0]);
+    }
+    if (vm && vm->has_pending_throw) return ps_value_undefined();
+    PSJsonParser p;
+    p.vm = vm;
+    p.buf = input ? input->utf8 : "";
+    p.len = input ? input->byte_len : 0;
+    p.pos = 0;
+    p.error = 0;
+    PSValue result = json_parse_value(&p);
+    if (!p.error) {
+        json_skip_ws(&p);
+        if (p.pos != p.len) {
+            json_parse_error(&p, "Invalid JSON");
+        }
+    }
+    if (p.error) return ps_value_undefined();
+    return result;
+}
+
+static PSValue ps_native_json_stringify(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    if (argc == 0) return ps_value_undefined();
+    PSJsonBuilder b;
+    json_builder_init(&b);
+    PSJsonStack stack;
+    stack.items = NULL;
+    stack.len = 0;
+    stack.cap = 0;
+    int rc = json_stringify_value(vm, argv[0], &b, &stack);
+    json_stack_free(&stack);
+    if (rc <= 0 || (vm && vm->has_pending_throw)) {
+        json_builder_free(&b);
+        return ps_value_undefined();
+    }
+    PSString *out = (b.len == 0)
+        ? ps_string_from_cstr("")
+        : ps_string_from_utf8(b.data, b.len);
+    json_builder_free(&b);
+    return ps_value_string(out);
+}
+
+/* --------------------------------------------------------- */
 /* VM lifecycle                                              */
 /* --------------------------------------------------------- */
 
@@ -5308,6 +5952,28 @@ void ps_vm_init_builtins(PSVM *vm) {
         ps_object_define(vm->global,
                          ps_string_from_cstr("Math"),
                          ps_value_object(vm->math_obj),
+                         PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
+    }
+
+    PSObject *json_obj = ps_object_new(vm->object_proto);
+    if (json_obj) {
+        PSObject *parse_fn = ps_function_new_native(ps_native_json_parse);
+        if (parse_fn) {
+            ps_function_setup(parse_fn, vm->function_proto, vm->object_proto, NULL);
+            ps_define_function_props(parse_fn, "parse", 1);
+            ps_object_define(json_obj, ps_string_from_cstr("parse"),
+                             ps_value_object(parse_fn), PS_ATTR_DONTENUM);
+        }
+        PSObject *stringify_fn = ps_function_new_native(ps_native_json_stringify);
+        if (stringify_fn) {
+            ps_function_setup(stringify_fn, vm->function_proto, vm->object_proto, NULL);
+            ps_define_function_props(stringify_fn, "stringify", 1);
+            ps_object_define(json_obj, ps_string_from_cstr("stringify"),
+                             ps_value_object(stringify_fn), PS_ATTR_DONTENUM);
+        }
+        ps_object_define(vm->global,
+                         ps_string_from_cstr("JSON"),
+                         ps_value_object(json_obj),
                          PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
     }
 }

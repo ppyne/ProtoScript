@@ -1,6 +1,6 @@
 # ProtoScript
 
-ProtoScript is a C reimplementation of an ECMAScript 1 core (almoste JavaScript 1.3), designed as a minimal, embeddable scripting language.
+ProtoScript is a C reimplementation of an ECMAScript 1 core (almost JavaScript 1.3), designed as a minimal, embeddable scripting language.
 
 It is a standalone command-line interpreter and does not target browsers, the DOM, HTML, or any client-side runtime.
 

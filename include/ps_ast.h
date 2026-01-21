@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include "ps_value.h"
+#include "ps_string.h"
 
 /* --------------------------------------------------------- */
 /* AST node kinds                                            */
@@ -42,7 +43,9 @@ typedef enum {
     AST_CONDITIONAL,
     AST_CALL,
     AST_MEMBER,
-    AST_NEW
+    AST_NEW,
+    AST_ARRAY_LITERAL,
+    AST_OBJECT_LITERAL
 } PSAstKind;
 
 /* --------------------------------------------------------- */
@@ -240,8 +243,25 @@ struct PSAstNode {
             size_t      argc;
         } new_expr;
 
+        /* array literal [a, b, c] */
+        struct {
+            PSAstNode **items;
+            size_t      count;
+        } array_literal;
+
+        /* object literal { key: value } */
+        struct {
+            struct PSAstProperty *props;
+            size_t                count;
+        } object_literal;
+
     } as;
 };
+
+typedef struct PSAstProperty {
+    PSString  *key;
+    PSAstNode *value;
+} PSAstProperty;
 
 /* --------------------------------------------------------- */
 /* Constructors                                              */
@@ -286,6 +306,8 @@ PSAstNode *ps_ast_conditional(PSAstNode *cond, PSAstNode *then_expr, PSAstNode *
 PSAstNode *ps_ast_call(PSAstNode *callee, PSAstNode **args, size_t argc);
 PSAstNode *ps_ast_member(PSAstNode *object, PSAstNode *property, int computed);
 PSAstNode *ps_ast_new(PSAstNode *callee, PSAstNode **args, size_t argc);
+PSAstNode *ps_ast_array_literal(PSAstNode **items, size_t count);
+PSAstNode *ps_ast_object_literal(PSAstProperty *props, size_t count);
 
 /* --------------------------------------------------------- */
 /* Destruction                                               */

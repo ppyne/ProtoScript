@@ -16,6 +16,16 @@ To execute a script, invoke the ProtoScript interpreter directly from the termin
 
 The interpreter parses the file, evaluates the code from top to bottom, and terminates when execution completes.
 
+Usage (file or stdin):
+
+```sh
+./protoscript script.js
+cat script.js | ./protoscript
+echo 'Io.print("Hello world");'| ./protoscript
+./protoscript < script.js
+./protoscript - < script.js
+```
+
 ---
 
 ## Execution Environment

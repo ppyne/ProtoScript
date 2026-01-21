@@ -1,4 +1,4 @@
-# ProtoScript 1.x Guide
+# ProtoScript Guide
 
 This document is the **main table of contents** for the ProtoScript documentation.
 

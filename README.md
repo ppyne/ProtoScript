@@ -8,6 +8,10 @@ The engine uses a glyph-based Unicode model (UTF-8), not UTF-16.
 
 ProtoScript does not aim for modern JavaScript or browser compatibility.
 
+## Manifest
+
+[Prototype-Based Languages: **A Different Way to Think**](docs/prototype_based_thinking_with_proto_script.md)
+
 ## Documentation
 
 - User guide: [`docs/user_guide/toc.md`](docs/user_guide/toc.md)

@@ -10,11 +10,11 @@ ProtoScript does not aim for modern JavaScript or browser compatibility.
 
 ## Documentation
 
-- User guide: `docs/user_guide/toc.md`
-- ES1 deviations: `docs/es1-notes.md`
-- String model spec: `docs/string-spec.md`
-- ECMA-262 Edition 1 (June 1997): `docs/ECMA-262_1st_edition_june_1997.pdf`
-- License (BSD-3-Clause): `LICENSE`
+- User guide: [`docs/user_guide/toc.md`](docs/user_guide/toc.md)
+- ES1 deviations: [`docs/es1-notes.md`](docs/es1-notes.md)
+- String model spec: [`docs/string-spec.md`](docs/string-spec.md)
+- ECMA-262 Edition 1 (June 1997): [`docs/ECMA-262_1st_edition_june_1997.pdf`](docs/ECMA-262_1st_edition_june_1997.pdf)
+- License (BSD-3-Clause): [`LICENSE`](LICENSE)
 
 ## Build
 

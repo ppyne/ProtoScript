@@ -183,6 +183,62 @@ function dumpProps(obj) {
 
 ---
 
+### `for...of` (ES2015 extension)
+
+ProtoScript supports a simplified `for...of` loop to iterate over values:
+
+```js
+for (var value of iterable) {
+    statements;
+}
+```
+
+Supported targets:
+- Arrays: values in index order.
+- Objects: own enumerable property values.
+- Strings: each glyph of the UTF-8 string.
+
+`var` is optional when the target already exists:
+
+```js
+for (value of iterable) {
+    statements;
+}
+```
+
+Examples:
+
+```js
+var list = [1, 2, 3, 4];
+var out = "";
+for (var v of list) {
+    out = out + v;
+}
+Io.print(out + "\n");
+```
+
+```js
+var obj = { a: 10, b: 20, c: 30 };
+var sum = 0;
+for (var v of obj) {
+    sum = sum + v;
+}
+Io.print(sum + "\n");
+```
+
+```js
+var text = "hé";
+var glyphs = "";
+for (var ch of text) {
+    glyphs = glyphs + ch;
+}
+Io.print(glyphs + "\n");
+```
+
+Note: this is an ES2015 (ES6) extension and does not use the ES6 iterator protocol.
+
+---
+
 ### `with`
 
 Temporarily sets an object as the default scope for property lookup.

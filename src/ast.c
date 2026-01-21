@@ -95,6 +95,16 @@ PSAstNode *ps_ast_for_in(PSAstNode *target, PSAstNode *object, PSAstNode *body, 
     return n;
 }
 
+PSAstNode *ps_ast_for_of(PSAstNode *target, PSAstNode *object, PSAstNode *body, int is_var) {
+    PSAstNode *n = alloc_node(AST_FOR_OF);
+    n->as.for_of.target = target;
+    n->as.for_of.object = object;
+    n->as.for_of.body = body;
+    n->as.for_of.is_var = is_var;
+    n->as.for_of.label = NULL;
+    return n;
+}
+
 PSAstNode *ps_ast_switch(PSAstNode *expr, PSAstNode **cases, size_t case_count) {
     PSAstNode *n = alloc_node(AST_SWITCH);
     n->as.switch_stmt.expr = expr;
@@ -323,6 +333,11 @@ void ps_ast_free(PSAstNode *node) {
             ps_ast_free(node->as.for_in.target);
             ps_ast_free(node->as.for_in.object);
             ps_ast_free(node->as.for_in.body);
+            break;
+        case AST_FOR_OF:
+            ps_ast_free(node->as.for_of.target);
+            ps_ast_free(node->as.for_of.object);
+            ps_ast_free(node->as.for_of.body);
             break;
 
         case AST_SWITCH:

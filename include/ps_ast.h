@@ -23,6 +23,7 @@ typedef enum {
     AST_DO_WHILE,
     AST_FOR,
     AST_FOR_IN,
+    AST_FOR_OF,
     AST_SWITCH,
     AST_CASE,
     AST_LABEL,
@@ -122,6 +123,15 @@ struct PSAstNode {
             int        is_var;
             PSAstNode *label;  /* optional label */
         } for_in;
+
+        /* for (target of object) body */
+        struct {
+            PSAstNode *target;
+            PSAstNode *object;
+            PSAstNode *body;
+            int        is_var;
+            PSAstNode *label;  /* optional label */
+        } for_of;
 
         /* switch (expr) { cases } */
         struct {
@@ -278,6 +288,7 @@ PSAstNode *ps_ast_while(PSAstNode *cond, PSAstNode *body);
 PSAstNode *ps_ast_do_while(PSAstNode *body, PSAstNode *cond);
 PSAstNode *ps_ast_for(PSAstNode *init, PSAstNode *test, PSAstNode *update, PSAstNode *body);
 PSAstNode *ps_ast_for_in(PSAstNode *target, PSAstNode *object, PSAstNode *body, int is_var);
+PSAstNode *ps_ast_for_of(PSAstNode *target, PSAstNode *object, PSAstNode *body, int is_var);
 PSAstNode *ps_ast_switch(PSAstNode *expr, PSAstNode **cases, size_t case_count);
 PSAstNode *ps_ast_case(PSAstNode *test, PSAstNode **items, size_t count);
 PSAstNode *ps_ast_label(PSAstNode *label, PSAstNode *stmt);

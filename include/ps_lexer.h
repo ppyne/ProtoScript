@@ -19,6 +19,7 @@ typedef enum {
     TOK_DO,
     TOK_FOR,
     TOK_IN,
+    TOK_OF,
     TOK_SWITCH,
     TOK_CASE,
     TOK_DEFAULT,

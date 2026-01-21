@@ -65,6 +65,7 @@ This document is the **main table of contents** for the ProtoScript documentatio
   - [for](statements.md#loop-statements)
   - [do…while](statements.md#loop-statements)
   - [while](statements.md#loop-statements)
+  - [for...of](statements.md#forof-es2015-extension)
   - [label](statements.md#loop-statements)
   - [break](statements.md#loop-statements)
   - [continue](statements.md#loop-statements)

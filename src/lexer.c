@@ -116,6 +116,7 @@ static PSTokenType keyword_type(const char *s, size_t len) {
     if (len == 2 && strncmp(s, "do", 2) == 0) return TOK_DO;
     if (len == 3 && strncmp(s, "for", 3) == 0) return TOK_FOR;
     if (len == 2 && strncmp(s, "in", 2) == 0) return TOK_IN;
+    if (len == 2 && strncmp(s, "of", 2) == 0) return TOK_OF;
     if (len == 6 && strncmp(s, "switch", 6) == 0) return TOK_SWITCH;
     if (len == 4 && strncmp(s, "case", 4) == 0) return TOK_CASE;
     if (len == 7 && strncmp(s, "default", 7) == 0) return TOK_DEFAULT;

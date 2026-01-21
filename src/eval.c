@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#include <stdint.h>
 
 /* --------------------------------------------------------- */
 /* Forward declarations                                      */
@@ -359,6 +360,20 @@ static int ps_string_is_length(const PSString *s) {
     return memcmp(s->utf8, length_str, 6) == 0;
 }
 
+typedef struct {
+    PSString *name;
+    size_t index;
+} PSIndexName;
+
+static int ps_index_name_compare(const void *a, const void *b) {
+    const PSIndexName *ia = (const PSIndexName *)a;
+    const PSIndexName *ib = (const PSIndexName *)b;
+    if (ia->index < ib->index) return -1;
+    if (ia->index > ib->index) return 1;
+    return 0;
+}
+
+
 static int ps_array_set_length(PSVM *vm, PSObject *obj, PSValue value, PSEvalControl *ctl) {
     if (!obj || obj->kind != PS_OBJ_KIND_ARRAY) return 0;
     double num = ps_to_number(vm, value);
@@ -389,6 +404,45 @@ static int ps_array_set_length(PSVM *vm, PSObject *obj, PSValue value, PSEvalCon
     }
     ps_object_put(obj, ps_string_from_cstr("length"), ps_value_number((double)new_len));
     return 1;
+}
+
+static int ps_assign_for_target(PSVM *vm,
+                                PSEnv *env,
+                                PSAstNode *target,
+                                int is_var,
+                                PSValue value,
+                                PSEvalControl *ctl) {
+    if (!target) return 0;
+    if (is_var) {
+        if (target->kind == AST_IDENTIFIER) {
+            PSString *name = ps_string_from_utf8(
+                target->as.identifier.name,
+                target->as.identifier.length
+            );
+            ps_env_define(env, name, value);
+        }
+        return 1;
+    }
+    if (target->kind == AST_IDENTIFIER) {
+        PSString *name = ps_string_from_utf8(
+            target->as.identifier.name,
+            target->as.identifier.length
+        );
+        ps_env_set(env, name, value);
+        return 1;
+    }
+    if (target->kind == AST_MEMBER) {
+        PSValue target_val = eval_expression(vm, env, target->as.member.object, ctl);
+        if (ctl->did_throw) return 0;
+        PSObject *target_obj = ps_to_object(vm, &target_val, ctl);
+        if (ctl->did_throw) return 0;
+        PSString *prop = ps_member_key(vm, env, target, ctl);
+        if (ctl->did_throw) return 0;
+        ps_object_put(target_obj, prop, value);
+        (void)ps_env_update_arguments(env, target_obj, prop, value);
+        return 1;
+    }
+    return 0;
 }
 
 static int ps_string_to_array_index(const PSString *name, size_t *out_index) {
@@ -728,6 +782,22 @@ static void hoist_decls(PSVM *vm, PSEnv *env, PSAstNode *node) {
             }
             hoist_decls(vm, env, node->as.for_in.body);
             break;
+        case AST_FOR_OF:
+            if (node->as.for_of.is_var &&
+                node->as.for_of.target &&
+                node->as.for_of.target->kind == AST_IDENTIFIER) {
+                PSString *name = ps_string_from_utf8(
+                    node->as.for_of.target->as.identifier.name,
+                    node->as.for_of.target->as.identifier.length
+                );
+                int found = 0;
+                (void)ps_object_get_own(env->record, name, &found);
+                if (!found) {
+                    ps_env_define(env, name, ps_value_undefined());
+                }
+            }
+            hoist_decls(vm, env, node->as.for_of.body);
+            break;
         case AST_SWITCH:
             for (size_t i = 0; i < node->as.switch_stmt.case_count; i++) {
                 hoist_decls(vm, env, node->as.switch_stmt.cases[i]);
@@ -971,8 +1041,46 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
             }
 
             PSValue last = ps_value_undefined();
-            for (size_t i = 0; i < list.count; i++) {
-                PSValue name_val = ps_value_string(list.items[i]);
+            PSString **ordered = list.items;
+            size_t ordered_count = list.count;
+            PSIndexName *indices = NULL;
+            PSString **others = NULL;
+            PSString **ordered_alloc = NULL;
+            if (obj && obj->kind == PS_OBJ_KIND_ARRAY && list.count > 0) {
+                indices = (PSIndexName *)calloc(list.count, sizeof(PSIndexName));
+                others = (PSString **)calloc(list.count, sizeof(PSString *));
+                if (indices && others) {
+                    size_t index_count = 0;
+                    size_t other_count = 0;
+                    for (size_t i = 0; i < list.count; i++) {
+                        PSString *name = list.items[i];
+                        if (ps_string_is_length(name)) continue;
+                        size_t idx = 0;
+                        if (ps_string_to_array_index(name, &idx)) {
+                            indices[index_count].name = name;
+                            indices[index_count].index = idx;
+                            index_count++;
+                        } else {
+                            others[other_count++] = name;
+                        }
+                    }
+                    qsort(indices, index_count, sizeof(PSIndexName), ps_index_name_compare);
+                    ordered_alloc = (PSString **)calloc(index_count + other_count, sizeof(PSString *));
+                    if (ordered_alloc) {
+                        ordered = ordered_alloc;
+                        ordered_count = index_count + other_count;
+                        for (size_t i = 0; i < index_count; i++) {
+                            ordered[i] = indices[i].name;
+                        }
+                        for (size_t i = 0; i < other_count; i++) {
+                            ordered[index_count + i] = others[i];
+                        }
+                    }
+                }
+            }
+
+            for (size_t i = 0; i < ordered_count; i++) {
+                PSValue name_val = ps_value_string(ordered[i]);
                 if (node->as.for_in.is_var) {
                     if (node->as.for_in.target->kind == AST_IDENTIFIER) {
                         PSString *name = ps_string_from_utf8(
@@ -1013,6 +1121,152 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
                 if (ctl->did_continue) {
                     if (ctl->continue_label) {
                         if (!loop_label || !ps_string_equals(ctl->continue_label, loop_label)) {
+                            return last;
+                        }
+                    }
+                    ctl->did_continue = 0;
+                    ctl->continue_label = NULL;
+                    continue;
+                }
+            }
+            free(ordered_alloc);
+            free(indices);
+            free(others);
+            free(list.items);
+            return last;
+        }
+
+        case AST_FOR_OF: {
+            PSString *loop_label = NULL;
+            if (node->as.for_of.label) {
+                loop_label = ps_string_from_utf8(
+                    node->as.for_of.label->as.identifier.name,
+                    node->as.for_of.label->as.identifier.length
+                );
+            }
+            PSValue obj_val = eval_expression(vm, env, node->as.for_of.object, ctl);
+            if (ctl->did_throw) return ctl->throw_value;
+
+            PSString *string_iter = NULL;
+            if (obj_val.type == PS_T_STRING) {
+                string_iter = obj_val.as.string;
+            } else if (obj_val.type == PS_T_OBJECT && obj_val.as.object &&
+                       obj_val.as.object->kind == PS_OBJ_KIND_STRING &&
+                       obj_val.as.object->internal) {
+                PSValue *inner = (PSValue *)obj_val.as.object->internal;
+                if (inner && inner->type == PS_T_STRING) {
+                    string_iter = inner->as.string;
+                }
+            }
+
+            PSValue last = ps_value_undefined();
+            if (string_iter) {
+                size_t len = ps_string_length(string_iter);
+                for (size_t i = 0; i < len; i++) {
+                    PSString *ch = ps_string_char_at(string_iter, i);
+                    (void)ps_assign_for_target(vm, env, node->as.for_of.target,
+                                               node->as.for_of.is_var,
+                                               ps_value_string(ch), ctl);
+                    if (ctl->did_throw) return ctl->throw_value;
+                    last = eval_node(vm, env, node->as.for_of.body, ctl);
+                    if (ctl->did_throw || ctl->did_return) break;
+                    if (ctl->did_break) {
+                        if (ctl->break_label) {
+                            if (!loop_label || !ps_string_equals(ctl->break_label, loop_label)) {
+                                return last;
+                            }
+                        }
+                        ctl->did_break = 0;
+                        ctl->break_label = NULL;
+                        break;
+                    }
+                    if (ctl->did_continue) {
+                        if (ctl->continue_label) {
+                            if (!loop_label || !ps_string_equals(ctl->continue_label, loop_label)) {
+                                return last;
+                            }
+                        }
+                        ctl->did_continue = 0;
+                        ctl->continue_label = NULL;
+                        continue;
+                    }
+                }
+                return last;
+            }
+
+            PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+            if (ctl->did_throw) return ctl->throw_value;
+            if (obj && obj->kind == PS_OBJ_KIND_ARRAY) {
+                size_t len = 0;
+                int found = 0;
+                PSValue len_val = ps_object_get(obj, ps_string_from_cstr("length"), &found);
+                if (found) {
+                    double num = ps_value_to_number(&len_val);
+                    if (!isnan(num) && num >= 0.0) {
+                        len = (size_t)num;
+                    }
+                }
+                for (size_t i = 0; i < len; i++) {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "%zu", i);
+                    PSValue val = ps_object_get(obj, ps_string_from_cstr(buf), NULL);
+                    (void)ps_assign_for_target(vm, env, node->as.for_of.target,
+                                               node->as.for_of.is_var, val, ctl);
+                    if (ctl->did_throw) return ctl->throw_value;
+                    last = eval_node(vm, env, node->as.for_of.body, ctl);
+                    if (ctl->did_throw || ctl->did_return) break;
+                    if (ctl->did_break) {
+                        if (ctl->break_label) {
+                            if (!loop_label || !ps_string_equals(ctl->break_label, loop_label)) {
+                                return last;
+                            }
+                        }
+                        ctl->did_break = 0;
+                        ctl->break_label = NULL;
+                        break;
+                    }
+                    if (ctl->did_continue) {
+                        if (ctl->continue_label) {
+                            if (!loop_label || !ps_string_equals(ctl->continue_label, loop_label)) {
+                                return last;
+                            }
+                        }
+                        ctl->did_continue = 0;
+                        ctl->continue_label = NULL;
+                        continue;
+                    }
+                }
+                return last;
+            }
+
+            PSNameList list = {0};
+            if (obj) {
+                (void)ps_object_enum_own(obj, ps_collect_enum_name, &list);
+            }
+            for (size_t i = 0; i < list.count; i++) {
+                int found = 0;
+                PSValue val = ps_object_get_own(obj, list.items[i], &found);
+                if (!found) continue;
+                (void)ps_assign_for_target(vm, env, node->as.for_of.target,
+                                           node->as.for_of.is_var, val, ctl);
+                if (ctl->did_throw) return ctl->throw_value;
+                last = eval_node(vm, env, node->as.for_of.body, ctl);
+                if (ctl->did_throw || ctl->did_return) break;
+                if (ctl->did_break) {
+                    if (ctl->break_label) {
+                        if (!loop_label || !ps_string_equals(ctl->break_label, loop_label)) {
+                            free(list.items);
+                            return last;
+                        }
+                    }
+                    ctl->did_break = 0;
+                    ctl->break_label = NULL;
+                    break;
+                }
+                if (ctl->did_continue) {
+                    if (ctl->continue_label) {
+                        if (!loop_label || !ps_string_equals(ctl->continue_label, loop_label)) {
+                            free(list.items);
                             return last;
                         }
                     }
@@ -1111,7 +1365,8 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
                 if (node->as.label_stmt.stmt->kind != AST_WHILE &&
                     node->as.label_stmt.stmt->kind != AST_DO_WHILE &&
                     node->as.label_stmt.stmt->kind != AST_FOR &&
-                    node->as.label_stmt.stmt->kind != AST_FOR_IN) {
+                    node->as.label_stmt.stmt->kind != AST_FOR_IN &&
+                    node->as.label_stmt.stmt->kind != AST_FOR_OF) {
                     ctl->did_throw = 1;
                     ctl->throw_value = ps_value_string(ps_string_from_cstr("SyntaxError"));
                     return ctl->throw_value;
@@ -1211,7 +1466,7 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             ps_object_define(arr,
                              ps_string_from_cstr("length"),
                              ps_value_number((double)node->as.array_literal.count),
-                             PS_ATTR_NONE);
+                             PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
             return ps_value_object(arr);
         }
 

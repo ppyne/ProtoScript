@@ -188,3 +188,7 @@ run_case 130-io-basic 0
 run_case 131-io-errors 0
 run_case 132-gc-collect 0
 run_case 133-gc-stats 0
+run_case 134-for-in-array 0
+run_case 135-for-of-array 0
+run_case 136-for-of-object 0
+run_case 137-for-of-string 0

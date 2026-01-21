@@ -375,7 +375,7 @@ static PSValue ps_native_array(PSVM *vm, PSValue this_val, int argc, PSValue *ar
         ps_object_define(obj,
                          ps_string_from_cstr("length"),
                          ps_value_number(num),
-                         PS_ATTR_NONE);
+                         PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
         return ps_value_object(obj);
     }
 
@@ -387,7 +387,7 @@ static PSValue ps_native_array(PSVM *vm, PSValue this_val, int argc, PSValue *ar
     ps_object_define(obj,
                      ps_string_from_cstr("length"),
                      ps_value_number((double)argc),
-                     PS_ATTR_NONE);
+                     PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
     return ps_value_object(obj);
 }
 
@@ -2473,9 +2473,18 @@ static int ps_object_has_length(PSObject *obj, size_t *out_len) {
 
 static void ps_object_set_length(PSObject *obj, size_t len) {
     if (!obj) return;
-    ps_object_put(obj,
-                  ps_string_from_cstr("length"),
-                  ps_value_number((double)len));
+    int found = 0;
+    (void)ps_object_get_own(obj, ps_string_from_cstr("length"), &found);
+    if (found) {
+        ps_object_put(obj,
+                      ps_string_from_cstr("length"),
+                      ps_value_number((double)len));
+        return;
+    }
+    ps_object_define(obj,
+                     ps_string_from_cstr("length"),
+                     ps_value_number((double)len),
+                     PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
 }
 
 static PSValue ps_native_array_join(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {

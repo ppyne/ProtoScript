@@ -334,6 +334,9 @@ static PSAstNode *parse_statement(PSParser *p) {
                 case AST_FOR_IN:
                     stmt->as.for_in.label = label_node;
                     return stmt;
+                case AST_FOR_OF:
+                    stmt->as.for_of.label = label_node;
+                    return stmt;
                 case AST_SWITCH:
                     stmt->as.switch_stmt.label = label_node;
                     return stmt;
@@ -435,6 +438,12 @@ static PSAstNode *parse_statement(PSParser *p) {
                 PSAstNode *body = parse_statement(p);
                 return ps_ast_for_in(id_node, obj, body, 1);
             }
+            if (match(p, TOK_OF)) {
+                PSAstNode *obj = parse_expression(p);
+                expect(p, TOK_RPAREN, "')'");
+                PSAstNode *body = parse_statement(p);
+                return ps_ast_for_of(id_node, obj, body, 1);
+            }
         } else {
             PSAstNode *left = parse_member(p);
             if (match(p, TOK_IN)) {
@@ -442,6 +451,12 @@ static PSAstNode *parse_statement(PSParser *p) {
                 expect(p, TOK_RPAREN, "')'");
                 PSAstNode *body = parse_statement(p);
                 return ps_ast_for_in(left, obj, body, 0);
+            }
+            if (match(p, TOK_OF)) {
+                PSAstNode *obj = parse_expression(p);
+                expect(p, TOK_RPAREN, "')'");
+                PSAstNode *body = parse_statement(p);
+                return ps_ast_for_of(left, obj, body, 0);
             }
         }
 

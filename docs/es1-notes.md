@@ -50,3 +50,12 @@ extension beyond ES1.
 ProtoScript exposes a global `JSON` object with `JSON.parse` and
 `JSON.stringify`. This is an ES5 feature (not part of ES1). The implementation
 does not support revivers, replacers, spacing, or `toJSON`.
+
+## 9. `for...of` (ES2015)
+
+ProtoScript supports a simplified `for...of` loop (ES2015/ES6). It iterates:
+- array values in index order,
+- own enumerable property values of plain objects,
+- glyphs of UTF-8 strings.
+
+This is an ES6 extension beyond ES1 and does not use the ES6 iterator protocol.

@@ -1,3 +1,4 @@
 .DS_Store
 protoscript
 *.o
+docs/user_guide

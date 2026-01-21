@@ -1,0 +1,14 @@
+var re = /a(b)(c)(d)(e)(f)(g)(h)(i)(j)/;
+re.exec('abcdefghij');
+Io.print(RegExp["$1"]);
+Io.print(RegExp["$2"]);
+Io.print(RegExp["$3"]);
+Io.print(RegExp["$4"]);
+Io.print(RegExp["$5"]);
+Io.print(RegExp["$6"]);
+Io.print(RegExp["$7"]);
+Io.print(RegExp["$8"]);
+Io.print(RegExp["$9"]);
+var re2 = /(a)?b/;
+re2.exec('b');
+Io.print('[' + RegExp["$1"] + ']');

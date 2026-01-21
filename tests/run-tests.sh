@@ -176,3 +176,5 @@ run_case 117-glyph-length 0
 run_case 119-function-details 0
 run_case 120-regexp-ignorecase-extended 0
 run_case 121-single-quote 0
+run_case 122-string-search 0
+run_case 123-regexp-static-captures 0

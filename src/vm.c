@@ -2254,6 +2254,40 @@ static PSValue ps_native_string_match(PSVM *vm, PSValue this_val, int argc, PSVa
     return ps_value_object(out);
 }
 
+static PSValue ps_native_string_search(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    if (this_val.type == PS_T_NULL || this_val.type == PS_T_UNDEFINED) {
+        ps_vm_throw_type_error(vm, "Invalid receiver");
+        return ps_value_undefined();
+    }
+    PSString *input = ps_to_string(vm, this_val);
+    PSValue regex_val;
+    if (argc > 0 && argv[0].type == PS_T_OBJECT && argv[0].as.object &&
+        argv[0].as.object->kind == PS_OBJ_KIND_REGEXP) {
+        regex_val = argv[0];
+    } else {
+        PSValue args[1];
+        args[0] = (argc > 0) ? argv[0] : ps_value_undefined();
+        regex_val = ps_native_regexp(vm, ps_value_undefined(), 1, args);
+        if (vm->has_pending_throw) return ps_value_undefined();
+    }
+    PSObject *re = regex_val.as.object;
+    if (!re) return ps_value_number(-1.0);
+    ps_object_put(re, ps_string_from_cstr("lastIndex"), ps_value_number(0.0));
+    PSValue exec_args[1];
+    exec_args[0] = ps_value_string(input);
+    PSValue match = ps_native_regexp_exec(vm, ps_value_object(re), 1, exec_args);
+    if (vm->has_pending_throw) return ps_value_undefined();
+    ps_object_put(re, ps_string_from_cstr("lastIndex"), ps_value_number(0.0));
+    if (match.type == PS_T_NULL) return ps_value_number(-1.0);
+    int found = 0;
+    PSValue index_val = ps_object_get(match.as.object, ps_string_from_cstr("index"), &found);
+    if (found) {
+        double d = ps_to_number(vm, index_val);
+        if (!isnan(d)) return ps_value_number(d);
+    }
+    return ps_value_number(-1.0);
+}
+
 static PSValue ps_native_string_replace(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
     if (this_val.type == PS_T_NULL || this_val.type == PS_T_UNDEFINED) {
         ps_vm_throw_type_error(vm, "Invalid receiver");
@@ -3746,6 +3780,30 @@ static PSValue ps_native_regexp_to_string(PSVM *vm, PSValue this_val, int argc, 
     return ps_value_string(ps_string_concat(base, flags));
 }
 
+static void ps_regexp_update_static_captures(PSVM *vm, PSString *input,
+                                             PSRegexCapture *caps, int cap_count) {
+    if (!vm || !vm->global) return;
+    int found = 0;
+    PSValue ctor_val = ps_object_get(vm->global, ps_string_from_cstr("RegExp"), &found);
+    if (!found || ctor_val.type != PS_T_OBJECT || !ctor_val.as.object) return;
+    PSObject *ctor = ctor_val.as.object;
+    for (int i = 1; i <= 9; i++) {
+        PSValue val;
+        if (i < cap_count && caps[i].defined) {
+            PSString *cap = ps_string_substring(input,
+                                                (size_t)caps[i].start,
+                                                (size_t)caps[i].end);
+            val = ps_value_string(cap);
+        } else {
+            val = ps_value_string(ps_string_from_cstr(""));
+        }
+        char name[4];
+        snprintf(name, sizeof(name), "$%d", i);
+        ps_object_define(ctor, ps_string_from_cstr(name), val,
+                         PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
+    }
+}
+
 static PSValue ps_native_regexp_exec(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
     if (this_val.type != PS_T_OBJECT || !this_val.as.object ||
         this_val.as.object->kind != PS_OBJ_KIND_REGEXP) {
@@ -3817,6 +3875,7 @@ static PSValue ps_native_regexp_exec(PSVM *vm, PSValue this_val, int argc, PSVal
             ps_object_define(result, ps_string_from_cstr("length"), ps_value_number((double)cap_count), PS_ATTR_NONE);
             ps_object_define(result, ps_string_from_cstr("index"), ps_value_number((double)pos), PS_ATTR_NONE);
             ps_object_define(result, ps_string_from_cstr("input"), ps_value_string(input), PS_ATTR_NONE);
+            ps_regexp_update_static_captures(vm, input, caps, cap_count);
             if (global) {
                 size_t next_index = end_pos;
                 if (end_pos == pos && next_index < len) next_index = pos + 1;
@@ -4717,6 +4776,15 @@ void ps_vm_init_builtins(PSVM *vm) {
                 ps_object_define(vm->string_proto,
                                  ps_string_from_cstr("match"),
                                  ps_value_object(match_fn),
+                                 PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+            }
+            PSObject *search_fn = ps_function_new_native(ps_native_string_search);
+            if (search_fn) {
+                ps_function_setup(search_fn, vm->function_proto, vm->object_proto, NULL);
+                ps_define_function_props(search_fn, "search", 1);
+                ps_object_define(vm->string_proto,
+                                 ps_string_from_cstr("search"),
+                                 ps_value_object(search_fn),
                                  PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
             }
         }

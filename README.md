@@ -22,7 +22,7 @@ You can test ProtoScript immediately thanks to a demo running on the web via Web
 
 ## Documentation
 
-- The technical foundation: [Object Creation with ES1](object_creation.md)
+- The technical foundation: [Object Creation with ES1](docs/object_creation.md)
 - User guide: [`docs/user_guide/toc.md`](docs/user_guide/toc.md)
 - Language reference: [`docs/language_reference.md`](docs/language_reference.md)
 - ES1 deviations: [`docs/es1-notes.md`](docs/es1-notes.md)

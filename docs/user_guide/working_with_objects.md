@@ -171,6 +171,7 @@ Removing the last reference to an object allows it to be garbage-collected.
 
 ProtoScript provides the following predefined core objects:
 
+- `Object`
 - `Array`
 - `Boolean`
 - `Date`
@@ -179,6 +180,9 @@ ProtoScript provides the following predefined core objects:
 - `Number`
 - `RegExp`
 - `String`
+- `JSON`
+- `Io`
+- `Gc`
 
 Browser-only objects have been intentionally excluded.
 

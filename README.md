@@ -12,7 +12,7 @@ ProtoScript does not aim for modern JavaScript or browser compatibility.
 
 ## Manifest
 
-[Prototype-Based Languages: **A Different Way to Think**](docs/prototype_based_thinking_with_proto_script.md)
+[Prototype-Based Languages: **A Different Way to Think**](docs/prototype_based_thinking_with_protoscript.md)
 
 ## Demo
 

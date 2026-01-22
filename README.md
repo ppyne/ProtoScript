@@ -23,6 +23,7 @@ You can test ProtoScript immediately thanks to a demo running on the web via Web
 ## Documentation
 
 - User guide: [`docs/user_guide/toc.md`](docs/user_guide/toc.md)
+- Language reference: [`docs/language_reference.md`](docs/language_reference.md)
 - ES1 deviations: [`docs/es1-notes.md`](docs/es1-notes.md)
 - String model spec: [`docs/string-spec.md`](docs/string-spec.md)
 - Io module spec: [`docs/io_spec.md`](docs/io_spec.md)

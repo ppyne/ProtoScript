@@ -1,3 +1,5 @@
+![ProtoScript](../header.png)
+
 # Prototype-Based Languages: A Different Way to Think
 
 > "The most dangerous thing you can do is to think you understand something when you do not." — David Ungar
@@ -147,6 +149,10 @@ This duality creates a split-brain effect: developers *write* classes but *run* 
 ProtoScript refuses this compromise.
 
 It exposes the real model directly, without disguise.
+
+![Same goal. Different mental model.](illust01.png)
+
+*Same goal. Different mental model.*
 
 ---
 
@@ -326,6 +332,10 @@ This is powerful and dangerous—ProtoScript encourages understanding this mecha
 ---
 
 This is where prototype-based thinking becomes *acrobatic*: not merely agile, but capable of controlled, high‑level transformations.
+
+![The mutation point.](illust02.png)
+
+*The mutation point.*
 
 ---
 

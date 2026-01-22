@@ -1,6 +1,6 @@
 ![ProtoScript](../header.png)
 
-# ProtoScript Language Reference (current implementation)
+# ProtoScript Language Reference
 
 This document lists the syntax and built-in symbols available to ProtoScript
 developers in the current implementation. It is implementation-focused and

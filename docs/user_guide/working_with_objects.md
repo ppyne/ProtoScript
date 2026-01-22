@@ -173,13 +173,13 @@ ProtoScript provides the following predefined core objects:
 
 - `Object`
 - `Array`
+- `Function`
+- `String`
+- `Number`
 - `Boolean`
 - `Date`
-- `Function`
 - `Math`
-- `Number`
 - `RegExp`
-- `String`
 - `JSON`
 - `Io`
 - `Gc`

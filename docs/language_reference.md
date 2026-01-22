@@ -27,7 +27,7 @@ does not describe every ES1 rule in detail.
 ```
 var if else while do for in of switch case default function return
 break continue with try catch finally throw new true false null typeof
-void delete
+instanceof void delete
 ```
 
 ---

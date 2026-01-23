@@ -1,5 +1,11 @@
 try {
-    Io.close(Io.stdin);
+    Io.stdin.close();
+} catch (e) {
+    Io.print((e.name) + "\n");
+}
+
+try {
+    Io.open("nope.txt", "rw");
 } catch (e) {
     Io.print((e.name) + "\n");
 }
@@ -7,8 +13,8 @@ try {
 var path = Io.tempPath();
 var f = Io.open(path, "w");
 try {
-    Io.read(f);
+    f.read();
 } catch (e) {
     Io.print((e.name) + "\n");
 }
-Io.close(f);
+f.close();

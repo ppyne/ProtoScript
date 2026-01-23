@@ -1,5 +1,8 @@
 # ProtoScript — Io Binary Extension
 
+**Status:** Superseded by `docs/io_unified_spec.md` (v1.2). This document is
+kept for historical reference only.
+
 **Specification v1.0**
 
 This document defines the binary I/O extensions to the existing `Io` module. These extensions introduce explicit binary file access using the `Buffer` type, without altering or overloading existing text-based APIs.
@@ -140,4 +143,3 @@ The binary Io extension answers one question:
 > “How do I read and write raw bytes, without ambiguity?”
 
 Nothing more.
-

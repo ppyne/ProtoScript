@@ -36,6 +36,10 @@ PSObject *ps_buffer_new(PSVM *vm, size_t size) {
     buf->size = size;
     obj->kind = PS_OBJ_KIND_BUFFER;
     obj->internal = buf;
+    ps_object_define(obj,
+                     ps_string_from_cstr("length"),
+                     ps_value_number((double)size),
+                     PS_ATTR_READONLY | PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
     return obj;
 }
 

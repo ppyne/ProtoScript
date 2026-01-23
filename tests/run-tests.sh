@@ -204,3 +204,5 @@ run_case 146-include-basic 0
 run_case 147-object-prototype 0
 run_case 148-assign-util 0
 run_case 149-clone-util 0
+run_case 150-io-eof 0
+run_case 151-io-bom 0

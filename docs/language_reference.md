@@ -220,16 +220,16 @@ Constructors:
 Object: `Io`
 - `Io.print(value)`
 - `Io.open(path, mode)`
-- `Io.read(file)`
-- `Io.readLines(file)`
-- `Io.readBinary(path)`
-- `Io.write(file, data)`
-- `Io.writeLine(file, data)`
-- `Io.writeBinary(path, buffer)`
-- `Io.close(file)`
 - `Io.tempPath()`
 - `Io.EOL`
+- `Io.EOF`
 - `Io.stdin`, `Io.stdout`, `Io.stderr`
+
+File object:
+- `file.read([size])`
+- `file.write(data)`
+- `file.close()`
+- `file.path`, `file.mode`, `file.closed`
 
 ### 7.2 Gc
 Object: `Gc`
@@ -241,6 +241,7 @@ Object: `Buffer`
 - `Buffer.alloc(size)`
 - `Buffer.size(buffer)`
 - `Buffer.slice(buffer, offset, length)`
+- `buffer.length` (bytes)
 
 ### 7.4 Event
 Object: `Event`

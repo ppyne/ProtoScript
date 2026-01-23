@@ -151,7 +151,7 @@ Performance characteristics are implementation-defined.
 
 The Buffer module is designed to interoperate with:
 
-- `Io.readBinary` / `Io.writeBinary`
+- `Io.open(..., "rb"/"wb"/"ab")` and `file.read` / `file.write`
 - `Display` framebuffer or blitting APIs
 - Other native modules requiring binary data
 

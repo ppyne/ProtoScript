@@ -1,20 +1,21 @@
 var path = Io.tempPath();
 var f = Io.open(path, "w");
-Io.write(f, "alpha\nbeta");
-Io.close(f);
+f.write("alpha\nbeta");
+f.close();
 
 f = Io.open(path, "r");
-Io.print((Io.read(f)) + "\n");
-Io.close(f);
+Io.print((f.read()) + "\n");
+f.close();
 
 var path2 = Io.tempPath();
 var f2 = Io.open(path2, "w");
-Io.write(f2, "x\ny");
-Io.close(f2);
+f2.write("x\ny");
+f2.close();
 
 f2 = Io.open(path2, "r");
-var lines = Io.readLines(f2);
-Io.close(f2);
+var data = f2.read();
+f2.close();
+var lines = data.split("\n");
 Io.print((lines.length) + "\n");
 Io.print((lines[0]) + "\n");
 Io.print((lines[1]) + "\n");

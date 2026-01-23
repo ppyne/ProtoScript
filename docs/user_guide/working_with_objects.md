@@ -272,29 +272,42 @@ ProtoScript exposes a host `Io` module for synchronous, explicit I/O.
 ```js
 var path = Io.tempPath();
 var f = Io.open(path, "w");
-Io.writeLine(f, "hello");
-Io.close(f);
+f.write("hello\n");
+f.close();
 ```
 
 Core operations:
-- `Io.open(path, mode)` with `"r"`, `"w"`, `"a"`.
-- `Io.read(file)` to read the rest of a file.
-- `Io.readLines(file)` to read lines split on `Io.EOL` (`"\n"`).
-- `Io.readBinary(path)` to read a file into a `Buffer`.
-- `Io.write(file, data)` and `Io.writeLine(file, data)`.
-- `Io.writeBinary(path, buffer)` to write a `Buffer` to a file.
-- `Io.close(file)` to release resources.
+- `Io.open(path, mode)` returns a file object.
+- `file.read()` reads to EOF and returns a string (text) or `Buffer` (binary).
+- `file.read(size)` reads up to `size` bytes and returns `Io.EOF` at end-of-file.
+- `file.write(data)` writes a string (text mode) or `Buffer` (binary mode).
+- `file.close()` closes the file (explicit, no GC auto-close).
+- `Io.EOF` is a unique constant used for end-of-file detection.
 - `Io.print(string)` writes to `Io.stdout` without an implicit newline.
+
+Mode flags:
+- `"r"` read text, `"w"` write text, `"a"` append text.
+- Add `"b"` for binary: `"rb"`, `"wb"`, `"ab"`.
 
 Standard streams:
 - `Io.stdin`, `Io.stdout`, `Io.stderr` are always open and cannot be closed.
 
-Binary I/O uses file paths (not `Io.open` handles):
+Sequential read example:
 
 ```js
-var buf = Io.readBinary("logo.bin");
-Io.writeBinary("copy.bin", buf);
+var f = Io.open("data.bin", "rb");
+while (true) {
+    var chunk = f.read(1024);
+    if (chunk === Io.EOF) break;
+    // process chunk
+}
+f.close();
 ```
+
+File objects:
+- `file.path`: original path string.
+- `file.mode`: mode string.
+- `file.closed`: boolean.
 
 ---
 

@@ -224,6 +224,241 @@ static PSValue ps_native_print(PSVM *vm, PSValue this_val, int argc, PSValue *ar
     return ps_value_undefined();
 }
 
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} PSSprintfBuf;
+
+static int sprintf_buf_reserve(PSSprintfBuf *buf, size_t needed) {
+    if (!buf) return 0;
+    if (needed <= buf->cap) return 1;
+    size_t next = buf->cap ? buf->cap : 64;
+    while (next < needed) next *= 2;
+    char *data = (char *)realloc(buf->data, next);
+    if (!data) return 0;
+    buf->data = data;
+    buf->cap = next;
+    return 1;
+}
+
+static int sprintf_buf_append(PSSprintfBuf *buf, const char *data, size_t len) {
+    if (!buf || !data || len == 0) return 1;
+    if (!sprintf_buf_reserve(buf, buf->len + len + 1)) return 0;
+    memcpy(buf->data + buf->len, data, len);
+    buf->len += len;
+    buf->data[buf->len] = '\0';
+    return 1;
+}
+
+static int sprintf_buf_append_char(PSSprintfBuf *buf, char c, size_t count) {
+    if (!buf || count == 0) return 1;
+    if (!sprintf_buf_reserve(buf, buf->len + count + 1)) return 0;
+    memset(buf->data + buf->len, c, count);
+    buf->len += count;
+    buf->data[buf->len] = '\0';
+    return 1;
+}
+
+static int sprintf_append_padded(PSSprintfBuf *buf,
+                                 const char *data,
+                                 size_t len,
+                                 int width,
+                                 int left_align,
+                                 char pad) {
+    size_t pad_len = 0;
+    if (width > 0 && (size_t)width > len) pad_len = (size_t)width - len;
+    if (!left_align && pad_len > 0) {
+        if (!sprintf_buf_append_char(buf, pad, pad_len)) return 0;
+    }
+    if (!sprintf_buf_append(buf, data, len)) return 0;
+    if (left_align && pad_len > 0) {
+        if (!sprintf_buf_append_char(buf, ' ', pad_len)) return 0;
+    }
+    return 1;
+}
+
+static int sprintf_append_signed(PSSprintfBuf *buf,
+                                 const char *data,
+                                 size_t len,
+                                 int width,
+                                 int left_align,
+                                 char pad) {
+    if (pad != '0' || left_align || len == 0 || (data[0] != '-' && data[0] != '+')) {
+        return sprintf_append_padded(buf, data, len, width, left_align, pad);
+    }
+    size_t pad_len = 0;
+    if (width > 0 && (size_t)width > len) pad_len = (size_t)width - len;
+    if (!sprintf_buf_append(buf, data, 1)) return 0;
+    if (pad_len > 0 && !sprintf_buf_append_char(buf, '0', pad_len)) return 0;
+    return sprintf_buf_append(buf, data + 1, len - 1);
+}
+
+static void sprintf_parse_flags(const char *fmt,
+                                size_t len,
+                                size_t *idx,
+                                int *left_align,
+                                int *zero_pad) {
+    while (*idx < len) {
+        char c = fmt[*idx];
+        if (c == '-') {
+            *left_align = 1;
+            (*idx)++;
+        } else if (c == '0') {
+            *zero_pad = 1;
+            (*idx)++;
+        } else {
+            break;
+        }
+    }
+}
+
+static int sprintf_parse_number(const char *fmt, size_t len, size_t *idx, int *out) {
+    int value = 0;
+    int found = 0;
+    while (*idx < len) {
+        char c = fmt[*idx];
+        if (c < '0' || c > '9') break;
+        found = 1;
+        value = value * 10 + (c - '0');
+        (*idx)++;
+    }
+    if (out) *out = found ? value : -1;
+    return found;
+}
+
+static int sprintf_format_number(char *out,
+                                 size_t out_len,
+                                 char spec,
+                                 double num,
+                                 int precision) {
+    if (isnan(num)) {
+        snprintf(out, out_len, "NaN");
+        return 1;
+    }
+    if (isinf(num)) {
+        snprintf(out, out_len, "%sInfinity", num < 0 ? "-" : "");
+        return 1;
+    }
+    if (spec == 'f') {
+        if (precision >= 0) {
+            snprintf(out, out_len, "%.*f", precision, num);
+        } else {
+            snprintf(out, out_len, "%f", num);
+        }
+        return 1;
+    }
+    long long ival = (long long)num;
+    if (spec == 'd' || spec == 'i') {
+        snprintf(out, out_len, "%lld", ival);
+        return 1;
+    }
+    if (spec == 'x') {
+        snprintf(out, out_len, "%llx", (unsigned long long)ival);
+        return 1;
+    }
+    if (spec == 'X') {
+        snprintf(out, out_len, "%llX", (unsigned long long)ival);
+        return 1;
+    }
+    if (spec == 'o') {
+        snprintf(out, out_len, "%llo", (unsigned long long)ival);
+        return 1;
+    }
+    return 0;
+}
+
+static PSValue ps_native_sprintf(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    if (argc < 1) {
+        ps_vm_throw_type_error(vm, "Io.sprintf expects (format, ...args)");
+        return ps_value_undefined();
+    }
+    if (argv[0].type != PS_T_STRING) {
+        ps_vm_throw_type_error(vm, "Io.sprintf expects (format, ...args)");
+        return ps_value_undefined();
+    }
+    PSString *fmt_s = argv[0].as.string;
+    if (!fmt_s) return ps_value_string(ps_string_from_cstr(""));
+
+    PSSprintfBuf out = {0};
+    size_t i = 0;
+    int arg_index = 1;
+    while (i < fmt_s->byte_len) {
+        char c = fmt_s->utf8[i];
+        if (c != '%') {
+            if (!sprintf_buf_append(&out, &c, 1)) break;
+            i++;
+            continue;
+        }
+        i++;
+        if (i >= fmt_s->byte_len) {
+            (void)sprintf_buf_append(&out, "%", 1);
+            break;
+        }
+        if (fmt_s->utf8[i] == '%') {
+            (void)sprintf_buf_append(&out, "%", 1);
+            i++;
+            continue;
+        }
+
+        int left_align = 0;
+        int zero_pad = 0;
+        int width = -1;
+        int precision = -1;
+        sprintf_parse_flags(fmt_s->utf8, fmt_s->byte_len, &i, &left_align, &zero_pad);
+        sprintf_parse_number(fmt_s->utf8, fmt_s->byte_len, &i, &width);
+        if (i < fmt_s->byte_len && fmt_s->utf8[i] == '.') {
+            i++;
+            sprintf_parse_number(fmt_s->utf8, fmt_s->byte_len, &i, &precision);
+            if (precision < 0) precision = 0;
+        }
+        if (i >= fmt_s->byte_len) {
+            (void)sprintf_buf_append(&out, "%", 1);
+            break;
+        }
+
+        char spec = fmt_s->utf8[i++];
+        PSValue arg = ps_value_undefined();
+        if (arg_index < argc) {
+            arg = argv[arg_index];
+        }
+        if (spec != '%') arg_index++;
+
+        char pad = (zero_pad && !left_align) ? '0' : ' ';
+        if (spec == 's') {
+            PSString *s = ps_to_string(vm, arg);
+            if (s) {
+                (void)sprintf_append_padded(&out, s->utf8, s->byte_len, width, left_align, pad);
+            }
+            continue;
+        }
+        if (spec == 'd' || spec == 'i' || spec == 'f' || spec == 'x' || spec == 'X' || spec == 'o') {
+            double num = ps_to_number(vm, arg);
+            char tmp[128];
+            if (!sprintf_format_number(tmp, sizeof(tmp), spec, num, precision)) {
+                (void)sprintf_buf_append(&out, "%", 1);
+                (void)sprintf_buf_append(&out, &spec, 1);
+                continue;
+            }
+            size_t len = strlen(tmp);
+            if (spec == 'd' || spec == 'i' || spec == 'f') {
+                (void)sprintf_append_signed(&out, tmp, len, width, left_align, pad);
+            } else {
+                (void)sprintf_append_padded(&out, tmp, len, width, left_align, pad);
+            }
+            continue;
+        }
+
+        (void)sprintf_buf_append(&out, "%", 1);
+        (void)sprintf_buf_append(&out, &spec, 1);
+    }
+
+    PSValue result = ps_value_string(ps_string_from_utf8(out.data ? out.data : "", out.len));
+    free(out.data);
+    return result;
+}
+
 static PSValue ps_native_open(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
     (void)this_val;
     if (argc < 2) {
@@ -537,6 +772,9 @@ void ps_io_init(PSVM *vm) {
     if (!print_fn) return;
     ps_function_setup(print_fn, vm->function_proto, vm->object_proto, NULL);
 
+    PSObject *sprintf_fn = ps_function_new_native(ps_native_sprintf);
+    if (sprintf_fn) ps_function_setup(sprintf_fn, vm->function_proto, vm->object_proto, NULL);
+
     PSObject *open_fn = ps_function_new_native(ps_native_open);
     PSObject *temp_path_fn = ps_function_new_native(ps_native_temp_path);
     if (open_fn) ps_function_setup(open_fn, vm->function_proto, vm->object_proto, NULL);
@@ -550,6 +788,9 @@ void ps_io_init(PSVM *vm) {
         PS_ATTR_NONE
     );
 
+    if (sprintf_fn) {
+        ps_object_define(io, ps_string_from_cstr("sprintf"), ps_value_object(sprintf_fn), PS_ATTR_NONE);
+    }
     if (open_fn) {
         ps_object_define(io, ps_string_from_cstr("open"), ps_value_object(open_fn), PS_ATTR_NONE);
     }

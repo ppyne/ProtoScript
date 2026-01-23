@@ -284,6 +284,7 @@ Core operations:
 - `file.close()` closes the file (explicit, no GC auto-close).
 - `Io.EOF` is a unique constant used for end-of-file detection.
 - `Io.print(string)` writes to `Io.stdout` without an implicit newline.
+- `Io.sprintf(format, ...args)` formats values into a string (no I/O).
 
 Mode flags:
 - `"r"` read text, `"w"` write text, `"a"` append text.
@@ -291,6 +292,59 @@ Mode flags:
 
 Standard streams:
 - `Io.stdin`, `Io.stdout`, `Io.stderr` are always open and cannot be closed.
+
+Formatting:
+`Io.sprintf(format, ...args)` builds and returns a formatted string.
+
+### Format specification
+
+Each format specifier follows:
+
+```
+%[flags][width][.precision]specifier
+```
+
+Only the specifiers and modifiers below are supported.
+
+#### Flags
+
+- `0` — zero padding (ignored when left-aligned).
+- `-` — left alignment.
+
+#### Width
+
+Minimum field width. If the formatted value is shorter, it is padded with
+spaces (or zeros if `0` is used).
+
+#### Precision
+
+Only applies to `%f` and specifies the number of digits after the decimal
+point.
+
+#### Supported specifiers
+
+| Specifier | Description |
+| -------- | -------- |
+| `%s` | string (uses `String(value)`) |
+| `%d` | signed decimal integer |
+| `%i` | signed integer |
+| `%x` | hexadecimal (lowercase) |
+| `%X` | hexadecimal (uppercase) |
+| `%o` | octal |
+| `%f` | floating-point |
+| `%%` | literal percent sign |
+
+#### Notes and limitations
+
+- Width and precision must be numeric literals.
+- Precision is only supported for `%f`.
+- Unsupported format sequences are left unchanged.
+- Missing arguments format as `undefined`.
+
+```js
+var line = Io.sprintf("%-10s %8.2f", "total", 3.14159);
+Io.print(line + "\n");
+```
 
 Sequential read example:
 

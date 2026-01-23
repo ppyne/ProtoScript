@@ -1,0 +1,12 @@
+Io.print(Io.sprintf("hello %s", "world") + "\n");
+Io.print(Io.sprintf("%d %i", 42.9, -3.2) + "\n");
+Io.print(Io.sprintf("%x %X %o", 255, 255, 9) + "\n");
+Io.print(Io.sprintf("%8s", "hi") + "\n");
+Io.print(Io.sprintf("%-6d", 12) + "\n");
+Io.print(Io.sprintf("%04d", 12) + "\n");
+Io.print(Io.sprintf("%02x", 5) + "\n");
+Io.print(Io.sprintf("%.2f", 3.14159) + "\n");
+Io.print(Io.sprintf("%8.2f", 3.14159) + "\n");
+Io.print(Io.sprintf("%-8.2f", 3.14159) + "\n");
+Io.print(Io.sprintf("%%") + "\n");
+Io.print(Io.sprintf("missing %s %d") + "\n");

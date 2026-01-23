@@ -106,6 +106,58 @@ Io.stdout.write(String(value))
 
 ---
 
+## Io.sprintf(format, ...args)
+
+Formats values into a string, similar to C `sprintf`. This function is pure
+and does not perform I/O.
+
+### Parameters
+- **format**: string — format string.
+- **args**: any — values to format.
+
+### Return Value
+- Formatted string.
+
+### Errors
+- If `format` is not a string, a `TypeError` is thrown.
+
+### Supported specifiers
+
+| Specifier | Meaning |
+| -------- | ------- |
+| `%s`     | string (uses `String(value)`) |
+| `%d` `%i` | signed integer (base 10) |
+| `%f`     | floating-point |
+| `%x` `%X` | hexadecimal (lower/upper) |
+| `%o`     | octal |
+| `%%`     | literal `%` |
+
+### Width, alignment, zero padding, precision
+
+- Optional **width**: `%8s`, `%5d` (minimum field width).
+- Optional **left alignment**: `%-8s`, `%-5d`.
+- Optional **zero padding**: `%02x`, `%04d` (ignored when left-aligned).
+- Optional **precision** for `%f`: `%.3f`, `%8.2f`, `%-10.4f`.
+
+Precision applies only to `%f`. Width applies to all specifiers.
+
+### Argument handling
+
+- Extra arguments are ignored.
+- Missing arguments format as `undefined`.
+
+### Examples
+
+```js
+Io.sprintf("name=%s id=%d", "alice", 12);
+```
+
+```js
+Io.sprintf("%-10s %8.2f", "total", 3.14159);
+```
+
+---
+
 ## Io.tempPath()
 
 Returns a unique, non-existing temporary file path as a string. The file is

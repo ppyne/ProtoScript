@@ -219,6 +219,7 @@ Constructors:
 ### 7.1 Io
 Object: `Io`
 - `Io.print(value)`
+- `Io.sprintf(format, ...args)`
 - `Io.open(path, mode)`
 - `Io.tempPath()`
 - `Io.EOL`

@@ -207,6 +207,7 @@ run_case 149-clone-util 0
 run_case 150-io-eof 0
 run_case 151-io-bom 0
 run_case 152-array-elision 0
+run_case 153-io-sprintf 0
 
 fs_enabled=$(awk '/^#define PS_ENABLE_MODULE_FS/ {print $3}' include/ps_config.h)
 if [ "${fs_enabled:-0}" -eq 1 ]; then

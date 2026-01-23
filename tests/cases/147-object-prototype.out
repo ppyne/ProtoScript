@@ -1,0 +1,9 @@
+proto-ok
+set-ok
+set-proto-ok
+null-ok
+TypeError
+TypeError
+clone-proto
+foo
+1

@@ -97,6 +97,11 @@ Rules:
 
 ### 6.1 Object
 Constructor: `Object(value)`
+Static:
+- `Object.getPrototypeOf(obj)`
+- `Object.setPrototypeOf(obj, proto)`
+- `Object.create(proto)`
+Note: `Object.create` does not support property descriptors; passing a second argument throws.
 Prototype methods:
 - `toString()`
 - `toLocaleString()`

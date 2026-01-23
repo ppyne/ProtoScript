@@ -55,13 +55,22 @@ ProtoScript supports ES2015-style default parameter values in function
 declarations (for example `function f(x, y = 10) { ... }`). This is an ES6
 extension beyond ES1.
 
-## 9. JSON (ES5)
+## 9. Object prototype APIs (ES5/ES2015)
+
+ProtoScript exposes:
+- `Object.getPrototypeOf` (ES5)
+- `Object.create` (ES5, without property descriptors)
+- `Object.setPrototypeOf` (ES2015)
+
+These are beyond ES1.
+
+## 10. JSON (ES5)
 
 ProtoScript exposes a global `JSON` object with `JSON.parse` and
 `JSON.stringify`. This is an ES5 feature (not part of ES1). The implementation
 does not support revivers, replacers, spacing, or `toJSON`.
 
-## 10. `for...of` (ES2015)
+## 11. `for...of` (ES2015)
 
 ProtoScript supports a simplified `for...of` loop (ES2015/ES6). It iterates:
 - array values in index order,
@@ -70,7 +79,7 @@ ProtoScript supports a simplified `for...of` loop (ES2015/ES6). It iterates:
 
 This is an ES6 extension beyond ES1 and does not use the ES6 iterator protocol.
 
-## 11. `instanceof` (ES3)
+## 12. `instanceof` (ES3)
 
 ProtoScript supports the `instanceof` operator (added in ES3). The right-hand
 side must be a function with a valid `prototype`, otherwise a `TypeError` is

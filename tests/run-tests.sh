@@ -201,3 +201,6 @@ run_case 143-io-binary 0
 run_case 144-io-binary-edge 0
 run_case 145-event-empty 0
 run_case 146-include-basic 0
+run_case 147-object-prototype 0
+run_case 148-assign-util 0
+run_case 149-clone-util 0

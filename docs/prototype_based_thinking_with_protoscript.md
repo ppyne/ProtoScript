@@ -218,7 +218,8 @@ When an object does not contain a property, the lookup continues through its pro
 - Observable
 - Modifiable at runtime
 
-In ProtoScript, prototype chains are explicit and readable. This encourages experimentation:
+In ProtoScript, prototype chains are explicit at the definition site (for example, `Car.prototype`). ProtoScript also exposes `Object.getPrototypeOf`, `Object.create`, and `Object.setPrototypeOf` for explicit inspection and changes when needed.
+This encourages experimentation:
 
 - Change a prototype
 - Observe how all derived objects react
@@ -242,7 +243,7 @@ This is delegation.
 
 Objects do not *belong* to a class. They *delegate* missing behavior to another object.
 
-ProtoScript makes this model explicit and simple, avoiding class keywords, constructors, and meta-object confusion.
+ProtoScript makes this model explicit and simple, avoiding `class` syntax and meta-object confusion.
 
 Once understood, delegation feels more natural for many real-world problems than rigid hierarchies.
 
@@ -277,13 +278,15 @@ Instead of designing a rigid architecture up front, you start with something con
 Rather than subclassing, you clone and adjust:
 
 ```
+include "examples/utils/clone.js";
+
 baseOsc = {
   freq: 440,
-  play: fn() { /* ... */ }
-}
+  play: function() { /* ... */ }
+};
 
-bassOsc = clone(baseOsc)
-bassOsc.freq = 110
+bassOsc = clone(baseOsc);
+bassOsc.freq = 110;
 ```
 
 No hierarchy. No constructor. No class explosion.
@@ -297,16 +300,18 @@ Each object tells its own story.
 You can add behavior *after* objects already exist:
 
 ```
-filter = { cutoff: 1000 }
+include "examples/utils/clone.js";
 
-osc = clone(baseOsc)
-osc.filter = filter
+filter = { cutoff: 1000 };
+
+osc = clone(baseOsc);
+osc.filter = filter;
 ```
 
 Later:
 
 ```
-filter.process = fn(signal) { /* ... */ }
+filter.process = function(signal) { /* ... */ };
 ```
 
 All objects delegating to `filter` gain the behavior instantly.
@@ -320,9 +325,9 @@ This is not just flexibility. It is **live architecture**.
 You can alter behavior deeply—but intentionally:
 
 ```
-baseOsc.play = fn() {
-  log("patched play")
-}
+baseOsc.play = function() {
+  Io.print("patched play\n");
+};
 ```
 
 Every derived object reacts.
@@ -454,4 +459,3 @@ If you are looking for comfort, it may disappoint you. If you are looking for un
 ProtoScript does not try to be popular.
 
 It tries to be *true*.
-

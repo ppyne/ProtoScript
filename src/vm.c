@@ -1461,6 +1461,86 @@ static PSValue ps_native_object_is_prototype_of(PSVM *vm, PSValue this_val, int 
     return ps_value_boolean(0);
 }
 
+static int ps_object_has_in_proto_chain(PSObject *obj, PSObject *proto) {
+    for (PSObject *cur = proto; cur; cur = cur->prototype) {
+        if (cur == obj) return 1;
+    }
+    return 0;
+}
+
+static PSValue ps_native_object_get_prototype_of(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    if (argc < 1) {
+        ps_vm_throw_type_error(vm, "Object.getPrototypeOf expects (obj)");
+        return ps_value_undefined();
+    }
+    PSValue val = argv[0];
+    if (val.type == PS_T_NULL || val.type == PS_T_UNDEFINED) {
+        ps_vm_throw_type_error(vm, "Object.getPrototypeOf expects (obj)");
+        return ps_value_undefined();
+    }
+    if (val.type != PS_T_OBJECT || !val.as.object) {
+        PSObject *wrapped = ps_vm_wrap_primitive(vm, &val);
+        if (!wrapped) return ps_value_undefined();
+        val = ps_value_object(wrapped);
+    }
+    PSObject *proto = val.as.object->prototype;
+    if (!proto) return ps_value_null();
+    return ps_value_object(proto);
+}
+
+static PSValue ps_native_object_set_prototype_of(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    if (argc < 2) {
+        ps_vm_throw_type_error(vm, "Object.setPrototypeOf expects (obj, proto)");
+        return ps_value_undefined();
+    }
+    if (argv[0].type != PS_T_OBJECT || !argv[0].as.object) {
+        ps_vm_throw_type_error(vm, "Object.setPrototypeOf expects (obj, proto)");
+        return ps_value_undefined();
+    }
+    PSObject *obj = argv[0].as.object;
+    PSObject *proto = NULL;
+    if (argv[1].type == PS_T_NULL) {
+        proto = NULL;
+    } else if (argv[1].type == PS_T_OBJECT && argv[1].as.object) {
+        proto = argv[1].as.object;
+    } else {
+        ps_vm_throw_type_error(vm, "Object.setPrototypeOf expects (obj, proto)");
+        return ps_value_undefined();
+    }
+    if (proto == obj || (proto && ps_object_has_in_proto_chain(obj, proto))) {
+        ps_vm_throw_type_error(vm, "Prototype cycle is not allowed");
+        return ps_value_undefined();
+    }
+    obj->prototype = proto;
+    return argv[0];
+}
+
+static PSValue ps_native_object_create(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    if (argc < 1) {
+        ps_vm_throw_type_error(vm, "Object.create expects (proto)");
+        return ps_value_undefined();
+    }
+    if (argc > 1 && argv[1].type != PS_T_UNDEFINED) {
+        ps_vm_throw_type_error(vm, "Object.create properties not supported");
+        return ps_value_undefined();
+    }
+    PSObject *proto = NULL;
+    if (argv[0].type == PS_T_NULL) {
+        proto = NULL;
+    } else if (argv[0].type == PS_T_OBJECT && argv[0].as.object) {
+        proto = argv[0].as.object;
+    } else {
+        ps_vm_throw_type_error(vm, "Object.create expects (proto)");
+        return ps_value_undefined();
+    }
+    PSObject *obj = ps_object_new(proto);
+    if (!obj) return ps_value_undefined();
+    return ps_value_object(obj);
+}
+
 static PSValue ps_native_boolean_to_string(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
     (void)vm;
     (void)argc;
@@ -5228,6 +5308,33 @@ void ps_vm_init_builtins(PSVM *vm) {
     if (object_ctor) {
         ps_function_setup(object_ctor, vm->function_proto, vm->object_proto, vm->object_proto);
         ps_define_function_props(object_ctor, "Object", 1);
+        PSObject *get_proto_fn = ps_function_new_native(ps_native_object_get_prototype_of);
+        if (get_proto_fn) {
+            ps_function_setup(get_proto_fn, vm->function_proto, vm->object_proto, NULL);
+            ps_define_function_props(get_proto_fn, "getPrototypeOf", 1);
+            ps_object_define(object_ctor,
+                             ps_string_from_cstr("getPrototypeOf"),
+                             ps_value_object(get_proto_fn),
+                             PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+        }
+        PSObject *set_proto_fn = ps_function_new_native(ps_native_object_set_prototype_of);
+        if (set_proto_fn) {
+            ps_function_setup(set_proto_fn, vm->function_proto, vm->object_proto, NULL);
+            ps_define_function_props(set_proto_fn, "setPrototypeOf", 2);
+            ps_object_define(object_ctor,
+                             ps_string_from_cstr("setPrototypeOf"),
+                             ps_value_object(set_proto_fn),
+                             PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+        }
+        PSObject *create_fn = ps_function_new_native(ps_native_object_create);
+        if (create_fn) {
+            ps_function_setup(create_fn, vm->function_proto, vm->object_proto, NULL);
+            ps_define_function_props(create_fn, "create", 1);
+            ps_object_define(object_ctor,
+                             ps_string_from_cstr("create"),
+                             ps_value_object(create_fn),
+                             PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+        }
         if (vm->object_proto) {
             ps_object_define(vm->object_proto,
                          ps_string_from_cstr("constructor"),

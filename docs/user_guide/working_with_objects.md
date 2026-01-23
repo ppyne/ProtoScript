@@ -116,6 +116,11 @@ car1.color = "black";
 
 All instances of `Car` share properties defined on `Car.prototype`.
 
+Prototype utilities:
+- `Object.getPrototypeOf(obj)` to inspect the prototype.
+- `Object.create(proto)` to create an object with a specific prototype.
+- `Object.setPrototypeOf(obj, proto)` to update the prototype (use with care).
+
 ---
 
 ## Defining Methods

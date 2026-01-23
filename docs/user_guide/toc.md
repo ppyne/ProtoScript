@@ -108,6 +108,7 @@ This document is the **main table of contents** for the ProtoScript documentatio
   - [String](working_with_objects.md#string)
   - [JSON](working_with_objects.md#json)
   - [Io module](working_with_objects.md#io-module)
+  - [Fs module](working_with_objects.md#fs-module)
   - [Event module](working_with_objects.md#event-module)
   - [Buffer module](working_with_objects.md#buffer-module)
   - [Display module](working_with_objects.md#display-module)

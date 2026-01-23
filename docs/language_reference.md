@@ -231,23 +231,45 @@ File object:
 - `file.close()`
 - `file.path`, `file.mode`, `file.closed`
 
-### 7.2 Gc
+### 7.2 Fs (POSIX-only)
+Object: `Fs`
+- `Fs.chmod(path, mode)`
+- `Fs.cp(source, destination)`
+- `Fs.exists(path)`
+- `Fs.size(path)`
+- `Fs.isDir(path)`
+- `Fs.isFile(path)`
+- `Fs.isSymlink(path)`
+- `Fs.isExecutable(path)`
+- `Fs.isReadable(path)`
+- `Fs.isWritable(path)`
+- `Fs.ls(path, all = false, limit = 0)`
+- `Fs.mkdir(path)`
+- `Fs.mv(source, destination)`
+- `Fs.pathInfo(path)`
+- `Fs.pwd()`
+- `Fs.rmdir(path)`
+- `Fs.rm(path)`
+
+Note: `Fs` is controlled by `PS_ENABLE_MODULE_FS` (1 = enabled, 0 = disabled).
+
+### 7.3 Gc
 Object: `Gc`
 - `Gc.collect()`
 - `Gc.stats()`
 
-### 7.3 Buffer
+### 7.4 Buffer
 Object: `Buffer`
 - `Buffer.alloc(size)`
 - `Buffer.size(buffer)`
 - `Buffer.slice(buffer, offset, length)`
 - `buffer.length` (bytes)
 
-### 7.4 Event
+### 7.5 Event
 Object: `Event`
 - `Event.next()`
 
-### 7.5 Display (optional)
+### 7.6 Display (optional)
 Object: `Display` (requires `PS_ENABLE_SDL=1`)
 - `Display.open(width, height, title, options)`
 - `Display.close()`
@@ -268,5 +290,6 @@ Defined in `include/ps_config.h` (0 = disabled, 1 = enabled):
 - `PS_ENABLE_WITH`
 - `PS_ENABLE_EVAL`
 - `PS_ENABLE_ARGUMENTS_ALIASING`
+- `PS_ENABLE_MODULE_FS`
 - `PS_ENABLE_SDL`
 - `PS_EVENT_QUEUE_CAPACITY`

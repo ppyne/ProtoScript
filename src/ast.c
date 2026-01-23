@@ -468,7 +468,9 @@ void ps_ast_free(PSAstNode *node) {
 
         case AST_ARRAY_LITERAL:
             for (size_t i = 0; i < node->as.array_literal.count; i++) {
-                ps_ast_free(node->as.array_literal.items[i]);
+                if (node->as.array_literal.items[i]) {
+                    ps_ast_free(node->as.array_literal.items[i]);
+                }
             }
             free(node->as.array_literal.items);
             break;

@@ -164,6 +164,18 @@ Extra commas create empty elements:
 fish = ["Lion", , "Angel"]; // fish[1] is undefined
 ```
 
+Trailing commas are allowed and do not add an extra element:
+
+```js
+fish = ["Lion", "Angel",]; // length is 2
+```
+
+Multiple commas create holes with no properties:
+
+```js
+holes = [, ,]; // length is 2, no elements
+```
+
 ---
 
 ### Boolean Literals

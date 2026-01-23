@@ -236,7 +236,9 @@ static void ps_gc_mark_ast_node(PSVM *vm, PSAstNode *node) {
             break;
         case AST_ARRAY_LITERAL:
             for (size_t i = 0; i < node->as.array_literal.count; i++) {
-                ps_gc_mark_ast_node(vm, node->as.array_literal.items[i]);
+                if (node->as.array_literal.items[i]) {
+                    ps_gc_mark_ast_node(vm, node->as.array_literal.items[i]);
+                }
             }
             break;
         case AST_OBJECT_LITERAL:

@@ -84,3 +84,10 @@ This is an ES6 extension beyond ES1 and does not use the ES6 iterator protocol.
 ProtoScript supports the `instanceof` operator (added in ES3). The right-hand
 side must be a function with a valid `prototype`, otherwise a `TypeError` is
 raised.
+
+## 13. Array literal elisions (ES1 behavior)
+
+Array literal elisions (extra commas) and trailing commas are supported as in
+ES1. Examples:
+- `["Lion", , "Angel"]` creates a hole at index 1.
+- `["Lion", "Angel",]` has length 2 and no extra element.

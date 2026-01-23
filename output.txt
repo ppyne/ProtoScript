@@ -1,0 +1,235 @@
++- home@
++- usr/
+|  +- bin/
+|  |  +- ptargrep5.30
+|  |  +- uux
+|  |  +- cpan
+|  |  +- loads.d
+|  |  +- htmltree5.30
+|  |  +- write
+|  |  +- lwp-mirror5.30
+|  |  +- indent
+|  |  +- bzip2recover
+|  |  +- hdiutil
+|  |  +- top
+|  |  +- gktool
+|  |  +- javah
+|  |  +- tee
+|  |  +- tidy_changelog
+|  |  +- xip
+|  |  +- yapp
+|  |  +- wsimport
+|  |  +- bzfgrep
+|  |  +- qlmanage@
+|  |  +- snmptranslate
+|  |  +- split
+|  |  +- chsh
+|  |  +- xml2man
+|  |  +- pl2pm5.30
+|  |  +- man
+|  |  +- lpoptions
+|  |  +- tabs
+|  |  +- rview@
+|  |  +- lsvfs
+|  |  +- zgrep
+|  |  +- dbiprof
+|  |  +- zmore
+|  |  +- pod2usage5.30
+|  |  +- gcov
+|  |  +- parldyn5.34
+|  |  +- package-stash-conflicts5.30
+|  |  +- dbiprof5.30
+|  |  +- vim
+|  |  +- mandoc_soelim
+|  |  +- xjc
+|  |  +- bzmore
+|  |  +- dyld_info
+|  |  +- package-stash-conflicts
+|  |  +- cancel
+|  |  +- apply
+|  |  +- bzgrep
+|  |  +- umask
+|  |  +- g++
+|  |  +- libtool
+|  |  +- findrule5.30
+|  |  +- ptar5.30
+|  |  +- unalias
+|  |  +- h2xs5.30
+|  |  +- scandeps5.34.pl
+|  |  +- mp2bug
+|  |  +- viewdiagnostic
+|  |  +- mkfifo
+|  |  +- toe
+|  |  +- hexdump
+|  |  +- Rez
+|  |  +- cap_mkdb
+|  |  +- ictool
+|  |  +- cmp
+|  |  +- syscallbypid.d
+|  |  +- snmpset
+|  |  +- locate
+|  |  +- trustcachectl
+|  |  +- afconvert
+|  |  +- afclip
+|  |  +- tidy_changelog5.30
+|  |  +- bzegrep
+|  |  +- instmodsh
+|  |  +- extcheck
+|  |  +- javapackager
+|  |  +- pl
+|  |  +- compress
+|  |  +- fddist
+|  |  +- db_upgrade
+|  |  +- diagnose-fu
+|  |  +- yamlpp-load-dump
+|  |  +- ctags
+|  |  +- zdiff
+|  |  +- yamlpp-parse-emit
+|  |  +- pathchk
+|  |  +- mesg
+|  |  +- setregion
+|  |  +- perlivp
+|  |  +- yamlpp-highlight5.30
+|  |  +- xpath5.30
+|  |  +- c++
+|  |  +- pod2readme
+|  |  +- pp
+|  |  +- vi@
+|  |  +- iofileb.d
+|  |  +- errinfo
+|  |  +- zipgrep
+|  |  +- pod2usage
+|  |  +- alias
+|  |  +- wait
+|  |  +- safaridriver@
+|  |  +- bzdiff
+|  |  +- unpack200
+|  |  +- corelist
+|  |  +- expand
+|  |  +- strings
+|  |  +- lwp-dump5.34
+|  |  +- appletviewer
+|  |  +- idlj
+|  |  +- dbiproxy5.34
+|  |  +- wall
+|  |  +- brctl
+|  |  +- yapp5.34
+|  |  +- gm4
+|  |  +- db_hotbackup
+|  |  +- auvaltool
+|  |  +- applesingle
+|  |  +- scandeps5.30.pl
+|  |  +- clang
+|  |  +- ibtool
+|  |  +- tty
+|  |  +- demandoc
+|  |  +- git-receive-pack
+|  |  +- infotocap@
+|  |  +- pkill
+|  |  +- cups-config
+|  |  +- piconv5.34
+|  |  +- basename
+|  |  +- nclist@
+|  |  +- objdump
+|  |  +- install
+|  |  +- native2ascii
+|  |  +- c99
+|  |  +- desdp
+|  |  +- binhex
+|  |  +- perlbug5.34
+|  |  +- lsmp
+|  |  +- xmllint
+|  |  +- yamlpp-highlight
+|  |  +- ipcount5.34
+|  |  +- last
+|  |  +- vm_stat
+|  |  +- syslog
+|  |  +- net-snmp-cert
+|  |  +- treereg5.30
+|  |  +- nslookup
+|  |  +- vimdiff@
+|  |  +- topsyscall
+|  |  +- libnetcfg
+|  |  +- cpan5.30
+|  |  +- c++filt
+|  |  +- avbdiagnose
+|  |  +- nice
+|  |  +- xcscontrol
+|  |  +- truncate
+|  |  +- calendar
+|  |  +- locale
+|  |  +- strip
+|  |  +- symbolscache
+|  |  +- trace
+|  |  +- tops
+|  |  +- lprm
+|  |  +- tiffutil
+|  |  +- du
+|  |  +- debinhex5.34.pl
+|  |  +- diff3
+|  |  +- cupstestppd
+|  |  +- json_pp5.30
+|  |  +- sw_vers
+|  |  +- fs_usage
+|  |  +- host
+|  |  +- jarsigner
+|  |  +- app-sso
+|  |  +- devmodectl
+|  |  +- nscurl
+|  |  +- logger
+|  |  +- caffeinate
+|  |  +- pod2html5.30
+|  |  +- say
+|  |  +- net-snmp-create-v3-user
+|  |  +- zipdetails5.34
+|  |  +- config_data5.34
+|  |  +- plutil
+|  |  +- python3
+|  |  +- avbutil
+|  |  +- xcode-select
+|  |  +- libnetcfg5.30
+|  |  +- powermetrics
+|  |  +- encguess5.34
+|  |  +- moose-outdated
+|  |  net-server
+|  |  cvmkdir
+|  |  ldapmodify
+|  |  iofile.d
+|  |  join
+|  |  SafeEjectGPU
+|  |  snmpdelta
+|  |  ssh-keyscan
+|  |  renice
+|  |  xxd
+|  |  clangd
+|  |  scandeps.pl
+|  |  nettop
+|  |  ppdmerge
+|  |  snmpconf
+|  |  xsltproc
+|  |  osascript
+|  |  iotop
+|  |  lex
+|  |  encguess
+|  |  eyapp5.34
+|  |  ctf_insert
+|  |  csplit
+|  |  swift-inspect
+|  |  splain5.30
+|  |  iconv
+|  |  captoinfo
+|  |  snmpinform
+|  |  lsbom
+|  |  pbcopy
+|  |  sort
+|  |  xpath
+|  |  snmpdf
+|  |  whoami
+|  |  sc_usage
+|  |  jot
+|  |  ocspcheck
+|  |  mkbom
+|  |  ldapurl
+|  |  json_xs
+|  |  pkgbuild
+|  |  yamlpp-eve

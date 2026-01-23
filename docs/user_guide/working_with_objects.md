@@ -311,6 +311,177 @@ File objects:
 
 ---
 
+## Fs module
+
+ProtoScript exposes a synchronous filesystem module `Fs`. It is **POSIX-only**
+(Linux, BSD, macOS). The module is controlled by the compile-time flag
+`PS_ENABLE_MODULE_FS` (1 = enabled, 0 = disabled). When disabled, `Fs` is not
+defined.
+
+All `Fs` functions are explicit and return values instead of throwing:
+- boolean operations return `true`/`false`
+- `Fs.size` returns `undefined` on failure
+- `Fs.ls` returns an empty array on failure
+
+Operations:
+- `Fs.chmod(path, mode)`
+- `Fs.cp(source, destination)`
+- `Fs.exists(path)`
+- `Fs.size(path)`
+- `Fs.isDir(path)`
+- `Fs.isFile(path)`
+- `Fs.isSymlink(path)`
+- `Fs.isExecutable(path)`
+- `Fs.isReadable(path)`
+- `Fs.isWritable(path)`
+- `Fs.ls(path, all = false, limit = 0)`
+- `Fs.mkdir(path)`
+- `Fs.mv(source, destination)`
+- `Fs.pathInfo(path)`
+- `Fs.pwd()`
+- `Fs.rmdir(path)`
+- `Fs.rm(path)`
+
+Examples (from the Fs specification):
+
+```js
+Fs.chmod("my_file.txt", 0644);
+```
+
+```js
+Fs.cp("a.txt", "b.txt");
+```
+
+```js
+Fs.exists("existing.txt");
+```
+
+```js
+Fs.size("somefile.txt");
+```
+
+```js
+Fs.isDir("..");
+```
+
+```js
+Fs.isFile("README.md");
+```
+
+```js
+Fs.isSymlink("link.txt");
+```
+
+```js
+var path = "./";
+var files = Fs.ls(path);
+for (file of files) {
+    if (Fs.isDir(path + file)) Io.print("directory: " + file + Io.EOL);
+    else Io.print("file: " + file + Io.EOL);
+}
+```
+
+```js
+function walkTree(path, prefix = "") {
+    if (path.lastIndexOf('/') !== path.length - 1) path += "/";
+    var files = Fs.ls(path, true, 200);
+    for (file of files) {
+        if (file == "." || file == "..") continue;
+        if (Fs.isSymlink(path + file)) {
+            Io.print(prefix + "+- " + file + "@" + Io.EOL);
+            continue;
+        }
+        var full = path + file;
+        if (Fs.isDir(full)) {
+            Io.print(prefix + "+- " + file + "/" + Io.EOL);
+            walkTree(full, prefix + "|  ");
+        } else {
+            Io.print(prefix + "+- " + file + Io.EOL);
+        }
+    }
+}
+walkTree("./");
+```
+
+```js
+Fs.mkdir("tmp");
+```
+
+```js
+Fs.mv("a.txt", "b.txt");
+```
+
+```js
+var infos = Fs.pathInfo("/a/b.txt");
+for (info in infos) Io.print(info + ': ' + infos[info] + Io.EOL);
+```
+
+```js
+Fs.pwd();
+```
+
+```js
+var path = "example";
+if (Fs.isDir(path) && Fs.ls(path).length == 0) {
+    Fs.rmdir(path);
+}
+```
+
+```js
+if (Fs.exists(filename)) Fs.rm(filename);
+```
+
+Additional practical examples:
+
+Directory traversal:
+
+```js
+function listDirs(path) {
+    var out = [];
+    var files = Fs.ls(path, true, 200);
+    for (file of files) {
+        var full = path + "/" + file;
+        if (Fs.isDir(full)) out[out.length] = full;
+    }
+    return out;
+}
+```
+
+Permission handling:
+
+```js
+var target = "script.sh";
+if (Fs.exists(target)) {
+    Fs.chmod(target, 0755);
+    if (Fs.isExecutable(target)) Io.print("ready" + Io.EOL);
+}
+```
+
+Error-safe filesystem manipulation:
+
+```js
+var src = "input.txt";
+var dst = "output.txt";
+if (Fs.isFile(src)) {
+    if (!Fs.cp(src, dst)) Io.print("copy failed" + Io.EOL);
+}
+```
+
+Typical scripting use case:
+
+```js
+var tmp = "tmp";
+if (!Fs.exists(tmp)) Fs.mkdir(tmp);
+var files = Fs.ls(".");
+for (file of files) {
+    if (Fs.isFile(file) && file.lastIndexOf(".log") > 0) {
+        Fs.mv(file, tmp + "/" + file);
+    }
+}
+```
+
+---
+
 ## Event module
 
 ProtoScript exposes a host `Event` module for pull-based event access.

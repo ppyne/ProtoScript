@@ -206,3 +206,36 @@ run_case 148-assign-util 0
 run_case 149-clone-util 0
 run_case 150-io-eof 0
 run_case 151-io-bom 0
+run_case 152-array-elision 0
+
+fs_enabled=$(awk '/^#define PS_ENABLE_MODULE_FS/ {print $3}' include/ps_config.h)
+if [ "${fs_enabled:-0}" -eq 1 ]; then
+    fs_root=""
+    cleanup_fs() {
+        rm -f tests/cases/fs_root.txt
+        if [ -n "${fs_root:-}" ]; then
+            rm -rf "$fs_root"
+        fi
+    }
+    trap cleanup_fs EXIT
+
+    fs_root=$(mktemp -d /tmp/protoscript-fs-XXXXXX)
+    printf '%s' "$fs_root" > tests/cases/fs_root.txt
+
+    printf '%s' "abc" > "$fs_root/file.txt"
+    printf '%s\n' "echo ok" > "$fs_root/exec.sh"
+    chmod 0755 "$fs_root/exec.sh"
+    mkdir "$fs_root/empty_dir"
+    mkdir "$fs_root/non_empty_dir"
+    printf '%s' "nested" > "$fs_root/non_empty_dir/nested.txt"
+    printf '%s' "nope" > "$fs_root/unreadable.txt"
+    chmod 0000 "$fs_root/unreadable.txt"
+    ln -s "file.txt" "$fs_root/symlink_file"
+    ln -s "empty_dir" "$fs_root/symlink_dir"
+    ln -s "missing.txt" "$fs_root/broken_symlink"
+
+    run_case 160-fs-basic 0
+    run_case 161-fs-edge 0
+else
+    run_case 159-fs-disabled 1
+fi

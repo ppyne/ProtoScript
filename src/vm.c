@@ -24,6 +24,9 @@ void ps_io_init(PSVM *vm);
 void ps_buffer_init(PSVM *vm);
 void ps_event_init(PSVM *vm);
 void ps_display_init(PSVM *vm);
+#if PS_ENABLE_MODULE_FS
+void ps_fs_init(PSVM *vm);
+#endif
 static PSValue ps_native_date_to_string(PSVM *vm, PSValue this_val, int argc, PSValue *argv);
 static PSValue ps_date_parse_iso(PSVM *vm, PSString *s);
 static PSString *ps_date_format_utc(double ms_num);
@@ -5041,6 +5044,9 @@ PSVM *ps_vm_new(void) {
     ps_vm_init_display(vm);
 #endif
     ps_vm_init_io(vm);
+#if PS_ENABLE_MODULE_FS
+    ps_vm_init_fs(vm);
+#endif
 
     return vm;
 }
@@ -6239,6 +6245,13 @@ void ps_vm_init_io(PSVM *vm) {
     /* Delegate to io.c */
     ps_io_init(vm);
 }
+
+#if PS_ENABLE_MODULE_FS
+void ps_vm_init_fs(PSVM *vm) {
+    /* Delegate to fs.c */
+    ps_fs_init(vm);
+}
+#endif
 
 void ps_vm_init_buffer(PSVM *vm) {
     /* Delegate to buffer.c */

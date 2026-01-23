@@ -8,6 +8,9 @@
 #ifndef PS_ENABLE_SDL
 #define PS_ENABLE_SDL 1
 #endif
+#ifndef PS_ENABLE_MODULE_FS
+#define PS_ENABLE_MODULE_FS 1
+#endif
 #ifndef PS_EVENT_QUEUE_CAPACITY
 #define PS_EVENT_QUEUE_CAPACITY 64
 #endif

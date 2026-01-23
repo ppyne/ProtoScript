@@ -1,6 +1,7 @@
 #ifndef PS_VM_H
 #define PS_VM_H
 
+#include "ps_config.h"
 #include "ps_object.h"
 #include "ps_value.h"
 #include "ps_env.h"
@@ -67,6 +68,9 @@ void ps_vm_init_buffer(PSVM *vm);
 void ps_vm_init_event(PSVM *vm);
 void ps_vm_init_display(PSVM *vm);
 void ps_vm_init_io(PSVM *vm);
+#if PS_ENABLE_MODULE_FS
+void ps_vm_init_fs(PSVM *vm);
+#endif
 
 /* Primitive wrappers */
 PSObject *ps_vm_wrap_primitive(PSVM *vm, const PSValue *v);

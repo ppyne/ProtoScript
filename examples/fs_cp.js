@@ -1,0 +1,11 @@
+var root = Io.tempPath();
+Fs.mkdir(root);
+var a = root + "/a.txt";
+var b = root + "/b.txt";
+var f = Io.open(a, "w");
+f.write("abc");
+f.close();
+Fs.cp(a, b);
+Fs.rm(a);
+Fs.rm(b);
+Fs.rmdir(root);

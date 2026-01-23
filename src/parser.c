@@ -1393,6 +1393,17 @@ static PSAstNode *parse_array_literal(PSParser *p, PSToken start_tok) {
     }
 
     while (1) {
+        if (match(p, TOK_COMMA)) {
+            items = realloc(items, sizeof(PSAstNode *) * (count + 1));
+            items[count++] = NULL;
+            if (match(p, TOK_RBRACKET)) {
+                break;
+            }
+            continue;
+        }
+        if (match(p, TOK_RBRACKET)) {
+            break;
+        }
         items = realloc(items, sizeof(PSAstNode *) * (count + 1));
         items[count++] = parse_assignment(p);
 

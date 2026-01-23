@@ -1,0 +1,10 @@
+var root = Io.tempPath();
+Fs.mkdir(root);
+var a = root + "/a.txt";
+var b = root + "/b.txt";
+var f = Io.open(a, "w");
+f.write("move");
+f.close();
+Fs.mv(a, b);
+Fs.rm(b);
+Fs.rmdir(root);

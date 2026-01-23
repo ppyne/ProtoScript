@@ -1,4 +1,4 @@
-var f = Io.open("ProtoScript", "rb");
+var f = Io.open("sample.jpg", "rb");
 //var f = Io.open("rgba.png", "rb");
 var buf = f.read();
 f.close();

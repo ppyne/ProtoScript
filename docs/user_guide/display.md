@@ -7,6 +7,8 @@ This chapter documents the Display module and how to enable it at build time.
 Display provides a single native window with a software framebuffer. It is
 low-level, explicit, and does not include widgets, layouts, or event callbacks.
 
+![ProtoScript Display](../illust03.png)
+
 ---
 
 ## Availability and Build Options

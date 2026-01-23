@@ -32,98 +32,94 @@ You can test ProtoScript immediately thanks to a demo running on the web via Web
 - ECMA-262 Edition 1 (June 1997): [`docs/ECMA-262_1st_edition_june_1997.pdf`](docs/ECMA-262_1st_edition_june_1997.pdf)
 - License (BSD-3-Clause): [`LICENSE`](LICENSE)
 
-## Build
+## Build (Simple, Complete)
 
-Display module is optional (native window + software framebuffer for drawing pixels) and controlled by the `PS_ENABLE_MODULE_DISPLAY` build flag.
+### Prerequisites
+- C compiler toolchain (gcc, clang, etc.)
+- libjpeg (for Image module)
+- libpng (for Image module)
+- SDL2 (for Display module)
+- git
+- awk
+- cmake
+- make
 
-Image module is optional (PNG/JPEG decode + resampling) and controlled by `PS_ENABLE_MODULE_IMG` in `include/ps_config.h`.
-
-### Disable Display
-
-If you do not want Display, build with:
-
+### Install third_party submodules
 ```sh
-make PS_ENABLE_MODULE_DISPLAY=0
+git submodule update --init --recursive third_party/SDL third_party/libpng third_party/libjpeg
 ```
 
-In this mode the `Display` global is not defined (accessing it will raise a
-`ReferenceError`), and `Event` will only return non-display events.
-
-### Enable Display
-
-To enable Display you need SDL2 (either system-wide or via `third_party/SDL`).
-
-#### Option A: System SDL2
-
-Install SDL2 so that `sdl2-config` is available in your `PATH`. On macOS,
-this can be done via Homebrew or MacPorts.
-
-Then build normally:
-
+### Build third_party (SDL2, libpng, libjpeg)
 ```sh
-make
-```
-
-#### Option B: Vendored SDL2 (third_party)
-
-The repo includes SDL2 as a git submodule in `third_party/SDL`.
-Build it with CMake:
-
-```sh
-git submodule update --init --recursive third_party/SDL
 mkdir -p third_party/SDL/build
-cd third_party/SDL/build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build .
-```
+cmake -S third_party/SDL -B third_party/SDL/build -DCMAKE_BUILD_TYPE=Release
+cmake --build third_party/SDL/build
 
-Prerequisites for the vendored build:
-- SDL2
-- `cmake`
-- a C compiler toolchain (Xcode Command Line Tools on macOS)
-
----
-
-If you do not use Display, no external dependencies are required.
-
-```sh
-make
-```
-
-If you enable Image, make sure libpng and libjpeg are available (vendored as
-submodules under `third_party/` or provided system-wide).
-
-### Enable Image
-
-To use vendored libraries:
-
-```sh
-git submodule update --init --recursive third_party/libpng third_party/libjpeg
 mkdir -p third_party/libpng/build
 cmake -S third_party/libpng -B third_party/libpng/build -DPNG_SHARED=OFF -DPNG_TESTS=OFF
 cmake --build third_party/libpng/build
+
 mkdir -p third_party/libjpeg/build
 cmake -S third_party/libjpeg -B third_party/libjpeg/build -DENABLE_SHARED=OFF
 cmake --build third_party/libjpeg/build
 ```
 
-Then set `PS_ENABLE_MODULE_IMG` to `1` and run `make`.
+### Build ProtoScript
 
-## Tests
+```sh
+make
+```
+
+### Test ProtoScript
 
 ```sh
 make test
 ```
 
-## Examples
+Note: test `155-display-blit-limit` opens an SDL window. In headless environments or CI,
+`make test` may fail if `PS_ENABLE_MODULE_DISPLAY=1`. To run this test, you need a
+working SDL2 setup with an available display server (macOS with a logged-in GUI,
+Linux X11/Wayland, or Windows desktop).
 
-Run an example:
+### Clean
+
+Remove everything that was built.
 
 ```sh
-./protoscript examples/hello.js
+make clean
 ```
 
-Usage (file or stdin):
+### WebAssembly (WASM)
+
+Note that ProtoScript may already be built in the `web` directory (you don't need to do the following).
+
+If you really need to rebuild ProtoScript for WebAssembly, you must have Emscripten installed. Then you can do this:
+
+```sh
+make web-clean # clean the previous build
+make web
+```
+
+### Configure features
+
+You may want to personalize your build of ProtoScript with these options in the file `include/ps_config.h`:
+
+- `PS_ENABLE_WITH` (0/1): enable `with`
+- `PS_ENABLE_EVAL` (0/1): enable `eval`
+- `PS_ENABLE_ARGUMENTS_ALIASING` (0/1): enable arguments aliasing
+- `PS_ENABLE_MODULE_FS` (0/1): enable Fs module
+- `PS_ENABLE_MODULE_IMG` (0/1): enable Image module (PNG/JPEG decode + resample)
+- `PS_ENABLE_MODULE_DISPLAY` (0/1): enable Display module (SDL2)
+- `PS_EVENT_QUEUE_CAPACITY` (int): Event queue size
+- `PS_IMG_MAX_IMAGES` (int): max live images
+- `PS_IMG_MAX_WIDTH` (int): max image width
+- `PS_IMG_MAX_HEIGHT` (int): max image height
+
+All feature switches are compile-time flags.
+
+### Run ProtoScript
+
+You can run ProtoScript in various ways:
 
 ```sh
 ./protoscript script.js
@@ -133,9 +129,15 @@ echo 'Io.print("Hello world\n");'| ./protoscript
 ./protoscript - < script.js
 ```
 
-Other examples:
+### Examples
 
-- `examples/basics.js`
-- `examples/arrays.js`
-- `examples/strings.js`
-- `examples/objects.js`
+Examples show core language usage and host modules:
+
+- `examples/hello.js`: minimal run
+- `examples/basics.js`: variables, loops, functions
+- `examples/arrays.js`: arrays
+- `examples/strings.js`: strings
+- `examples/objects.js`: objects
+- `examples/image_display.js`: PNG decode + Display blit
+
+and more in the `examples/` directory.

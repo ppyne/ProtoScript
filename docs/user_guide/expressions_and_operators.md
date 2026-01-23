@@ -91,6 +91,7 @@ Comparison operators compare operands and return a Boolean value.
 | `>=` | Greater than or equal |
 | `<` | Less than |
 | `<=` | Less than or equal |
+| `in` | Property existence in an object |
 
 Strings are compared lexicographically using Unicode code points.
 

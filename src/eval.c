@@ -1927,6 +1927,17 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                     }
                     return ps_value_boolean(0);
                 }
+                case TOK_IN: {
+                    if (right.type != PS_T_OBJECT || !right.as.object) {
+                        ctl->did_throw = 1;
+                        ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Right-hand side of in is not an object");
+                        return ctl->throw_value;
+                    }
+                    PSString *key = ps_to_string(vm, left);
+                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                    if (!key) return ps_value_boolean(0);
+                    return ps_value_boolean(ps_object_has(right.as.object, key));
+                }
                 case TOK_EQ:
                 {
                     int eq = ps_abstract_equals(vm, &left, &right, ctl);

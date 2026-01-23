@@ -212,6 +212,7 @@ run_case 154-binary-literals 0
 run_case 156-protoscript-info 0
 run_case 157-protoscript-exit 1
 run_case 158-protoscript-sleep 0
+run_case 163-in-operator 0
 
 display_enabled=$(awk '/^#define PS_ENABLE_MODULE_DISPLAY/ {print $3}' include/ps_config.h)
 if [ "${display_enabled:-0}" -eq 1 ]; then

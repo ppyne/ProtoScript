@@ -137,6 +137,7 @@ This index lists core **ProtoScript language concepts**, operators, statements, 
 
 - `if...else` statement (see [Statements](statements.md#conditional-statements))
 - inheritance (see [Object Model and Prototypes](object_model_and_prototypes.md#creating-an-object-hierarchy))
+- `in` operator (see [Expressions and Operators](expressions_and_operators.md#comparison-operators))
 - initialization (see [Values, Variables, and Literals](values_variables_and_literals.md#declaring-variables))
 - `isFinite` function (see [Functions](functions.md#predefined-functions))
 - `isNaN` function (see [Functions](functions.md#predefined-functions))

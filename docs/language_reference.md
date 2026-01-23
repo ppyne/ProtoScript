@@ -39,7 +39,7 @@ instanceof void delete include
 
 ### 3.2 Binary
 `+ - * / %`
-`< <= > >= instanceof`
+`< <= > >= instanceof in`
 `== != === !==`
 `& | ^ << >> >>>`
 `&& ||`

@@ -34,7 +34,55 @@ You can test ProtoScript immediately thanks to a demo running on the web via Web
 
 ## Build
 
-No external dependencies are required.
+Display module is optional (native window + software framebuffer for drawing pixels) and controlled by the `PS_ENABLE_SDL` build flag.
+
+### Disable Display
+
+If you do not want Display, build with:
+
+```sh
+make PS_ENABLE_SDL=0
+```
+
+In this mode the `Display` global is not defined (accessing it will raise a
+`ReferenceError`), and `Event` will only return non-display events.
+
+### Enable Display
+
+To enable Display you need SDL2 (either system-wide or via `third_party/SDL`).
+
+#### Option A: System SDL2
+
+Install SDL2 so that `sdl2-config` is available in your `PATH`. On macOS,
+this can be done via Homebrew or MacPorts.
+
+Then build normally:
+
+```sh
+make
+```
+
+#### Option B: Vendored SDL2 (third_party)
+
+The repo includes SDL2 as a git submodule in `third_party/SDL`.
+Build it with CMake:
+
+```sh
+git submodule update --init --recursive third_party/SDL
+mkdir -p third_party/SDL/build
+cd third_party/SDL/build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build .
+```
+
+Prerequisites for the vendored build:
+- SDL2
+- `cmake`
+- a C compiler toolchain (Xcode Command Line Tools on macOS)
+
+---
+
+If you do not use Display, no external dependencies are required.
 
 ```sh
 make

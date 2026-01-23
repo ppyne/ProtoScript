@@ -107,6 +107,9 @@ This document is the **main table of contents** for the ProtoScript documentatio
   - [String](working_with_objects.md#string)
   - [JSON](working_with_objects.md#json)
   - [Io module](working_with_objects.md#io-module)
+  - [Event module](working_with_objects.md#event-module)
+  - [Buffer module](working_with_objects.md#buffer-module)
+  - [Display module](working_with_objects.md#display-module)
   - [Gc module](working_with_objects.md#gc-module)
 
 ### [Chapter 8 — Object Model and Prototypes](object_model_and_prototypes.md)
@@ -116,6 +119,17 @@ This document is the **main table of contents** for the ProtoScript documentatio
 - [Adding and removing properties](object_model_and_prototypes.md#adding-properties-at-run-time)
 - [Summary of differences](object_model_and_prototypes.md#object-properties-and-the-prototype-chain)
 - [Object hierarchy example](object_model_and_prototypes.md#creating-an-object-hierarchy)
+
+---
+
+## Graphics and Events
+
+### [Chapter 9 — Display Module (v1.3)](display.md)
+- [Availability and Build Options](display.md#availability-and-build-options)
+- [API Reference (v1.3)](display.md#api-reference-v13)
+- [Resize and Scaling Semantics](display.md#resize-and-scaling-semantics)
+- [Events](display.md#events)
+- [Example](display.md#example)
 
 ---
 

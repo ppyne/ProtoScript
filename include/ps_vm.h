@@ -7,6 +7,7 @@
 #include "ps_gc.h"
 
 struct PSAstNode;
+struct PSDisplay;
 
 /*
  * ProtoScript Virtual Machine
@@ -35,6 +36,14 @@ typedef struct PSVM {
     PSObject *syntax_error_proto;
     PSObject *eval_error_proto;
 
+    PSValue *event_queue;
+    size_t event_capacity;
+    size_t event_head;
+    size_t event_tail;
+    size_t event_count;
+
+    struct PSDisplay *display;
+
     int has_pending_throw;
     PSValue pending_throw;
     PSObject *current_callee;
@@ -54,6 +63,9 @@ PSObject *ps_vm_global(PSVM *vm);
 
 /* Initialization helpers */
 void ps_vm_init_builtins(PSVM *vm);
+void ps_vm_init_buffer(PSVM *vm);
+void ps_vm_init_event(PSVM *vm);
+void ps_vm_init_display(PSVM *vm);
 void ps_vm_init_io(PSVM *vm);
 
 /* Primitive wrappers */

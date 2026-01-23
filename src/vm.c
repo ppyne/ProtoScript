@@ -8,6 +8,8 @@
 #include "ps_parser.h"
 #include "ps_ast.h"
 #include "ps_regexp.h"
+#include "ps_config.h"
+#include "ps_display.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -19,6 +21,9 @@
 
 /* Forward declaration (implemented in io.c) */
 void ps_io_init(PSVM *vm);
+void ps_buffer_init(PSVM *vm);
+void ps_event_init(PSVM *vm);
+void ps_display_init(PSVM *vm);
 static PSValue ps_native_date_to_string(PSVM *vm, PSValue this_val, int argc, PSValue *argv);
 static PSValue ps_date_parse_iso(PSVM *vm, PSString *s);
 static PSString *ps_date_format_utc(double ms_num);
@@ -4894,9 +4899,35 @@ PSVM *ps_vm_new(void) {
     ps_gc_init(vm);
     ps_gc_set_active_vm(vm);
 
+    vm->event_capacity = 64;
+    vm->event_queue = (PSValue *)calloc(vm->event_capacity, sizeof(PSValue));
+    if (!vm->event_queue) {
+        ps_gc_destroy(vm);
+        if (ps_gc_active_vm() == vm) {
+            ps_gc_set_active_vm(NULL);
+        }
+        free(vm);
+        return NULL;
+    }
+#if PS_ENABLE_SDL
+    vm->display = (struct PSDisplay *)calloc(1, sizeof(struct PSDisplay));
+    if (!vm->display) {
+        free(vm->event_queue);
+        ps_gc_destroy(vm);
+        if (ps_gc_active_vm() == vm) {
+            ps_gc_set_active_vm(NULL);
+        }
+        free(vm);
+        return NULL;
+    }
+#else
+    vm->display = NULL;
+#endif
+
     /* Create Global Object (no prototype for now) */
     vm->global = ps_object_new(NULL);
     if (!vm->global) {
+        free(vm->event_queue);
         ps_gc_destroy(vm);
         free(vm);
         return NULL;
@@ -4905,6 +4936,7 @@ PSVM *ps_vm_new(void) {
     vm->env = ps_env_new(NULL, vm->global, 0);
     if (!vm->env) {
         ps_object_free(vm->global);
+        free(vm->event_queue);
         ps_gc_destroy(vm);
         if (ps_gc_active_vm() == vm) {
             ps_gc_set_active_vm(NULL);
@@ -4923,6 +4955,11 @@ PSVM *ps_vm_new(void) {
 
     /* Initialize built-ins and host extensions */
     ps_vm_init_builtins(vm);
+    ps_vm_init_buffer(vm);
+    ps_vm_init_event(vm);
+#if PS_ENABLE_SDL
+    ps_vm_init_display(vm);
+#endif
     ps_vm_init_io(vm);
 
     return vm;
@@ -4935,6 +4972,10 @@ void ps_vm_free(PSVM *vm) {
     if (ps_gc_active_vm() == vm) {
         ps_gc_set_active_vm(NULL);
     }
+#if PS_ENABLE_SDL
+    ps_display_shutdown(vm);
+#endif
+    free(vm->event_queue);
     free(vm);
 }
 
@@ -6090,4 +6131,19 @@ void ps_vm_init_builtins(PSVM *vm) {
 void ps_vm_init_io(PSVM *vm) {
     /* Delegate to io.c */
     ps_io_init(vm);
+}
+
+void ps_vm_init_buffer(PSVM *vm) {
+    /* Delegate to buffer.c */
+    ps_buffer_init(vm);
+}
+
+void ps_vm_init_event(PSVM *vm) {
+    /* Delegate to event.c */
+    ps_event_init(vm);
+}
+
+void ps_vm_init_display(PSVM *vm) {
+    /* Delegate to display.c */
+    ps_display_init(vm);
 }

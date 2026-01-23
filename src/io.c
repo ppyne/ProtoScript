@@ -4,6 +4,7 @@
 #include "ps_string.h"
 #include "ps_function.h"
 #include "ps_eval.h"
+#include "ps_buffer.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -204,6 +205,11 @@ static PSValue ps_native_read(PSVM *vm, PSValue this_val, int argc, PSValue *arg
             break;
         }
     }
+    if (len > 0 && buf && memchr(buf, '\0', len)) {
+        free(buf);
+        io_throw(vm, "Error", "Binary data not allowed");
+        return ps_value_undefined();
+    }
     PSValue out = io_return_string(vm, buf ? buf : "", len);
     free(buf);
     return out;
@@ -300,6 +306,11 @@ static PSValue ps_native_write(PSVM *vm, PSValue this_val, int argc, PSValue *ar
         io_throw(vm, "Error", "File not open for writing");
         return ps_value_undefined();
     }
+    if (argv[1].type == PS_T_OBJECT && argv[1].as.object &&
+        argv[1].as.object->kind == PS_OBJ_KIND_BUFFER) {
+        ps_vm_throw_type_error(vm, "Io.write expects (file, data)");
+        return ps_value_undefined();
+    }
     PSString *s = ps_to_string(vm, argv[1]);
     if (vm && vm->has_pending_throw) return ps_value_undefined();
     if (s && s->byte_len > 0) {
@@ -309,6 +320,101 @@ static PSValue ps_native_write(PSVM *vm, PSValue this_val, int argc, PSValue *ar
             return ps_value_undefined();
         }
     }
+    return ps_value_undefined();
+}
+
+static PSValue ps_native_read_binary(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    if (argc < 1) {
+        ps_vm_throw_type_error(vm, "Io.readBinary expects (path)");
+        return ps_value_undefined();
+    }
+    PSString *path_s = ps_to_string(vm, argv[0]);
+    if (vm && vm->has_pending_throw) return ps_value_undefined();
+    char *path = io_string_cstr(vm, path_s);
+    if (vm && vm->has_pending_throw) {
+        free(path);
+        return ps_value_undefined();
+    }
+    FILE *fp = fopen(path, "rb");
+    free(path);
+    if (!fp) {
+        io_throw(vm, "Error", "Unable to open file");
+        return ps_value_undefined();
+    }
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        io_throw(vm, "Error", "Read error");
+        return ps_value_undefined();
+    }
+    long size = ftell(fp);
+    if (size < 0) {
+        fclose(fp);
+        io_throw(vm, "Error", "Read error");
+        return ps_value_undefined();
+    }
+    rewind(fp);
+    if ((unsigned long long)size > (unsigned long long)SIZE_MAX) {
+        fclose(fp);
+        io_throw(vm, "Error", "Read error");
+        return ps_value_undefined();
+    }
+    PSObject *buf_obj = ps_buffer_new(vm, (size_t)size);
+    if (!buf_obj) {
+        fclose(fp);
+        return ps_value_undefined();
+    }
+    PSBuffer *buf = ps_buffer_from_object(buf_obj);
+    if (size > 0 && buf && buf->data) {
+        size_t n = fread(buf->data, 1, (size_t)size, fp);
+        if (n != (size_t)size) {
+            fclose(fp);
+            io_throw(vm, "Error", "Read error");
+            return ps_value_undefined();
+        }
+    }
+    fclose(fp);
+    return ps_value_object(buf_obj);
+}
+
+static PSValue ps_native_write_binary(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    if (argc < 2) {
+        ps_vm_throw_type_error(vm, "Io.writeBinary expects (path, buffer)");
+        return ps_value_undefined();
+    }
+    PSString *path_s = ps_to_string(vm, argv[0]);
+    if (vm && vm->has_pending_throw) return ps_value_undefined();
+    if (argv[1].type != PS_T_OBJECT || !argv[1].as.object ||
+        argv[1].as.object->kind != PS_OBJ_KIND_BUFFER) {
+        ps_vm_throw_type_error(vm, "Io.writeBinary expects (path, buffer)");
+        return ps_value_undefined();
+    }
+    PSBuffer *buf = ps_buffer_from_object(argv[1].as.object);
+    if (!buf) {
+        ps_vm_throw_type_error(vm, "Io.writeBinary expects (path, buffer)");
+        return ps_value_undefined();
+    }
+    char *path = io_string_cstr(vm, path_s);
+    if (vm && vm->has_pending_throw) {
+        free(path);
+        return ps_value_undefined();
+    }
+    FILE *fp = fopen(path, "wb");
+    free(path);
+    if (!fp) {
+        io_throw(vm, "Error", "Unable to open file");
+        return ps_value_undefined();
+    }
+    if (buf->size > 0 && buf->data) {
+        size_t n = fwrite(buf->data, 1, buf->size, fp);
+        if (n != buf->size) {
+            fclose(fp);
+            io_throw(vm, "Error", "Write error");
+            return ps_value_undefined();
+        }
+    }
+    fclose(fp);
     return ps_value_undefined();
 }
 
@@ -388,6 +494,8 @@ void ps_io_init(PSVM *vm) {
     PSObject *write_line_fn = ps_function_new_native(ps_native_write_line);
     PSObject *close_fn = ps_function_new_native(ps_native_close);
     PSObject *temp_path_fn = ps_function_new_native(ps_native_temp_path);
+    PSObject *read_binary_fn = ps_function_new_native(ps_native_read_binary);
+    PSObject *write_binary_fn = ps_function_new_native(ps_native_write_binary);
     if (open_fn) ps_function_setup(open_fn, vm->function_proto, vm->object_proto, NULL);
     if (read_fn) ps_function_setup(read_fn, vm->function_proto, vm->object_proto, NULL);
     if (read_lines_fn) ps_function_setup(read_lines_fn, vm->function_proto, vm->object_proto, NULL);
@@ -395,6 +503,8 @@ void ps_io_init(PSVM *vm) {
     if (write_line_fn) ps_function_setup(write_line_fn, vm->function_proto, vm->object_proto, NULL);
     if (close_fn) ps_function_setup(close_fn, vm->function_proto, vm->object_proto, NULL);
     if (temp_path_fn) ps_function_setup(temp_path_fn, vm->function_proto, vm->object_proto, NULL);
+    if (read_binary_fn) ps_function_setup(read_binary_fn, vm->function_proto, vm->object_proto, NULL);
+    if (write_binary_fn) ps_function_setup(write_binary_fn, vm->function_proto, vm->object_proto, NULL);
 
     /* Attach print to Io */
     ps_object_define(
@@ -424,6 +534,12 @@ void ps_io_init(PSVM *vm) {
     }
     if (temp_path_fn) {
         ps_object_define(io, ps_string_from_cstr("tempPath"), ps_value_object(temp_path_fn), PS_ATTR_NONE);
+    }
+    if (read_binary_fn) {
+        ps_object_define(io, ps_string_from_cstr("readBinary"), ps_value_object(read_binary_fn), PS_ATTR_NONE);
+    }
+    if (write_binary_fn) {
+        ps_object_define(io, ps_string_from_cstr("writeBinary"), ps_value_object(write_binary_fn), PS_ATTR_NONE);
     }
 
     ps_object_define(io,

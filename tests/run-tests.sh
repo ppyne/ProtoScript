@@ -196,3 +196,7 @@ run_case 138-function-expr-closure 0
 run_case 139-instanceof 0
 run_case 140-instanceof-array 0
 run_case 141-global-nan 0
+run_case 142-buffer-basic 0
+run_case 143-io-binary 0
+run_case 144-io-binary-edge 0
+run_case 145-event-empty 0

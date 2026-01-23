@@ -6,6 +6,8 @@
 #include "ps_function.h"
 #include "ps_ast.h"
 #include "ps_regexp.h"
+#include "ps_buffer.h"
+#include "ps_display.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -360,6 +362,15 @@ static void ps_gc_mark_roots(PSVM *vm) {
     } else {
         ps_gc_mark_ast_node(vm, vm->current_ast);
     }
+    if (vm->display && vm->display->framebuffer_obj) {
+        ps_gc_mark_object(vm, vm->display->framebuffer_obj);
+    }
+    if (vm->event_queue && vm->event_count > 0) {
+        for (size_t i = 0; i < vm->event_count; i++) {
+            size_t idx = (vm->event_head + i) % vm->event_capacity;
+            ps_gc_mark_value(vm, vm->event_queue[idx]);
+        }
+    }
     for (size_t i = 0; i < vm->gc.root_count; i++) {
         PSGCRoot *root = &vm->gc.roots[i];
         switch (root->type) {
@@ -407,6 +418,14 @@ static void ps_gc_finalize_object(PSObject *obj) {
         case PS_OBJ_KIND_REGEXP:
             ps_regex_free((PSRegex *)obj->internal);
             break;
+        case PS_OBJ_KIND_BUFFER: {
+            PSBuffer *buf = (PSBuffer *)obj->internal;
+            if (buf) {
+                free(buf->data);
+                free(buf);
+            }
+            break;
+        }
         default: {
             free(obj->internal);
             break;

@@ -37,7 +37,8 @@ typedef enum {
     PS_OBJ_KIND_STRING = 4,
     PS_OBJ_KIND_ARRAY = 5,
     PS_OBJ_KIND_DATE = 6,
-    PS_OBJ_KIND_REGEXP = 7
+    PS_OBJ_KIND_REGEXP = 7,
+    PS_OBJ_KIND_BUFFER = 8
 } PSObjectKind;
 
 /* Object lifecycle */

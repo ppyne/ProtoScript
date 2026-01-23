@@ -284,6 +284,42 @@ Standard streams:
 
 ---
 
+## Event module
+
+ProtoScript exposes a host `Event` module for pull-based event access.
+
+```js
+var ev = Event.next();
+if (ev && ev.type == "quit") {
+    Io.print("bye\n");
+}
+```
+
+See the Display chapter for event types and payloads.
+
+---
+
+## Buffer module
+
+ProtoScript exposes a low-level `Buffer` module for byte-addressable data.
+
+```js
+var b = Buffer.alloc(4);
+b[0] = 255;
+Io.print(Buffer.size(b) + "\n");
+```
+
+Buffers are also used for binary I/O and the Display framebuffer.
+
+---
+
+## Display module
+
+ProtoScript exposes a host `Display` module for a single native window with a
+software framebuffer. See the Display chapter for full v1.2 behavior.
+
+---
+
 ## Gc module
 
 ProtoScript exposes a host `Gc` module for explicit garbage-collection control

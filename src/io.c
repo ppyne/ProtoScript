@@ -211,17 +211,49 @@ static int io_check_text_data(PSVM *vm, PSIOFile *file, const unsigned char *buf
 /* Internal builtin: Io.print                                */
 /* --------------------------------------------------------- */
 
-/* Native implementation of Io.print */
-static PSValue ps_native_print(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
-    (void)vm;
-    (void)this_val;
-    if (argc > 0) {
-        PSString *s = ps_to_string(vm, argv[0]);
+static PSValue io_print_stream(PSVM *vm, int argc, PSValue *argv, FILE *out) {
+    for (int i = 0; i < argc; i++) {
+        if (i > 0) {
+            fputc(' ', out);
+        }
+        PSString *s = ps_to_string(vm, argv[i]);
         if (s) {
-            fwrite(s->utf8, 1, s->byte_len, stdout);
+            fwrite(s->utf8, 1, s->byte_len, out);
         }
     }
     return ps_value_undefined();
+}
+
+static PSValue io_print_stream_line(PSVM *vm, int argc, PSValue *argv, FILE *out) {
+    io_print_stream(vm, argc, argv, out);
+    fputc('\n', out);
+    return ps_value_undefined();
+}
+
+/* Native implementation of Io.print */
+static PSValue ps_native_print(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    return io_print_stream(vm, argc, argv, stdout);
+}
+
+static PSValue ps_native_console_log(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    return io_print_stream_line(vm, argc, argv, stdout);
+}
+
+static PSValue ps_native_console_info(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    return io_print_stream_line(vm, argc, argv, stdout);
+}
+
+static PSValue ps_native_console_warn(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    return io_print_stream_line(vm, argc, argv, stdout);
+}
+
+static PSValue ps_native_console_error(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    return io_print_stream_line(vm, argc, argv, stderr);
 }
 
 typedef struct {
@@ -771,6 +803,25 @@ void ps_io_init(PSVM *vm) {
     PSObject *print_fn = ps_function_new_native(ps_native_print);
     if (!print_fn) return;
     ps_function_setup(print_fn, vm->function_proto, vm->object_proto, NULL);
+
+    PSObject *console = ps_object_new(NULL);
+    PSObject *console_log_fn = ps_function_new_native(ps_native_console_log);
+    PSObject *console_info_fn = ps_function_new_native(ps_native_console_info);
+    PSObject *console_warn_fn = ps_function_new_native(ps_native_console_warn);
+    PSObject *console_error_fn = ps_function_new_native(ps_native_console_error);
+
+    if (console_log_fn) ps_function_setup(console_log_fn, vm->function_proto, vm->object_proto, NULL);
+    if (console_info_fn) ps_function_setup(console_info_fn, vm->function_proto, vm->object_proto, NULL);
+    if (console_warn_fn) ps_function_setup(console_warn_fn, vm->function_proto, vm->object_proto, NULL);
+    if (console_error_fn) ps_function_setup(console_error_fn, vm->function_proto, vm->object_proto, NULL);
+
+    if (console) {
+        if (console_log_fn) ps_object_define(console, ps_string_from_cstr("log"), ps_value_object(console_log_fn), PS_ATTR_NONE);
+        if (console_info_fn) ps_object_define(console, ps_string_from_cstr("info"), ps_value_object(console_info_fn), PS_ATTR_NONE);
+        if (console_warn_fn) ps_object_define(console, ps_string_from_cstr("warn"), ps_value_object(console_warn_fn), PS_ATTR_NONE);
+        if (console_error_fn) ps_object_define(console, ps_string_from_cstr("error"), ps_value_object(console_error_fn), PS_ATTR_NONE);
+        ps_object_define(vm->global, ps_string_from_cstr("console"), ps_value_object(console), PS_ATTR_NONE);
+    }
 
     PSObject *sprintf_fn = ps_function_new_native(ps_native_sprintf);
     if (sprintf_fn) ps_function_setup(sprintf_fn, vm->function_proto, vm->object_proto, NULL);

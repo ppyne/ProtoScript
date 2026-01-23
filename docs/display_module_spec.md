@@ -162,7 +162,26 @@ Returns the logical framebuffer as a `Buffer` for direct pixel manipulation.
 
 ---
 
-### 4.10 `Display.present()`
+### 4.10 `Display.blitRGBA(buffer, srcW, srcH, dstX, dstY)`
+
+Copies an RGBA8 buffer into the logical framebuffer.
+
+**Parameters:**
+
+- `buffer` (`Buffer`): source RGBA data
+- `srcW`, `srcH` (number): source dimensions in pixels
+- `dstX`, `dstY` (number): destination top-left in the framebuffer
+
+**Semantics:**
+
+- Pixel format: RGBA 8-bit (4 bytes per pixel)
+- Source buffer length must be at least `srcW * srcH * 4`
+- The blit is clipped to the framebuffer bounds
+- Negative `dstX`/`dstY` are allowed (source is clipped accordingly)
+
+---
+
+### 4.11 `Display.present()`
 
 Presents the framebuffer to the window according to the active scaling mode.
 
@@ -217,6 +236,16 @@ This event is **not** emitted on window resize when the framebuffer remains unch
 
 - Indicates that any previously obtained `Buffer` from `Display.framebuffer()` is invalid
 - User code must reacquire the framebuffer via `Display.framebuffer()`
+
+---
+
+## 7. Test Matrix
+
+- blit to origin (full image)
+- blit with negative offsets (top-left clip)
+- blit partially outside right/bottom edges
+- invalid buffer size (too small)
+- invalid dimensions (non-integers, <= 0)
 
 ---
 

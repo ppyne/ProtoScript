@@ -8,7 +8,7 @@
 #include "ps_string.h"
 #include "ps_value.h"
 
-#if PS_ENABLE_SDL
+#if PS_ENABLE_MODULE_DISPLAY
 #include <SDL.h>
 #include <math.h>
 #include <stdlib.h>
@@ -62,6 +62,17 @@ static int display_parse_size(PSVM *vm, PSValue value, int *out) {
     return 1;
 }
 
+static int display_parse_coord(PSVM *vm, PSValue value, int *out) {
+    double num = ps_to_number(vm, value);
+    if (vm && vm->has_pending_throw) return 0;
+    if (isnan(num) || isinf(num) || floor(num) != num) {
+        display_throw(vm, "RangeError", "Invalid display coordinate");
+        return 0;
+    }
+    if (out) *out = (int)num;
+    return 1;
+}
+
 static PSBuffer *display_buffer(PSDisplay *d) {
     if (!d || !d->framebuffer_obj) return NULL;
     return ps_buffer_from_object(d->framebuffer_obj);
@@ -92,7 +103,7 @@ static int display_recreate_texture(PSDisplay *d) {
         d->texture = NULL;
     }
     d->texture = SDL_CreateTexture(d->renderer,
-                                   SDL_PIXELFORMAT_RGBA8888,
+                                   SDL_PIXELFORMAT_ABGR8888,
                                    SDL_TEXTUREACCESS_STREAMING,
                                    d->logical_width,
                                    d->logical_height);
@@ -618,6 +629,78 @@ static PSValue ps_native_display_fill_rect(PSVM *vm, PSValue this_val, int argc,
     return ps_value_undefined();
 }
 
+static PSValue ps_native_display_blit_rgba(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    if (!display_require_open(vm)) return ps_value_undefined();
+    if (argc < 5) {
+        ps_vm_throw_type_error(vm, "Display.blitRGBA expects (buffer, srcW, srcH, dstX, dstY)");
+        return ps_value_undefined();
+    }
+    if (argv[0].type != PS_T_OBJECT || !argv[0].as.object ||
+        argv[0].as.object->kind != PS_OBJ_KIND_BUFFER) {
+        ps_vm_throw_type_error(vm, "Display.blitRGBA expects (buffer, srcW, srcH, dstX, dstY)");
+        return ps_value_undefined();
+    }
+    PSDisplay *d = display_state(vm);
+    PSBuffer *dst_buf = display_buffer(d);
+    if (!dst_buf || !dst_buf->data) return ps_value_undefined();
+    PSBuffer *src_buf = ps_buffer_from_object(argv[0].as.object);
+    if (!src_buf || !src_buf->data) return ps_value_undefined();
+
+    int src_w = 0;
+    int src_h = 0;
+    if (!display_parse_size(vm, argv[1], &src_w) ||
+        !display_parse_size(vm, argv[2], &src_h)) {
+        return ps_value_undefined();
+    }
+    int dst_x = 0;
+    int dst_y = 0;
+    if (!display_parse_coord(vm, argv[3], &dst_x) ||
+        !display_parse_coord(vm, argv[4], &dst_y)) {
+        return ps_value_undefined();
+    }
+
+    size_t expected = (size_t)src_w * (size_t)src_h * 4u;
+    if (src_buf->size < expected) {
+        display_throw(vm, "RangeError", "Invalid blit buffer size");
+        return ps_value_undefined();
+    }
+
+    int copy_w = src_w;
+    int copy_h = src_h;
+    int src_x = 0;
+    int src_y = 0;
+
+    if (dst_x < 0) {
+        src_x = -dst_x;
+        copy_w -= src_x;
+        dst_x = 0;
+    }
+    if (dst_y < 0) {
+        src_y = -dst_y;
+        copy_h -= src_y;
+        dst_y = 0;
+    }
+    if (dst_x + copy_w > d->logical_width) {
+        copy_w = d->logical_width - dst_x;
+    }
+    if (dst_y + copy_h > d->logical_height) {
+        copy_h = d->logical_height - dst_y;
+    }
+    if (copy_w <= 0 || copy_h <= 0) return ps_value_undefined();
+
+    size_t row_bytes = (size_t)copy_w * 4u;
+    for (int row = 0; row < copy_h; row++) {
+        size_t src_off = ((size_t)(src_y + row) * (size_t)src_w + (size_t)src_x) * 4u;
+        size_t dst_off = ((size_t)(dst_y + row) * (size_t)d->logical_width + (size_t)dst_x) * 4u;
+        if (src_off + row_bytes > src_buf->size || dst_off + row_bytes > dst_buf->size) {
+            break;
+        }
+        memmove(dst_buf->data + dst_off, src_buf->data + src_off, row_bytes);
+    }
+    return ps_value_undefined();
+}
+
 static PSValue ps_native_display_present(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
     (void)this_val;
     (void)argc;
@@ -685,6 +768,7 @@ void ps_display_init(PSVM *vm) {
     PSObject *line_fn = ps_function_new_native(ps_native_display_line);
     PSObject *rect_fn = ps_function_new_native(ps_native_display_rect);
     PSObject *fill_rect_fn = ps_function_new_native(ps_native_display_fill_rect);
+    PSObject *blit_fn = ps_function_new_native(ps_native_display_blit_rgba);
     PSObject *present_fn = ps_function_new_native(ps_native_display_present);
     PSObject *framebuffer_fn = ps_function_new_native(ps_native_display_framebuffer);
 
@@ -696,6 +780,7 @@ void ps_display_init(PSVM *vm) {
     if (line_fn) ps_function_setup(line_fn, vm->function_proto, vm->object_proto, NULL);
     if (rect_fn) ps_function_setup(rect_fn, vm->function_proto, vm->object_proto, NULL);
     if (fill_rect_fn) ps_function_setup(fill_rect_fn, vm->function_proto, vm->object_proto, NULL);
+    if (blit_fn) ps_function_setup(blit_fn, vm->function_proto, vm->object_proto, NULL);
     if (present_fn) ps_function_setup(present_fn, vm->function_proto, vm->object_proto, NULL);
     if (framebuffer_fn) ps_function_setup(framebuffer_fn, vm->function_proto, vm->object_proto, NULL);
 
@@ -708,6 +793,8 @@ void ps_display_init(PSVM *vm) {
     if (rect_fn) ps_object_define(display, ps_string_from_cstr("rect"), ps_value_object(rect_fn), PS_ATTR_NONE);
     if (fill_rect_fn) ps_object_define(display, ps_string_from_cstr("fillRect"),
                                        ps_value_object(fill_rect_fn), PS_ATTR_NONE);
+    if (blit_fn) ps_object_define(display, ps_string_from_cstr("blitRGBA"),
+                                  ps_value_object(blit_fn), PS_ATTR_NONE);
     if (present_fn) ps_object_define(display, ps_string_from_cstr("present"),
                                      ps_value_object(present_fn), PS_ATTR_NONE);
     if (framebuffer_fn) ps_object_define(display, ps_string_from_cstr("framebuffer"),

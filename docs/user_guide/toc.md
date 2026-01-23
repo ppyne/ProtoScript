@@ -111,6 +111,7 @@ This document is the **main table of contents** for the ProtoScript documentatio
   - [Fs module](working_with_objects.md#fs-module)
   - [Event module](working_with_objects.md#event-module)
   - [Buffer module](working_with_objects.md#buffer-module)
+  - [Image module](working_with_objects.md#image-module)
   - [Display module](working_with_objects.md#display-module)
   - [Gc module](working_with_objects.md#gc-module)
 

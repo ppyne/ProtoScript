@@ -27,6 +27,9 @@ void ps_display_init(PSVM *vm);
 #if PS_ENABLE_MODULE_FS
 void ps_fs_init(PSVM *vm);
 #endif
+#if PS_ENABLE_MODULE_IMG
+void ps_img_init(PSVM *vm);
+#endif
 static PSValue ps_native_date_to_string(PSVM *vm, PSValue this_val, int argc, PSValue *argv);
 static PSValue ps_date_parse_iso(PSVM *vm, PSString *s);
 static PSString *ps_date_format_utc(double ms_num);
@@ -4992,7 +4995,7 @@ PSVM *ps_vm_new(void) {
         free(vm);
         return NULL;
     }
-#if PS_ENABLE_SDL
+#if PS_ENABLE_MODULE_DISPLAY
     vm->display = (struct PSDisplay *)calloc(1, sizeof(struct PSDisplay));
     if (!vm->display) {
         free(vm->event_queue);
@@ -5040,12 +5043,15 @@ PSVM *ps_vm_new(void) {
     ps_vm_init_builtins(vm);
     ps_vm_init_buffer(vm);
     ps_vm_init_event(vm);
-#if PS_ENABLE_SDL
+#if PS_ENABLE_MODULE_DISPLAY
     ps_vm_init_display(vm);
 #endif
     ps_vm_init_io(vm);
 #if PS_ENABLE_MODULE_FS
     ps_vm_init_fs(vm);
+#endif
+#if PS_ENABLE_MODULE_IMG
+    ps_vm_init_img(vm);
 #endif
 
     return vm;
@@ -5058,7 +5064,7 @@ void ps_vm_free(PSVM *vm) {
     if (ps_gc_active_vm() == vm) {
         ps_gc_set_active_vm(NULL);
     }
-#if PS_ENABLE_SDL
+#if PS_ENABLE_MODULE_DISPLAY
     ps_display_shutdown(vm);
 #endif
     free(vm->event_queue);
@@ -6250,6 +6256,13 @@ void ps_vm_init_io(PSVM *vm) {
 void ps_vm_init_fs(PSVM *vm) {
     /* Delegate to fs.c */
     ps_fs_init(vm);
+}
+#endif
+
+#if PS_ENABLE_MODULE_IMG
+void ps_vm_init_img(PSVM *vm) {
+    /* Delegate to img.c */
+    ps_img_init(vm);
 }
 #endif
 

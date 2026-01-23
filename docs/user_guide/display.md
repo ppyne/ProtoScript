@@ -9,14 +9,14 @@ low-level, explicit, and does not include widgets, layouts, or event callbacks.
 
 ## Availability and Build Options
 
-Display is optional and controlled by the `PS_ENABLE_SDL` build flag.
+Display is optional and controlled by the `PS_ENABLE_MODULE_DISPLAY` build flag.
 
 ### Disable Display
 
 If you do not want Display, build with:
 
 ```
-make PS_ENABLE_SDL=0
+make PS_ENABLE_MODULE_DISPLAY=0
 ```
 
 In this mode the `Display` global is not defined (accessing it will raise a
@@ -167,6 +167,19 @@ Semantics:
 
 Returns:
 - `Buffer`
+
+### Display.blitRGBA(buffer, srcW, srcH, dstX, dstY)
+
+Copies an RGBA8 buffer into the logical framebuffer.
+
+Parameters:
+- `buffer` (`Buffer`): source RGBA data
+- `srcW`, `srcH` (number): source dimensions in pixels
+- `dstX`, `dstY` (number): destination top-left in the framebuffer
+
+Notes:
+- The copy is clipped to the framebuffer bounds.
+- Negative `dstX`/`dstY` values are allowed (source is clipped accordingly).
 
 ### Display.present()
 

@@ -8,6 +8,10 @@
 #include "ps_regexp.h"
 #include "ps_buffer.h"
 #include "ps_display.h"
+#include "ps_config.h"
+#if PS_ENABLE_MODULE_IMG
+#include "ps_img.h"
+#endif
 
 #include <stdlib.h>
 #include <string.h>
@@ -428,6 +432,11 @@ static void ps_gc_finalize_object(PSObject *obj) {
             }
             break;
         }
+#if PS_ENABLE_MODULE_IMG
+        case PS_OBJ_KIND_IMAGE:
+            ps_img_handle_release((PSImageHandle *)obj->internal);
+            break;
+#endif
         default: {
             free(obj->internal);
             break;

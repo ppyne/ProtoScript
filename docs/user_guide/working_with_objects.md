@@ -572,10 +572,49 @@ Buffers are also used for binary I/O and the Display framebuffer.
 
 ---
 
+## Image module
+
+ProtoScript exposes a host `Image` module for decoding PNG/JPEG buffers and
+resampling RGBA images. It is available when `PS_ENABLE_MODULE_IMG` is set to
+`1` at build time.
+
+Image objects are plain objects:
+
+```js
+{
+    width:  320,
+    height: 200,
+    data:   Buffer.alloc(320 * 200 * 4)
+}
+```
+
+The `data` buffer is RGBA8 (R, G, B, A), non-premultiplied, row-major, and
+originates at the top-left pixel (0,0).
+
+```js
+var f = Io.open("assets/photo.png", "rb");
+var buf = f.read();
+f.close();
+
+var format = Image.detectFormat(buf);
+if (format == "png") {
+    Io.print("format png\n");
+}
+
+var img = Image.decodePNG(buf);
+// For JPEG buffers: Image.decodeJPEG(buf);
+var half = Image.resample(img, img.width / 2, img.height / 2, "linear");
+Io.print(half.width + "x" + half.height + "\n");
+```
+
+Resample modes: `none`, `linear`, `cubic`, `nohalo`, `lohalo`.
+
+---
+
 ## Display module
 
 ProtoScript exposes a host `Display` module for a single native window with a
-software framebuffer. See the Display chapter for full behavior.
+software framebuffer. See the [Display chapter](display.md) for full behavior.
 
 ---
 

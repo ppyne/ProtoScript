@@ -89,6 +89,10 @@ static int is_hex_digit(char c) {
            (c >= 'A' && c <= 'F');
 }
 
+static int is_bin_digit(char c) {
+    return c == '0' || c == '1';
+}
+
 static int unicode_escape_after_backslash(PSLexer *lx) {
     return peek(lx) == 'u' &&
            is_hex_digit(peek_n(lx, 1)) &&
@@ -225,6 +229,14 @@ PSToken ps_lexer_next(PSLexer *lx) {
             size_t len = lx->src + lx->pos - start;
             PSToken t = make_token(TOK_NUMBER, start, len, line, column);
             t.number = (double)strtoul(start, NULL, 16);
+            return t;
+        }
+        if (c == '0' && (peek(lx) == 'b' || peek(lx) == 'B')) {
+            advance(lx);
+            while (is_bin_digit(peek(lx))) advance(lx);
+            size_t len = lx->src + lx->pos - start;
+            PSToken t = make_token(TOK_NUMBER, start, len, line, column);
+            t.number = (double)strtoul(start + 2, NULL, 2);
             return t;
         }
         if (isdigit((unsigned char)c)) {

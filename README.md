@@ -34,14 +34,16 @@ You can test ProtoScript immediately thanks to a demo running on the web via Web
 
 ## Build
 
-Display module is optional (native window + software framebuffer for drawing pixels) and controlled by the `PS_ENABLE_SDL` build flag.
+Display module is optional (native window + software framebuffer for drawing pixels) and controlled by the `PS_ENABLE_MODULE_DISPLAY` build flag.
+
+Image module is optional (PNG/JPEG decode + resampling) and controlled by `PS_ENABLE_MODULE_IMG` in `include/ps_config.h`.
 
 ### Disable Display
 
 If you do not want Display, build with:
 
 ```sh
-make PS_ENABLE_SDL=0
+make PS_ENABLE_MODULE_DISPLAY=0
 ```
 
 In this mode the `Display` global is not defined (accessing it will raise a
@@ -87,6 +89,25 @@ If you do not use Display, no external dependencies are required.
 ```sh
 make
 ```
+
+If you enable Image, make sure libpng and libjpeg are available (vendored as
+submodules under `third_party/` or provided system-wide).
+
+### Enable Image
+
+To use vendored libraries:
+
+```sh
+git submodule update --init --recursive third_party/libpng third_party/libjpeg
+mkdir -p third_party/libpng/build
+cmake -S third_party/libpng -B third_party/libpng/build -DPNG_SHARED=OFF -DPNG_TESTS=OFF
+cmake --build third_party/libpng/build
+mkdir -p third_party/libjpeg/build
+cmake -S third_party/libjpeg -B third_party/libjpeg/build -DENABLE_SHARED=OFF
+cmake --build third_party/libjpeg/build
+```
+
+Then set `PS_ENABLE_MODULE_IMG` to `1` and run `make`.
 
 ## Tests
 

@@ -206,6 +206,7 @@ Integers may be written in:
 
 - decimal (base 10)
 - hexadecimal (base 16, `0x` prefix)
+- binary (base 2, `0b` prefix)
 - octal (base 8, leading `0`)
 - exponent notation (base-10, `e`/`E` with optional sign)
 
@@ -213,6 +214,7 @@ Examples:
 
 ```js
 42
+0b1010
 0xFFF
 012
 -345

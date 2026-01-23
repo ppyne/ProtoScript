@@ -71,6 +71,9 @@ void ps_vm_init_io(PSVM *vm);
 #if PS_ENABLE_MODULE_FS
 void ps_vm_init_fs(PSVM *vm);
 #endif
+#if PS_ENABLE_MODULE_IMG
+void ps_vm_init_img(PSVM *vm);
+#endif
 
 /* Primitive wrappers */
 PSObject *ps_vm_wrap_primitive(PSVM *vm, const PSValue *v);

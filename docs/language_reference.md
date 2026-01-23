@@ -11,7 +11,7 @@ does not describe every ES1 rule in detail.
 ## 1. Lexical forms
 
 ### 1.1 Literals
-- Numbers: decimal, hex (`0xFF`), octal (`077`), fractional, exponent (`1e3`)
+- Numbers: decimal, hex (`0xFF`), octal (`077`), binary (`0b1010`), fractional, exponent (`1e3`)
 - Strings: single or double quotes with escapes
 - `true`, `false`, `null`, `undefined`
 - RegExp literal: `/pattern/flags` (flags: `g`, `i`, `m` supported)
@@ -271,7 +271,7 @@ Object: `Event`
 - `Event.next()`
 
 ### 7.6 Display (optional)
-Object: `Display` (requires `PS_ENABLE_SDL=1`)
+Object: `Display` (requires `PS_ENABLE_MODULE_DISPLAY=1`)
 - `Display.open(width, height, title, options)`
 - `Display.close()`
 - `Display.size()`
@@ -292,5 +292,5 @@ Defined in `include/ps_config.h` (0 = disabled, 1 = enabled):
 - `PS_ENABLE_EVAL`
 - `PS_ENABLE_ARGUMENTS_ALIASING`
 - `PS_ENABLE_MODULE_FS`
-- `PS_ENABLE_SDL`
+- `PS_ENABLE_MODULE_DISPLAY`
 - `PS_EVENT_QUEUE_CAPACITY`

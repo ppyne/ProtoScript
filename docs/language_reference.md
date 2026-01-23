@@ -27,7 +27,7 @@ does not describe every ES1 rule in detail.
 ```
 var if else while do for in of switch case default function return
 break continue with try catch finally throw new true false null typeof
-instanceof void delete
+instanceof void delete include
 ```
 
 ---
@@ -67,6 +67,22 @@ instanceof void delete
 - `try / catch / finally`, `throw`
 - `return`
 - `with` (compile-time gated)
+- `include "path/to/file.js"` (top-level only, before statements)
+
+### 4.1 `include`
+
+ProtoScript supports a static source inclusion directive:
+
+```js
+include "relative/or/absolute/path.js";
+```
+
+Rules:
+- top-level only (not inside blocks)
+- must appear before any executable statements in the file
+- argument must be a string literal ending in `.js`
+- relative paths resolve from the including file
+- cycles are detected and reported as errors
 
 ---
 
@@ -213,6 +229,30 @@ Object: `Gc`
 - `Gc.collect()`
 - `Gc.stats()`
 
+### 7.3 Buffer
+Object: `Buffer`
+- `Buffer.alloc(size)`
+- `Buffer.size(buffer)`
+- `Buffer.fromString(string)`
+- `Buffer.toString(buffer)`
+
+### 7.4 Event
+Object: `Event`
+- `Event.next()`
+
+### 7.5 Display (optional)
+Object: `Display` (requires `PS_ENABLE_SDL=1`)
+- `Display.open(width, height, title, options)`
+- `Display.close()`
+- `Display.size()`
+- `Display.clear(r, g, b)`
+- `Display.pixel(x, y, r, g, b)`
+- `Display.line(x1, y1, x2, y2, r, g, b)`
+- `Display.rect(x, y, w, h, r, g, b)`
+- `Display.fillRect(x, y, w, h, r, g, b)`
+- `Display.framebuffer()`
+- `Display.present()`
+
 ---
 
 ## 8. Compile-time flags
@@ -221,3 +261,5 @@ Defined in `include/ps_config.h` (0 = disabled, 1 = enabled):
 - `PS_ENABLE_WITH`
 - `PS_ENABLE_EVAL`
 - `PS_ENABLE_ARGUMENTS_ALIASING`
+- `PS_ENABLE_SDL`
+- `PS_EVENT_QUEUE_CAPACITY`

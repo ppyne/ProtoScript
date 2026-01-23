@@ -30,28 +30,38 @@ set in `include/ps_config.h`.
 `PS_ENABLE_EVAL=0` and `PS_ENABLE_WITH=0`, set in `include/ps_config.h`. When
 disabled, attempting to use them is rejected.
 
-## 5. Host extension
+## 5. `include` directive
 
-The `Io` module (print + file/stream I/O) is a non-standard host extension.
+ProtoScript supports a static `include "path.js"` directive. It is not part of
+ES1 and is resolved before execution. `include` is only allowed at top level
+and must appear before any executable statements.
 
-## 6. GC module (host extension)
+## 6. Host extensions
+
+ProtoScript adds non-standard host modules:
+- `Io` (print + file/stream I/O)
+- `Buffer` (byte-addressable data)
+- `Event` (pull-based events)
+- `Display` (optional SDL-backed framebuffer window)
+
+## 7. GC module (host extension)
 
 ProtoScript exposes a non-standard `Gc` object with `Gc.collect()` and
 `Gc.stats()` to force and inspect garbage collection. This is outside ES1.
 
-## 7. ES2015 default parameters
+## 8. ES2015 default parameters
 
 ProtoScript supports ES2015-style default parameter values in function
 declarations (for example `function f(x, y = 10) { ... }`). This is an ES6
 extension beyond ES1.
 
-## 8. JSON (ES5)
+## 9. JSON (ES5)
 
 ProtoScript exposes a global `JSON` object with `JSON.parse` and
 `JSON.stringify`. This is an ES5 feature (not part of ES1). The implementation
 does not support revivers, replacers, spacing, or `toJSON`.
 
-## 9. `for...of` (ES2015)
+## 10. `for...of` (ES2015)
 
 ProtoScript supports a simplified `for...of` loop (ES2015/ES6). It iterates:
 - array values in index order,
@@ -60,7 +70,7 @@ ProtoScript supports a simplified `for...of` loop (ES2015/ES6). It iterates:
 
 This is an ES6 extension beyond ES1 and does not use the ES6 iterator protocol.
 
-## 10. `instanceof` (ES3)
+## 11. `instanceof` (ES3)
 
 ProtoScript supports the `instanceof` operator (added in ES3). The right-hand
 side must be a function with a valid `prototype`, otherwise a `TypeError` is

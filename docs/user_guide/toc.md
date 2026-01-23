@@ -72,6 +72,7 @@ This document is the **main table of contents** for the ProtoScript documentatio
 - [Object manipulation statements](statements.md#object-manipulation-statements)
   - [for…in](statements.md#object-manipulation-statements)
   - [with](statements.md#object-manipulation-statements)
+- [Source inclusion (`include`)](statements.md#include)
 - [Comments](statements.md#comments)
 
 ### [Chapter 6 — Functions](functions.md)

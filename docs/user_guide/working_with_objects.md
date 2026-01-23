@@ -316,7 +316,7 @@ Buffers are also used for binary I/O and the Display framebuffer.
 ## Display module
 
 ProtoScript exposes a host `Display` module for a single native window with a
-software framebuffer. See the Display chapter for full v1.2 behavior.
+software framebuffer. See the Display chapter for full behavior.
 
 ---
 

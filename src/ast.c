@@ -208,6 +208,10 @@ PSAstNode *ps_ast_identifier(const char *name, size_t length) {
     return n;
 }
 
+PSAstNode *ps_ast_this(void) {
+    return alloc_node(AST_THIS);
+}
+
 PSAstNode *ps_ast_literal(PSValue value) {
     PSAstNode *n = alloc_node(AST_LITERAL);
     n->as.literal.value = value;
@@ -485,6 +489,7 @@ void ps_ast_free(PSAstNode *node) {
         case AST_IDENTIFIER:
             free((void *)node->as.identifier.name);
             break;
+        case AST_THIS:
         case AST_LITERAL:
             /* nothing to free */
             break;

@@ -7,4 +7,4 @@ Foo.prototype.x = 1;
 var f = new Foo();
 Io.print(("x" in f) + "\n");
 
-Io.print((("length") in "hi") + "\n");
+Io.print((("length") in new String("hi")) + "\n");

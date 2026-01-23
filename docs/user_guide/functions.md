@@ -211,6 +211,6 @@ escape(string);
 unescape(string);
 ```
 
-Availability: not implemented in the current ProtoScript runtime. Calling
-`escape(...)` or `unescape(...)` results in a `ReferenceError` because the
-functions are undefined.
+`escape` uses `%XX` for bytes in the `0x00-0xFF` range and `%uXXXX` for code
+points above `0xFF`. `unescape` reverses `%XX` and `%uXXXX` sequences and
+leaves invalid escape sequences unchanged.

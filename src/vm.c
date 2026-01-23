@@ -34,6 +34,13 @@ static PSValue ps_native_date_to_string(PSVM *vm, PSValue this_val, int argc, PS
 static PSValue ps_date_parse_iso(PSVM *vm, PSString *s);
 static PSString *ps_date_format_utc(double ms_num);
 static int64_t ps_to_int64(double v, int *ok);
+static size_t ps_utf8_encode(uint32_t code, char *out);
+static PSValue ps_native_is_finite(PSVM *vm, PSValue this_val, int argc, PSValue *argv);
+static PSValue ps_native_is_nan(PSVM *vm, PSValue this_val, int argc, PSValue *argv);
+static PSValue ps_native_parse_int(PSVM *vm, PSValue this_val, int argc, PSValue *argv);
+static PSValue ps_native_parse_float(PSVM *vm, PSValue this_val, int argc, PSValue *argv);
+static PSValue ps_native_escape(PSVM *vm, PSValue this_val, int argc, PSValue *argv);
+static PSValue ps_native_unescape(PSVM *vm, PSValue this_val, int argc, PSValue *argv);
 static PSValue ps_date_utc_from_parts(PSVM *vm,
                                       int year,
                                       int month,
@@ -366,6 +373,345 @@ static PSValue ps_native_string(PSVM *vm, PSValue this_val, int argc, PSValue *a
         return this_val;
     }
     return ps_value_string(value);
+}
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} PSCharBuffer;
+
+static void ps_char_buffer_init(PSCharBuffer *b) {
+    b->data = NULL;
+    b->len = 0;
+    b->cap = 0;
+}
+
+static void ps_char_buffer_free(PSCharBuffer *b) {
+    free(b->data);
+    b->data = NULL;
+    b->len = 0;
+    b->cap = 0;
+}
+
+static int ps_char_buffer_reserve(PSCharBuffer *b, size_t extra) {
+    size_t needed = b->len + extra;
+    if (needed <= b->cap) return 1;
+    size_t cap = b->cap ? b->cap * 2 : 64;
+    while (cap < needed) cap *= 2;
+    char *next = realloc(b->data, cap);
+    if (!next) return 0;
+    b->data = next;
+    b->cap = cap;
+    return 1;
+}
+
+static int ps_char_buffer_append(PSCharBuffer *b, const char *src, size_t len) {
+    if (!ps_char_buffer_reserve(b, len)) return 0;
+    memcpy(b->data + b->len, src, len);
+    b->len += len;
+    return 1;
+}
+
+static int ps_char_buffer_append_char(PSCharBuffer *b, char c) {
+    return ps_char_buffer_append(b, &c, 1);
+}
+
+static int ps_is_ascii_space_local(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+static int ps_hex_value_local(unsigned char c) {
+    if (c >= '0' && c <= '9') return (int)(c - '0');
+    if (c >= 'a' && c <= 'f') return (int)(c - 'a') + 10;
+    if (c >= 'A' && c <= 'F') return (int)(c - 'A') + 10;
+    return -1;
+}
+
+static int ps_radix_digit_value(unsigned char c) {
+    if (c >= '0' && c <= '9') return (int)(c - '0');
+    if (c >= 'a' && c <= 'z') return (int)(c - 'a') + 10;
+    if (c >= 'A' && c <= 'Z') return (int)(c - 'A') + 10;
+    return -1;
+}
+
+static int ps_escape_passthrough(unsigned char c) {
+    if ((c >= 'A' && c <= 'Z') ||
+        (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9')) {
+        return 1;
+    }
+    switch (c) {
+        case '@':
+        case '*':
+        case '_':
+        case '+':
+        case '-':
+        case '.':
+        case '/':
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static PSValue ps_native_is_finite(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    double num = (argc > 0) ? ps_to_number(vm, argv[0]) : NAN;
+    return ps_value_boolean(isfinite(num));
+}
+
+static PSValue ps_native_is_nan(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    double num = (argc > 0) ? ps_to_number(vm, argv[0]) : NAN;
+    return ps_value_boolean(isnan(num));
+}
+
+static PSValue ps_native_parse_float(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    if (argc < 1) return ps_value_number(NAN);
+    PSString *s = ps_to_string(vm, argv[0]);
+    if (!s || s->byte_len == 0) return ps_value_number(NAN);
+
+    size_t start = 0;
+    while (start < s->byte_len &&
+           ps_is_ascii_space_local((unsigned char)s->utf8[start])) {
+        start++;
+    }
+    if (start >= s->byte_len) return ps_value_number(NAN);
+
+    size_t len = s->byte_len - start;
+    char *tmp = malloc(len + 1);
+    if (!tmp) return ps_value_number(NAN);
+    memcpy(tmp, s->utf8 + start, len);
+    tmp[len] = '\0';
+
+    char *endptr = NULL;
+    double val = strtod(tmp, &endptr);
+    if (!endptr || endptr == tmp) {
+        free(tmp);
+        return ps_value_number(NAN);
+    }
+    free(tmp);
+    return ps_value_number(val);
+}
+
+static PSValue ps_native_parse_int(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    if (argc < 1) return ps_value_number(NAN);
+    PSString *s = ps_to_string(vm, argv[0]);
+    if (!s || s->byte_len == 0) return ps_value_number(NAN);
+
+    int radix = 0;
+    if (argc > 1 && argv[1].type != PS_T_UNDEFINED) {
+        double r = ps_to_number(vm, argv[1]);
+        if (!isnan(r) && isfinite(r)) {
+            radix = (int)r;
+        }
+    }
+    if (radix != 0 && (radix < 2 || radix > 36)) {
+        return ps_value_number(NAN);
+    }
+
+    size_t i = 0;
+    while (i < s->byte_len && ps_is_ascii_space_local((unsigned char)s->utf8[i])) i++;
+    if (i >= s->byte_len) return ps_value_number(NAN);
+
+    int sign = 1;
+    if (s->utf8[i] == '+' || s->utf8[i] == '-') {
+        if (s->utf8[i] == '-') sign = -1;
+        i++;
+    }
+
+    if (radix == 0) {
+        if (i + 1 < s->byte_len && s->utf8[i] == '0' &&
+            (s->utf8[i + 1] == 'x' || s->utf8[i + 1] == 'X')) {
+            radix = 16;
+            i += 2;
+        } else {
+            radix = 10;
+        }
+    } else if (radix == 16) {
+        if (i + 1 < s->byte_len && s->utf8[i] == '0' &&
+            (s->utf8[i + 1] == 'x' || s->utf8[i + 1] == 'X')) {
+            i += 2;
+        }
+    }
+
+    int saw_digit = 0;
+    double value = 0.0;
+    for (; i < s->byte_len; i++) {
+        int digit = ps_radix_digit_value((unsigned char)s->utf8[i]);
+        if (digit < 0 || digit >= radix) break;
+        saw_digit = 1;
+        value = value * (double)radix + (double)digit;
+    }
+    if (!saw_digit) return ps_value_number(NAN);
+    return ps_value_number((double)sign * value);
+}
+
+static PSValue ps_native_escape(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    PSString *s = (argc > 0) ? ps_to_string(vm, argv[0]) : ps_string_from_cstr("");
+    if (!s || s->glyph_count == 0) {
+        return ps_value_string(ps_string_from_cstr(""));
+    }
+
+    PSCharBuffer b;
+    ps_char_buffer_init(&b);
+    static const char hex[] = "0123456789ABCDEF";
+
+    for (size_t i = 0; i < s->glyph_count; i++) {
+        uint32_t code = ps_string_char_code_at(s, i);
+        if (code <= 0x7F && ps_escape_passthrough((unsigned char)code)) {
+            if (!ps_char_buffer_append_char(&b, (char)code)) {
+                ps_char_buffer_free(&b);
+                return ps_value_undefined();
+            }
+            continue;
+        }
+
+        if (code <= 0xFF) {
+            char buf[3];
+            buf[0] = '%';
+            buf[1] = hex[(code >> 4) & 0xF];
+            buf[2] = hex[code & 0xF];
+            if (!ps_char_buffer_append(&b, buf, sizeof(buf))) {
+                ps_char_buffer_free(&b);
+                return ps_value_undefined();
+            }
+            continue;
+        }
+
+        if (code <= 0xFFFF) {
+            char buf[6];
+            buf[0] = '%';
+            buf[1] = 'u';
+            buf[2] = hex[(code >> 12) & 0xF];
+            buf[3] = hex[(code >> 8) & 0xF];
+            buf[4] = hex[(code >> 4) & 0xF];
+            buf[5] = hex[code & 0xF];
+            if (!ps_char_buffer_append(&b, buf, sizeof(buf))) {
+                ps_char_buffer_free(&b);
+                return ps_value_undefined();
+            }
+            continue;
+        }
+
+        uint32_t cp = code - 0x10000;
+        uint32_t high = 0xD800 + (cp >> 10);
+        uint32_t low = 0xDC00 + (cp & 0x3FF);
+        char buf[6];
+        buf[0] = '%';
+        buf[1] = 'u';
+        buf[2] = hex[(high >> 12) & 0xF];
+        buf[3] = hex[(high >> 8) & 0xF];
+        buf[4] = hex[(high >> 4) & 0xF];
+        buf[5] = hex[high & 0xF];
+        if (!ps_char_buffer_append(&b, buf, sizeof(buf))) {
+            ps_char_buffer_free(&b);
+            return ps_value_undefined();
+        }
+        buf[2] = hex[(low >> 12) & 0xF];
+        buf[3] = hex[(low >> 8) & 0xF];
+        buf[4] = hex[(low >> 4) & 0xF];
+        buf[5] = hex[low & 0xF];
+        if (!ps_char_buffer_append(&b, buf, sizeof(buf))) {
+            ps_char_buffer_free(&b);
+            return ps_value_undefined();
+        }
+    }
+
+    PSString *out = ps_string_from_utf8(b.data ? b.data : "", b.len);
+    ps_char_buffer_free(&b);
+    return ps_value_string(out);
+}
+
+static PSValue ps_native_unescape(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    PSString *s = (argc > 0) ? ps_to_string(vm, argv[0]) : ps_string_from_cstr("");
+    if (!s || s->byte_len == 0) {
+        return ps_value_string(ps_string_from_cstr(""));
+    }
+
+    PSCharBuffer b;
+    ps_char_buffer_init(&b);
+    size_t i = 0;
+    while (i < s->byte_len) {
+        unsigned char c = (unsigned char)s->utf8[i];
+        if (c == '%' && i + 1 < s->byte_len) {
+            if (s->utf8[i + 1] == 'u' && i + 5 < s->byte_len) {
+                int h1 = ps_hex_value_local((unsigned char)s->utf8[i + 2]);
+                int h2 = ps_hex_value_local((unsigned char)s->utf8[i + 3]);
+                int h3 = ps_hex_value_local((unsigned char)s->utf8[i + 4]);
+                int h4 = ps_hex_value_local((unsigned char)s->utf8[i + 5]);
+                if (h1 >= 0 && h2 >= 0 && h3 >= 0 && h4 >= 0) {
+                    uint32_t code = (uint32_t)((h1 << 12) | (h2 << 8) | (h3 << 4) | h4);
+                    i += 6;
+                    if (code >= 0xD800 && code <= 0xDBFF &&
+                        i + 5 < s->byte_len &&
+                        s->utf8[i] == '%' && s->utf8[i + 1] == 'u') {
+                        int l1 = ps_hex_value_local((unsigned char)s->utf8[i + 2]);
+                        int l2 = ps_hex_value_local((unsigned char)s->utf8[i + 3]);
+                        int l3 = ps_hex_value_local((unsigned char)s->utf8[i + 4]);
+                        int l4 = ps_hex_value_local((unsigned char)s->utf8[i + 5]);
+                        if (l1 >= 0 && l2 >= 0 && l3 >= 0 && l4 >= 0) {
+                            uint32_t low = (uint32_t)((l1 << 12) | (l2 << 8) | (l3 << 4) | l4);
+                            if (low >= 0xDC00 && low <= 0xDFFF) {
+                                uint32_t cp = ((code - 0xD800) << 10) + (low - 0xDC00) + 0x10000;
+                                char utf8[4];
+                                size_t bytes = ps_utf8_encode(cp, utf8);
+                                if (!ps_char_buffer_append(&b, utf8, bytes)) {
+                                    ps_char_buffer_free(&b);
+                                    return ps_value_undefined();
+                                }
+                                i += 6;
+                                continue;
+                            }
+                        }
+                    }
+                    char utf8[4];
+                    size_t bytes = ps_utf8_encode(code, utf8);
+                    if (!ps_char_buffer_append(&b, utf8, bytes)) {
+                        ps_char_buffer_free(&b);
+                        return ps_value_undefined();
+                    }
+                    continue;
+                }
+            } else if (i + 2 < s->byte_len) {
+                int h1 = ps_hex_value_local((unsigned char)s->utf8[i + 1]);
+                int h2 = ps_hex_value_local((unsigned char)s->utf8[i + 2]);
+                if (h1 >= 0 && h2 >= 0) {
+                    uint32_t code = (uint32_t)((h1 << 4) | h2);
+                    if (code <= 0x7F) {
+                        char byte = (char)code;
+                        if (!ps_char_buffer_append(&b, &byte, 1)) {
+                            ps_char_buffer_free(&b);
+                            return ps_value_undefined();
+                        }
+                    } else {
+                        char utf8[4];
+                        size_t bytes = ps_utf8_encode(code, utf8);
+                        if (!ps_char_buffer_append(&b, utf8, bytes)) {
+                            ps_char_buffer_free(&b);
+                            return ps_value_undefined();
+                        }
+                    }
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        if (!ps_char_buffer_append_char(&b, (char)c)) {
+            ps_char_buffer_free(&b);
+            return ps_value_undefined();
+        }
+        i++;
+    }
+
+    PSString *out = ps_string_from_utf8(b.data ? b.data : "", b.len);
+    ps_char_buffer_free(&b);
+    return ps_value_string(out);
 }
 
 static PSValue ps_native_array(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
@@ -963,6 +1309,33 @@ static const PSCaseFoldPair ps_casefold_pairs[] = {
     {0x016A, 0x016B}, {0x016C, 0x016D}, {0x016E, 0x016F}, {0x0170, 0x0171},
     {0x0172, 0x0173}, {0x0174, 0x0175}, {0x0176, 0x0177}, {0x0179, 0x017A},
     {0x017B, 0x017C}, {0x017D, 0x017E},
+
+    {0x0181, 0x0253}, {0x0182, 0x0183}, {0x0184, 0x0185}, {0x0186, 0x0254},
+    {0x0187, 0x0188}, {0x0189, 0x0256}, {0x018A, 0x0257}, {0x018B, 0x018C},
+    {0x018E, 0x01DD}, {0x018F, 0x0259}, {0x0190, 0x025B}, {0x0191, 0x0192},
+    {0x0193, 0x0260}, {0x0194, 0x0263}, {0x0196, 0x0269}, {0x0197, 0x0268},
+    {0x0198, 0x0199}, {0x019C, 0x026F}, {0x019D, 0x0272}, {0x019F, 0x0275},
+    {0x01A0, 0x01A1}, {0x01A2, 0x01A3}, {0x01A4, 0x01A5}, {0x01A6, 0x0280},
+    {0x01A7, 0x01A8}, {0x01A9, 0x0283}, {0x01AC, 0x01AD}, {0x01AE, 0x0288},
+    {0x01AF, 0x01B0}, {0x01B1, 0x028A}, {0x01B2, 0x028B}, {0x01B3, 0x01B4},
+    {0x01B5, 0x01B6}, {0x01B7, 0x0292}, {0x01B8, 0x01B9}, {0x01BC, 0x01BD},
+    {0x01C4, 0x01C6}, {0x01C7, 0x01C9}, {0x01CA, 0x01CC}, {0x01CD, 0x01CE},
+    {0x01CF, 0x01D0}, {0x01D1, 0x01D2}, {0x01D3, 0x01D4}, {0x01D5, 0x01D6},
+    {0x01D7, 0x01D8}, {0x01D9, 0x01DA}, {0x01DB, 0x01DC}, {0x01DE, 0x01DF},
+    {0x01E0, 0x01E1}, {0x01E2, 0x01E3}, {0x01E4, 0x01E5}, {0x01E6, 0x01E7},
+    {0x01E8, 0x01E9}, {0x01EA, 0x01EB}, {0x01EC, 0x01ED}, {0x01EE, 0x01EF},
+    {0x01F1, 0x01F3}, {0x01F4, 0x01F5}, {0x01F6, 0x0195}, {0x01F7, 0x01BF},
+    {0x01F8, 0x01F9}, {0x01FA, 0x01FB}, {0x01FC, 0x01FD}, {0x01FE, 0x01FF},
+    {0x0200, 0x0201}, {0x0202, 0x0203}, {0x0204, 0x0205}, {0x0206, 0x0207},
+    {0x0208, 0x0209}, {0x020A, 0x020B}, {0x020C, 0x020D}, {0x020E, 0x020F},
+    {0x0210, 0x0211}, {0x0212, 0x0213}, {0x0214, 0x0215}, {0x0216, 0x0217},
+    {0x0218, 0x0219}, {0x021A, 0x021B}, {0x021C, 0x021D}, {0x021E, 0x021F},
+    {0x0220, 0x019E}, {0x0222, 0x0223}, {0x0224, 0x0225}, {0x0226, 0x0227},
+    {0x0228, 0x0229}, {0x022A, 0x022B}, {0x022C, 0x022D}, {0x022E, 0x022F},
+    {0x0230, 0x0231}, {0x0232, 0x0233}, {0x023A, 0x2C65}, {0x023B, 0x023C},
+    {0x023D, 0x019A}, {0x023E, 0x2C66}, {0x0241, 0x0242}, {0x0243, 0x0180},
+    {0x0244, 0x0289}, {0x0245, 0x028C}, {0x0246, 0x0247}, {0x0248, 0x0249},
+    {0x024A, 0x024B}, {0x024C, 0x024D}, {0x024E, 0x024F},
 
     {0x0391, 0x03B1}, {0x0392, 0x03B2}, {0x0393, 0x03B3}, {0x0394, 0x03B4},
     {0x0395, 0x03B5}, {0x0396, 0x03B6}, {0x0397, 0x03B7}, {0x0398, 0x03B8},
@@ -5162,6 +5535,66 @@ void ps_vm_init_builtins(PSVM *vm) {
                          ps_string_from_cstr("NaN"),
                          ps_value_number(NAN),
                          PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    }
+
+    PSObject *is_finite_fn = ps_function_new_native(ps_native_is_finite);
+    if (is_finite_fn) {
+        ps_function_setup(is_finite_fn, vm->function_proto, vm->object_proto, NULL);
+        ps_define_function_props(is_finite_fn, "isFinite", 1);
+        ps_object_define(vm->global,
+                         ps_string_from_cstr("isFinite"),
+                         ps_value_object(is_finite_fn),
+                         PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
+    }
+
+    PSObject *is_nan_fn = ps_function_new_native(ps_native_is_nan);
+    if (is_nan_fn) {
+        ps_function_setup(is_nan_fn, vm->function_proto, vm->object_proto, NULL);
+        ps_define_function_props(is_nan_fn, "isNaN", 1);
+        ps_object_define(vm->global,
+                         ps_string_from_cstr("isNaN"),
+                         ps_value_object(is_nan_fn),
+                         PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
+    }
+
+    PSObject *parse_int_fn = ps_function_new_native(ps_native_parse_int);
+    if (parse_int_fn) {
+        ps_function_setup(parse_int_fn, vm->function_proto, vm->object_proto, NULL);
+        ps_define_function_props(parse_int_fn, "parseInt", 2);
+        ps_object_define(vm->global,
+                         ps_string_from_cstr("parseInt"),
+                         ps_value_object(parse_int_fn),
+                         PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
+    }
+
+    PSObject *parse_float_fn = ps_function_new_native(ps_native_parse_float);
+    if (parse_float_fn) {
+        ps_function_setup(parse_float_fn, vm->function_proto, vm->object_proto, NULL);
+        ps_define_function_props(parse_float_fn, "parseFloat", 1);
+        ps_object_define(vm->global,
+                         ps_string_from_cstr("parseFloat"),
+                         ps_value_object(parse_float_fn),
+                         PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
+    }
+
+    PSObject *escape_fn = ps_function_new_native(ps_native_escape);
+    if (escape_fn) {
+        ps_function_setup(escape_fn, vm->function_proto, vm->object_proto, NULL);
+        ps_define_function_props(escape_fn, "escape", 1);
+        ps_object_define(vm->global,
+                         ps_string_from_cstr("escape"),
+                         ps_value_object(escape_fn),
+                         PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
+    }
+
+    PSObject *unescape_fn = ps_function_new_native(ps_native_unescape);
+    if (unescape_fn) {
+        ps_function_setup(unescape_fn, vm->function_proto, vm->object_proto, NULL);
+        ps_define_function_props(unescape_fn, "unescape", 1);
+        ps_object_define(vm->global,
+                         ps_string_from_cstr("unescape"),
+                         ps_value_object(unescape_fn),
+                         PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
     }
 
     PSObject *error_ctor = ps_function_new_native(ps_native_error);

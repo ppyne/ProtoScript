@@ -27,7 +27,7 @@ does not describe every ES1 rule in detail.
 ```
 var if else while do for in of switch case default function return
 break continue with try catch finally throw new true false null typeof
-instanceof void delete include
+this instanceof void delete include
 ```
 
 ---
@@ -90,6 +90,16 @@ Rules:
 
 - `undefined` (read-only)
 - `NaN` (read-only)
+
+### 5.1 Global functions
+
+- `eval(expr)` (compile-time gated by `PS_ENABLE_EVAL`)
+- `isFinite(number)`
+- `isNaN(value)`
+- `parseInt(str, radix)`
+- `parseFloat(str)`
+- `escape(string)`
+- `unescape(string)`
 
 ---
 

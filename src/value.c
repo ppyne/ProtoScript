@@ -83,7 +83,13 @@ struct PSString *ps_value_to_string(const PSValue *v) {
             return ps_string_from_cstr(v->as.boolean ? "true" : "false");
         case PS_T_NUMBER: {
             char buf[64];
-            snprintf(buf, sizeof(buf), "%.15g", v->as.number);
+            if (isnan(v->as.number)) {
+                snprintf(buf, sizeof(buf), "NaN");
+            } else if (isinf(v->as.number)) {
+                snprintf(buf, sizeof(buf), "%sInfinity", v->as.number < 0 ? "-" : "");
+            } else {
+                snprintf(buf, sizeof(buf), "%.15g", v->as.number);
+            }
             return ps_string_from_cstr(buf);
         }
         case PS_T_STRING:

@@ -85,6 +85,8 @@ This index lists core **ProtoScript language concepts**, operators, statements, 
 ## E
 
 - `else` clause (see [Statements](statements.md#conditional-statements))
+- ES1 compatibility report (see [ProtoScript — ES1 Compatibility Report](../es1-compatibility.md))
+- `escape` function (see [Functions](functions.md#predefined-functions))
 - `eval` function (see [Functions](functions.md#predefined-functions))
 - expressions (see [Expressions and Operators](expressions_and_operators.md#expressions))
 - `Error` object (see [Language Reference](../language_reference.md))
@@ -244,6 +246,7 @@ This index lists core **ProtoScript language concepts**, operators, statements, 
 ## U
 
 - `undefined` (see [Values, Variables, and Literals](values_variables_and_literals.md#values))
+- `unescape` function (see [Functions](functions.md#predefined-functions))
 
 ---
 

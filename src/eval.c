@@ -1623,6 +1623,17 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             return v;
         }
 
+        case AST_THIS: {
+            PSString *name = ps_string_from_cstr("this");
+            int found = 0;
+            PSValue v = ps_env_get(env, name, &found);
+            if (found) return v;
+            if (vm && vm->global) {
+                return ps_value_object(vm->global);
+            }
+            return ps_value_undefined();
+        }
+
         case AST_ASSIGN: {
             PSValue rhs = eval_expression(vm, env, node->as.assign.value, ctl);
             if (ctl->did_throw) return rhs;

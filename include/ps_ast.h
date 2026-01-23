@@ -37,6 +37,7 @@ typedef enum {
 
     /* Expressions */
     AST_IDENTIFIER,
+    AST_THIS,
     AST_LITERAL,
     AST_ASSIGN,
     AST_BINARY,
@@ -324,6 +325,7 @@ PSAstNode *ps_ast_func_expr(PSAstNode *id,
                             PSAstNode *body);
 
 PSAstNode *ps_ast_identifier(const char *name, size_t length);
+PSAstNode *ps_ast_this(void);
 PSAstNode *ps_ast_literal(PSValue value);
 
 PSAstNode *ps_ast_assign(int op, PSAstNode *target, PSAstNode *value);

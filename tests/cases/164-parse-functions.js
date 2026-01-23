@@ -1,0 +1,15 @@
+Io.print(isFinite(10) + "\n");
+Io.print(isFinite("Infinity") + "\n");
+Io.print(isNaN("foo") + "\n");
+Io.print(parseInt("08") + "\n");
+Io.print(parseInt("0x10") + "\n");
+Io.print(parseInt("10", 2) + "\n");
+Io.print(parseInt("zz", 36) + "\n");
+Io.print(parseInt("nope") + "\n");
+Io.print(parseFloat("3.14abc") + "\n");
+Io.print(parseFloat("  -1.5e2foo") + "\n");
+var s = "A B@*_+-./\u00A9\u20AC";
+var e = escape(s);
+Io.print(e + "\n");
+var t = unescape(e);
+Io.print(t.charCodeAt(10) + "," + t.charCodeAt(11) + "\n");

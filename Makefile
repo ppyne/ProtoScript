@@ -1,6 +1,12 @@
 CC ?= cc
 CMAKE ?= /opt/local/bin/cmake
+OPT ?= -O2
 CFLAGS ?= -std=c99 -Wall -Wextra -Iinclude
+ifeq ($(strip $(OPT)),)
+  CFLAGS +=
+else
+  CFLAGS += $(OPT)
+endif
 LDLIBS ?=
 PS_ENABLE_MODULE_DISPLAY ?= 1
 export PATH := /opt/local/bin:$(PATH)

@@ -1300,6 +1300,10 @@ static PSAstNode *parse_primary_atom(PSParser *p) {
         return parse_identifier_token(tok);
     }
 
+    if (match(p, TOK_THIS)) {
+        return set_pos(ps_ast_this(), tok);
+    }
+
     /* number literal */
     if (match(p, TOK_NUMBER)) {
         return set_pos(ps_ast_literal(ps_value_number(tok.number)), tok);

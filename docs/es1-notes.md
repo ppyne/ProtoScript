@@ -14,9 +14,9 @@ ProtoScript uses UTF-8 with glyph-based length and indexing:
 ## 2. RegExp ignoreCase
 
 `ignoreCase` uses a static one-to-one case-folding table (ASCII + Latin-1 +
-Latin Extended-A + basic Greek + basic Cyrillic) plus special-case folds
-(final sigma, long s, Kelvin sign, Angstrom sign, sharp s). It does not
-support full Unicode case-folding or multi-character folds.
+Latin Extended-A + Latin Extended-B + basic Greek + basic Cyrillic) plus
+special-case folds (final sigma, long s, Kelvin sign, Angstrom sign, sharp s).
+It does not support full Unicode case-folding or multi-character folds.
 
 ## 3. Arguments aliasing default
 

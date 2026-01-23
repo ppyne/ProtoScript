@@ -13,6 +13,8 @@ This document is the **main table of contents** for the ProtoScript documentatio
 - [ProtoScript and the ECMA Specification (historical context)](execution_model.md#compatibility-scope)
 - [Garbage collection](execution_model.md#garbage-collection)
 
+### [Appendix — ES1 Compatibility Report](../es1-compatibility.md)
+
 ### [Chapter 2 — Values, Variables, and Literals](values_variables_and_literals.md)
 - [Values](values_variables_and_literals.md#values)
   - [Data type conversion](values_variables_and_literals.md#data-type-conversion)

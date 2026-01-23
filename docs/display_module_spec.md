@@ -162,7 +162,7 @@ Returns the logical framebuffer as a `Buffer` for direct pixel manipulation.
 
 ---
 
-### 4.10 `Display.blitRGBA(buffer, srcW, srcH, dstX, dstY)`
+### 4.10 `Display.blitRGBA(buffer, srcW, srcH, dstX, dstY, destW?, destH?)`
 
 Copies an RGBA8 buffer into the logical framebuffer.
 
@@ -171,12 +171,14 @@ Copies an RGBA8 buffer into the logical framebuffer.
 - `buffer` (`Buffer`): source RGBA data
 - `srcW`, `srcH` (number): source dimensions in pixels
 - `dstX`, `dstY` (number): destination top-left in the framebuffer
+- `destW`, `destH` (number, optional): maximum size to write in the destination
 
 **Semantics:**
 
 - Pixel format: RGBA 8-bit (4 bytes per pixel)
 - Source buffer length must be at least `srcW * srcH * 4`
 - The blit is clipped to the framebuffer bounds
+- If `destW`/`destH` are provided, the blit is limited to that size
 - Negative `dstX`/`dstY` are allowed (source is clipped accordingly)
 
 ---

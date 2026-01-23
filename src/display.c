@@ -633,12 +633,12 @@ static PSValue ps_native_display_blit_rgba(PSVM *vm, PSValue this_val, int argc,
     (void)this_val;
     if (!display_require_open(vm)) return ps_value_undefined();
     if (argc < 5) {
-        ps_vm_throw_type_error(vm, "Display.blitRGBA expects (buffer, srcW, srcH, dstX, dstY)");
+        ps_vm_throw_type_error(vm, "Display.blitRGBA expects (buffer, srcW, srcH, dstX, dstY, destW?, destH?)");
         return ps_value_undefined();
     }
     if (argv[0].type != PS_T_OBJECT || !argv[0].as.object ||
         argv[0].as.object->kind != PS_OBJ_KIND_BUFFER) {
-        ps_vm_throw_type_error(vm, "Display.blitRGBA expects (buffer, srcW, srcH, dstX, dstY)");
+        ps_vm_throw_type_error(vm, "Display.blitRGBA expects (buffer, srcW, srcH, dstX, dstY, destW?, destH?)");
         return ps_value_undefined();
     }
     PSDisplay *d = display_state(vm);
@@ -658,6 +658,15 @@ static PSValue ps_native_display_blit_rgba(PSVM *vm, PSValue this_val, int argc,
     if (!display_parse_coord(vm, argv[3], &dst_x) ||
         !display_parse_coord(vm, argv[4], &dst_y)) {
         return ps_value_undefined();
+    }
+
+    int dest_w = 0;
+    int dest_h = 0;
+    if (argc >= 7) {
+        if (!display_parse_size(vm, argv[5], &dest_w) ||
+            !display_parse_size(vm, argv[6], &dest_h)) {
+            return ps_value_undefined();
+        }
     }
 
     size_t expected = (size_t)src_w * (size_t)src_h * 4u;
@@ -687,6 +696,8 @@ static PSValue ps_native_display_blit_rgba(PSVM *vm, PSValue this_val, int argc,
     if (dst_y + copy_h > d->logical_height) {
         copy_h = d->logical_height - dst_y;
     }
+    if (dest_w > 0 && dest_w < copy_w) copy_w = dest_w;
+    if (dest_h > 0 && dest_h < copy_h) copy_h = dest_h;
     if (copy_w <= 0 || copy_h <= 0) return ps_value_undefined();
 
     size_t row_bytes = (size_t)copy_w * 4u;

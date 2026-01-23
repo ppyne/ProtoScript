@@ -10,7 +10,6 @@ This document is the **main table of contents** for the ProtoScript documentatio
 
 ### [Chapter 1 — Introduction to ProtoScript](execution_model.md)
 - [What Is ProtoScript?](execution_model.md#running-a-protoscript-program)
-- [ProtoScript and Java](execution_model.md#compatibility-scope)
 - [ProtoScript and the ECMA Specification (historical context)](execution_model.md#compatibility-scope)
 - [Garbage collection](execution_model.md#garbage-collection)
 

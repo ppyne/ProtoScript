@@ -168,7 +168,7 @@ Semantics:
 Returns:
 - `Buffer`
 
-### Display.blitRGBA(buffer, srcW, srcH, dstX, dstY)
+### Display.blitRGBA(buffer, srcW, srcH, dstX, dstY, destW?, destH?)
 
 Copies an RGBA8 buffer into the logical framebuffer.
 
@@ -176,10 +176,12 @@ Parameters:
 - `buffer` (`Buffer`): source RGBA data
 - `srcW`, `srcH` (number): source dimensions in pixels
 - `dstX`, `dstY` (number): destination top-left in the framebuffer
+- `destW`, `destH` (number, optional): maximum size to write in the destination
 
 Notes:
 - The copy is clipped to the framebuffer bounds.
 - Negative `dstX`/`dstY` values are allowed (source is clipped accordingly).
+- If `destW`/`destH` are provided, the copy is limited to that size.
 
 ### Display.present()
 

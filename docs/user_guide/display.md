@@ -1,3 +1,5 @@
+![ProtoScript](../../header.png)
+
 # ProtoScript — Display Module
 
 This chapter documents the Display module and how to enable it at build time.

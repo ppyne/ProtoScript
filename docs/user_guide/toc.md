@@ -139,3 +139,4 @@ This document is the **main table of contents** for the ProtoScript documentatio
 
 - [ProtoScript Glossary](glossary.md)
 - [Index](index.md)
+- [Frequently Asked Questions (FAQ)](faq.md)

@@ -1,3 +1,5 @@
+![ProtoScript](../../header.png)
+
 # ProtoScript – Frequently Asked Questions
 
 **How to get much time in milliseconds has passed since 00:00:00 UTC on 1 January 1970?**

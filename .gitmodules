@@ -4,6 +4,8 @@
 [submodule "third_party/libpng"]
 	path = third_party/libpng
 	url = https://github.com/glennrp/libpng.git
+	ignore = untracked
 [submodule "third_party/libjpeg"]
 	path = third_party/libjpeg
 	url = https://github.com/libjpeg-turbo/libjpeg-turbo.git
+	ignore = untracked

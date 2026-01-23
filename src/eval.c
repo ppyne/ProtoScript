@@ -82,7 +82,7 @@ static PSValue ps_eval_source(PSVM *vm, PSEnv *env, PSString *source, PSEvalCont
     memcpy(buf, source->utf8, source->byte_len);
     buf[source->byte_len] = '\0';
 
-    PSAstNode *program = ps_parse(buf);
+    PSAstNode *program = ps_parse_with_path(buf, NULL);
     free(buf);
     if (!program) {
         ctl->did_throw = 1;

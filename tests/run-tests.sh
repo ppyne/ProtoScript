@@ -200,3 +200,4 @@ run_case 142-buffer-basic 0
 run_case 143-io-binary 0
 run_case 144-io-binary-edge 0
 run_case 145-event-empty 0
+run_case 146-include-basic 0

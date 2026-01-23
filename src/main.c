@@ -93,7 +93,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    PSAstNode *program = ps_parse(source);
+    const char *source_path = NULL;
+    if (argc >= 2 && strcmp(argv[1], "-") != 0) {
+        source_path = argv[1];
+    }
+    PSAstNode *program = ps_parse_with_path(source, source_path);
     if (!program) {
         ps_vm_free(vm);
         free(source);

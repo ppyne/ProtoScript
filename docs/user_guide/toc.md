@@ -124,9 +124,9 @@ This document is the **main table of contents** for the ProtoScript documentatio
 
 ## Graphics and Events
 
-### [Chapter 9 — Display Module (v1.3)](display.md)
+### [Chapter 9 — Display Module](display.md)
 - [Availability and Build Options](display.md#availability-and-build-options)
-- [API Reference (v1.3)](display.md#api-reference-v13)
+- [API Reference](display.md#api-reference-v13)
 - [Resize and Scaling Semantics](display.md#resize-and-scaling-semantics)
 - [Events](display.md#events)
 - [Example](display.md#example)

@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <setjmp.h>
 
 /* --------------------------------------------------------- */
@@ -16,7 +17,16 @@
 typedef struct {
     PSLexer  lexer;
     PSToken current;
+    const char *source_path;
+    struct PSIncludeStack *include_stack;
+    int context_level;
+    int saw_non_include;
 } PSParser;
+
+typedef struct PSIncludeStack {
+    char **paths;
+    size_t count;
+} PSIncludeStack;
 
 static jmp_buf *g_parse_jmp = NULL;
 static PSParser *g_parse_parser = NULL;
@@ -124,6 +134,151 @@ static size_t append_utf8(char *buf, size_t pos, uint32_t codepoint) {
         buf[pos++] = (char)(0x80 | (codepoint & 0x3F));
     }
     return pos;
+}
+
+static char *string_to_cstr(PSString *s) {
+    if (!s) return NULL;
+    if (memchr(s->utf8, '\0', s->byte_len)) {
+        return NULL;
+    }
+    char *out = (char *)malloc(s->byte_len + 1);
+    if (!out) return NULL;
+    memcpy(out, s->utf8, s->byte_len);
+    out[s->byte_len] = '\0';
+    return out;
+}
+
+static int is_absolute_path(const char *path) {
+    if (!path || !path[0]) return 0;
+    if (path[0] == '/') return 1;
+    if (path[0] == '\\' && path[1] == '\\') return 1;
+    if (isalpha((unsigned char)path[0]) && path[1] == ':') return 1;
+    return 0;
+}
+
+static int has_js_extension(const char *path) {
+    if (!path) return 0;
+    size_t len = strlen(path);
+    return len >= 3 && strcmp(path + len - 3, ".js") == 0;
+}
+
+static char *resolve_include_path(const char *base_path, const char *include_path) {
+    if (!include_path) return NULL;
+    if (is_absolute_path(include_path)) {
+        return strdup(include_path);
+    }
+    if (!base_path) {
+        return NULL;
+    }
+    const char *slash = strrchr(base_path, '/');
+    const char *bslash = strrchr(base_path, '\\');
+    const char *sep = slash;
+    if (bslash && (!sep || bslash > sep)) sep = bslash;
+    size_t dir_len = sep ? (size_t)(sep - base_path) : 0;
+    size_t inc_len = strlen(include_path);
+    size_t out_len = dir_len + (dir_len ? 1 : 0) + inc_len;
+    char *out = (char *)malloc(out_len + 1);
+    if (!out) return NULL;
+    if (dir_len) {
+        memcpy(out, base_path, dir_len);
+        out[dir_len] = '/';
+        memcpy(out + dir_len + 1, include_path, inc_len);
+    } else {
+        memcpy(out, include_path, inc_len);
+    }
+    out[out_len] = '\0';
+    return out;
+}
+
+static int include_stack_contains(PSIncludeStack *stack, const char *path, size_t *index) {
+    if (!stack || !path) return 0;
+    for (size_t i = 0; i < stack->count; i++) {
+        if (strcmp(stack->paths[i], path) == 0) {
+            if (index) *index = i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void include_stack_push(PSIncludeStack *stack, const char *path) {
+    if (!stack || !path) return;
+    char **next = (char **)realloc(stack->paths, sizeof(char *) * (stack->count + 1));
+    if (!next) {
+        parse_error("Parse error: out of memory");
+    }
+    stack->paths = next;
+    stack->paths[stack->count] = strdup(path);
+    if (!stack->paths[stack->count]) {
+        parse_error("Parse error: out of memory");
+    }
+    stack->count++;
+}
+
+static void include_stack_pop(PSIncludeStack *stack) {
+    if (!stack || stack->count == 0) return;
+    free(stack->paths[stack->count - 1]);
+    stack->count--;
+}
+
+static void include_cycle_error(PSIncludeStack *stack, const char *path) {
+    if (!stack || !path) {
+        parse_error("Include cycle detected");
+        return;
+    }
+    size_t idx = 0;
+    include_stack_contains(stack, path, &idx);
+    size_t total = 0;
+    for (size_t i = idx; i < stack->count; i++) {
+        total += strlen(stack->paths[i]) + 4;
+    }
+    total += strlen(path) + 1;
+    char *msg = (char *)malloc(total + 32);
+    if (!msg) {
+        parse_error("Include cycle detected");
+        return;
+    }
+    strcpy(msg, "Include cycle detected: ");
+    size_t pos = strlen(msg);
+    for (size_t i = idx; i < stack->count; i++) {
+        size_t len = strlen(stack->paths[i]);
+        memcpy(msg + pos, stack->paths[i], len);
+        pos += len;
+        memcpy(msg + pos, " -> ", 4);
+        pos += 4;
+    }
+    {
+        size_t len = strlen(path);
+        memcpy(msg + pos, path, len);
+        pos += len;
+    }
+    msg[pos] = '\0';
+    parse_error(msg);
+}
+
+static char *read_file(const char *path, size_t *out_len) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    long size = ftell(fp);
+    if (size < 0) {
+        fclose(fp);
+        return NULL;
+    }
+    rewind(fp);
+    char *buf = (char *)malloc((size_t)size + 1);
+    if (!buf) {
+        fclose(fp);
+        return NULL;
+    }
+    size_t read = fread(buf, 1, (size_t)size, fp);
+    fclose(fp);
+    buf[read] = '\0';
+    if (out_len) *out_len = read;
+    return buf;
 }
 
 static char *decode_identifier(const char *start, size_t len, size_t *out_len, size_t line, size_t column) {
@@ -273,6 +428,7 @@ static PSString *parse_string_literal(const char *start, size_t len) {
 /* --------------------------------------------------------- */
 
 static PSAstNode *parse_statement(PSParser *p);
+static PSAstNode *parse_statement_nested(PSParser *p);
 static PSAstNode *parse_expression(PSParser *p);
 static PSAstNode *parse_var_decl_list(PSParser *p);
 static PSAstNode *parse_comma(PSParser *p);
@@ -299,21 +455,35 @@ static PSAstNode *parse_member_base(PSParser *p);
 static PSAstNode *parse_member(PSParser *p);
 static PSAstNode *parse_block(PSParser *p, PSToken start_tok);
 static PSAstNode *parse_switch(PSParser *p, PSToken switch_tok);
+static PSAstNode *parse_include_statement(PSParser *p, PSToken include_tok);
 
 /* --------------------------------------------------------- */
 /* Entry point                                               */
 /* --------------------------------------------------------- */
 
-PSAstNode *ps_parse(const char *source) {
+static PSAstNode *parse_source_with_path(const char *source, const char *path, PSIncludeStack *stack) {
     PSParser p;
     ps_lexer_init(&p.lexer, source);
+    p.source_path = path;
+    p.include_stack = stack;
+    p.context_level = 0;
+    p.saw_non_include = 0;
+    int pushed = 0;
     jmp_buf jmp_env;
     g_parse_jmp = &jmp_env;
     g_parse_parser = &p;
     if (setjmp(jmp_env) != 0) {
+        if (pushed) {
+            include_stack_pop(stack);
+        }
         g_parse_jmp = NULL;
         g_parse_parser = NULL;
         return NULL;
+    }
+
+    if (path && stack) {
+        include_stack_push(stack, path);
+        pushed = 1;
     }
 
     advance(&p);
@@ -326,9 +496,27 @@ PSAstNode *ps_parse(const char *source) {
         items[count++] = parse_statement(&p);
     }
 
+    if (pushed) {
+        include_stack_pop(stack);
+    }
+
     g_parse_jmp = NULL;
     g_parse_parser = NULL;
     return ps_ast_program(items, count);
+}
+
+PSAstNode *ps_parse_with_path(const char *source, const char *path) {
+    PSIncludeStack stack = {0};
+    PSAstNode *node = parse_source_with_path(source, path, &stack);
+    for (size_t i = 0; i < stack.count; i++) {
+        free(stack.paths[i]);
+    }
+    free(stack.paths);
+    return node;
+}
+
+PSAstNode *ps_parse(const char *source) {
+    return ps_parse_with_path(source, NULL);
 }
 
 /* --------------------------------------------------------- */
@@ -366,6 +554,27 @@ static PSAstNode *parse_var_decl_list(PSParser *p) {
 }
 
 static PSAstNode *parse_statement(PSParser *p) {
+    int is_top_level = (p->context_level == 0);
+
+    /* include directive */
+    if (p->current.type == TOK_INCLUDE) {
+        PSToken tok = p->current;
+        if (!is_top_level) {
+            parse_error_at(tok.line, tok.column, "Parse error: include is only allowed at top level");
+        }
+        if (p->saw_non_include) {
+            parse_error_at(tok.line, tok.column, "Parse error: include must appear before any statements");
+        }
+        advance(p);
+        PSAstNode *node = parse_include_statement(p, tok);
+        expect(p, TOK_SEMI, "';'");
+        return node;
+    }
+
+    if (is_top_level) {
+        p->saw_non_include = 1;
+    }
+
     /* label */
     if (p->current.type == TOK_IDENTIFIER) {
         PSParser saved = *p;
@@ -373,7 +582,7 @@ static PSAstNode *parse_statement(PSParser *p) {
         advance(p);
         if (match(p, TOK_COLON)) {
             PSAstNode *label_node = parse_identifier_token(label);
-            PSAstNode *stmt = parse_statement(p);
+            PSAstNode *stmt = parse_statement_nested(p);
             switch (stmt->kind) {
                 case AST_WHILE:
                     stmt->as.while_stmt.label = label_node;
@@ -414,6 +623,15 @@ static PSAstNode *parse_statement(PSParser *p) {
         PSAstNode *decls = parse_var_decl_list(p);
         expect(p, TOK_SEMI, "';'");
         return set_pos(decls, tok);
+    }
+
+    /* include directive */
+    if (p->current.type == TOK_INCLUDE) {
+        PSToken tok = p->current;
+        advance(p);
+        PSAstNode *node = parse_include_statement(p, tok);
+        expect(p, TOK_SEMI, "';'");
+        return node;
     }
 
     /* function declaration */
@@ -457,10 +675,10 @@ static PSAstNode *parse_statement(PSParser *p) {
         expect(p, TOK_LPAREN, "'('");
         PSAstNode *cond = parse_expression(p);
         expect(p, TOK_RPAREN, "')'");
-        PSAstNode *then_branch = parse_statement(p);
+        PSAstNode *then_branch = parse_statement_nested(p);
         PSAstNode *else_branch = NULL;
         if (match(p, TOK_ELSE)) {
-            else_branch = parse_statement(p);
+            else_branch = parse_statement_nested(p);
         }
         return set_pos(ps_ast_if(cond, then_branch, else_branch), tok);
     }
@@ -472,7 +690,7 @@ static PSAstNode *parse_statement(PSParser *p) {
         expect(p, TOK_LPAREN, "'('");
         PSAstNode *cond = parse_expression(p);
         expect(p, TOK_RPAREN, "')'");
-        PSAstNode *body = parse_statement(p);
+        PSAstNode *body = parse_statement_nested(p);
         return set_pos(ps_ast_while(cond, body), tok);
     }
 
@@ -480,7 +698,7 @@ static PSAstNode *parse_statement(PSParser *p) {
     if (p->current.type == TOK_DO) {
         PSToken tok = p->current;
         advance(p);
-        PSAstNode *body = parse_statement(p);
+        PSAstNode *body = parse_statement_nested(p);
         expect(p, TOK_WHILE, "'while'");
         expect(p, TOK_LPAREN, "'('");
         PSAstNode *cond = parse_expression(p);
@@ -503,13 +721,13 @@ static PSAstNode *parse_statement(PSParser *p) {
             if (match(p, TOK_IN)) {
                 PSAstNode *obj = parse_expression(p);
                 expect(p, TOK_RPAREN, "')'");
-                PSAstNode *body = parse_statement(p);
+                PSAstNode *body = parse_statement_nested(p);
                 return set_pos(ps_ast_for_in(id_node, obj, body, 1), tok);
             }
             if (match(p, TOK_OF)) {
                 PSAstNode *obj = parse_expression(p);
                 expect(p, TOK_RPAREN, "')'");
-                PSAstNode *body = parse_statement(p);
+                PSAstNode *body = parse_statement_nested(p);
                 return set_pos(ps_ast_for_of(id_node, obj, body, 1), tok);
             }
         } else {
@@ -517,13 +735,13 @@ static PSAstNode *parse_statement(PSParser *p) {
             if (match(p, TOK_IN)) {
                 PSAstNode *obj = parse_expression(p);
                 expect(p, TOK_RPAREN, "')'");
-                PSAstNode *body = parse_statement(p);
+                PSAstNode *body = parse_statement_nested(p);
                 return set_pos(ps_ast_for_in(left, obj, body, 0), tok);
             }
             if (match(p, TOK_OF)) {
                 PSAstNode *obj = parse_expression(p);
                 expect(p, TOK_RPAREN, "')'");
-                PSAstNode *body = parse_statement(p);
+                PSAstNode *body = parse_statement_nested(p);
                 return set_pos(ps_ast_for_of(left, obj, body, 0), tok);
             }
         }
@@ -555,7 +773,7 @@ static PSAstNode *parse_statement(PSParser *p) {
         }
         expect(p, TOK_RPAREN, "')'");
 
-        PSAstNode *body = parse_statement(p);
+        PSAstNode *body = parse_statement_nested(p);
         return set_pos(ps_ast_for(init, test, update, body), tok);
     }
 
@@ -604,7 +822,7 @@ static PSAstNode *parse_statement(PSParser *p) {
         expect(p, TOK_LPAREN, "'('");
         PSAstNode *obj = parse_expression(p);
         expect(p, TOK_RPAREN, "')'");
-        PSAstNode *body = parse_statement(p);
+        PSAstNode *body = parse_statement_nested(p);
         return set_pos(ps_ast_with(obj, body), tok);
     }
 
@@ -669,6 +887,61 @@ static PSAstNode *parse_statement(PSParser *p) {
     PSAstNode *expr = parse_expression(p);
     expect(p, TOK_SEMI, "';'");
     return set_pos_from_node(ps_ast_expr_stmt(expr), expr);
+}
+
+static PSAstNode *parse_statement_nested(PSParser *p) {
+    p->context_level++;
+    PSAstNode *stmt = parse_statement(p);
+    p->context_level--;
+    return stmt;
+}
+
+static PSAstNode *parse_include_statement(PSParser *p, PSToken include_tok) {
+    PSToken str_tok = p->current;
+    expect(p, TOK_STRING, "string literal");
+    PSString *raw = parse_string_literal(str_tok.start, str_tok.length);
+    char *include_path = string_to_cstr(raw);
+    if (!include_path) {
+        parse_error_at(str_tok.line, str_tok.column, "Include error: invalid string literal");
+    }
+    if (!has_js_extension(include_path)) {
+        free(include_path);
+        parse_error_at(str_tok.line, str_tok.column, "Include error: path must end with .js");
+    }
+    char *resolved = resolve_include_path(p->source_path, include_path);
+    if (!resolved) {
+        free(include_path);
+        parse_error_at(str_tok.line, str_tok.column, "Include error: cannot resolve path");
+    }
+    free(include_path);
+
+    PSIncludeStack *stack = p->include_stack;
+    if (stack && include_stack_contains(stack, resolved, NULL)) {
+        include_cycle_error(stack, resolved);
+    }
+
+    struct stat st;
+    if (stat(resolved, &st) != 0 || !S_ISREG(st.st_mode)) {
+        free(resolved);
+        parse_error_at(str_tok.line, str_tok.column, "Include error: file not found");
+    }
+
+    size_t len = 0;
+    char *source = read_file(resolved, &len);
+    if (!source) {
+        free(resolved);
+        parse_error_at(str_tok.line, str_tok.column, "Include error: unable to read file");
+    }
+
+    PSAstNode *program = parse_source_with_path(source, resolved, stack);
+    free(source);
+    free(resolved);
+    if (!program || program->kind != AST_PROGRAM) {
+        return set_pos(ps_ast_block(NULL, 0), include_tok);
+    }
+    PSAstNode *block = ps_ast_block(program->as.list.items, program->as.list.count);
+    free(program);
+    return set_pos(block, include_tok);
 }
 
 /* --------------------------------------------------------- */
@@ -1232,6 +1505,8 @@ static PSAstNode *parse_regex_literal(PSParser *p, PSToken start_tok) {
 static PSAstNode *parse_block(PSParser *p, PSToken start_tok) {
     PSAstNode **items = NULL;
     size_t count = 0;
+    int saved_level = p->context_level;
+    p->context_level++;
 
     while (p->current.type != TOK_RBRACE && p->current.type != TOK_EOF) {
         items = realloc(items, sizeof(PSAstNode *) * (count + 1));
@@ -1239,6 +1514,7 @@ static PSAstNode *parse_block(PSParser *p, PSToken start_tok) {
     }
 
     expect(p, TOK_RBRACE, "'}'");
+    p->context_level = saved_level;
     return set_pos(ps_ast_block(items, count), start_tok);
 }
 
@@ -1264,7 +1540,7 @@ static PSAstNode *parse_switch(PSParser *p, PSToken switch_tok) {
                    p->current.type != TOK_DEFAULT &&
                    p->current.type != TOK_RBRACE) {
                 items = realloc(items, sizeof(PSAstNode *) * (count + 1));
-                items[count++] = parse_statement(p);
+                items[count++] = parse_statement_nested(p);
             }
 
             PSAstNode *case_node = set_pos(ps_ast_case(test, items, count), case_tok);
@@ -1282,7 +1558,7 @@ static PSAstNode *parse_switch(PSParser *p, PSToken switch_tok) {
                    p->current.type != TOK_DEFAULT &&
                    p->current.type != TOK_RBRACE) {
                 items = realloc(items, sizeof(PSAstNode *) * (count + 1));
-                items[count++] = parse_statement(p);
+                items[count++] = parse_statement_nested(p);
             }
 
             PSAstNode *case_node = set_pos(ps_ast_case(test, items, count), case_tok);

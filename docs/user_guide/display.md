@@ -1,4 +1,4 @@
-# ProtoScript — Display Module (v1.3)
+# ProtoScript — Display Module
 
 This chapter documents the Display module and how to enable it at build time.
 
@@ -74,7 +74,7 @@ Only one Display window can exist at a time (v1).
 
 ---
 
-## API Reference (v1.3)
+## API Reference
 
 ### Display.open(width, height, title, options)
 
@@ -203,7 +203,7 @@ Every event object has at least:
 Some events include additional fields (see below). When an event has no extra
 fields, it only contains `type`.
 
-Display-related events (v1.3):
+Display-related events:
 
 ### window_resized
 

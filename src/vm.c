@@ -273,7 +273,7 @@ static PSValue ps_native_function(PSVM *vm, PSValue this_val, int argc, PSValue 
     cursor += strlen(suffix);
     *cursor = '\0';
 
-    PSAstNode *program = ps_parse(source);
+    PSAstNode *program = ps_parse_with_path(source, NULL);
     free(source);
     free(params);
 

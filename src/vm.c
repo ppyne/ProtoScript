@@ -4899,7 +4899,7 @@ PSVM *ps_vm_new(void) {
     ps_gc_init(vm);
     ps_gc_set_active_vm(vm);
 
-    vm->event_capacity = 64;
+    vm->event_capacity = PS_EVENT_QUEUE_CAPACITY;
     vm->event_queue = (PSValue *)calloc(vm->event_capacity, sizeof(PSValue));
     if (!vm->event_queue) {
         ps_gc_destroy(vm);

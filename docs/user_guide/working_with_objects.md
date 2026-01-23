@@ -275,12 +275,21 @@ Core operations:
 - `Io.open(path, mode)` with `"r"`, `"w"`, `"a"`.
 - `Io.read(file)` to read the rest of a file.
 - `Io.readLines(file)` to read lines split on `Io.EOL` (`"\n"`).
+- `Io.readBinary(path)` to read a file into a `Buffer`.
 - `Io.write(file, data)` and `Io.writeLine(file, data)`.
+- `Io.writeBinary(path, buffer)` to write a `Buffer` to a file.
 - `Io.close(file)` to release resources.
 - `Io.print(string)` writes to `Io.stdout` without an implicit newline.
 
 Standard streams:
 - `Io.stdin`, `Io.stdout`, `Io.stderr` are always open and cannot be closed.
+
+Binary I/O uses file paths (not `Io.open` handles):
+
+```js
+var buf = Io.readBinary("logo.bin");
+Io.writeBinary("copy.bin", buf);
+```
 
 ---
 
@@ -308,6 +317,13 @@ var b = Buffer.alloc(4);
 b[0] = 255;
 Io.print(Buffer.size(b) + "\n");
 ```
+
+Buffer operations:
+- `Buffer.alloc(size)` allocates a zeroed buffer.
+- `Buffer.size(buf)` returns the size in bytes.
+- `Buffer.slice(buf, offset, length)` copies a sub-range.
+- `buf[i]` reads a byte; `buf[i] = value` writes a byte (clamped to 0–255).
+- Out-of-range access throws an error.
 
 Buffers are also used for binary I/O and the Display framebuffer.
 

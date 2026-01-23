@@ -151,7 +151,7 @@ Performance characteristics are implementation-defined.
 
 The Buffer module is designed to interoperate with:
 
-- `Io.readBinary` / `Io.writeBinary` (future extension)
+- `Io.readBinary` / `Io.writeBinary`
 - `Display` framebuffer or blitting APIs
 - Other native modules requiring binary data
 
@@ -176,4 +176,3 @@ The Buffer module answers one question:
 > “How do I manipulate raw bytes safely and explicitly?”
 
 Nothing more.
-

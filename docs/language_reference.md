@@ -217,8 +217,10 @@ Object: `Io`
 - `Io.open(path, mode)`
 - `Io.read(file)`
 - `Io.readLines(file)`
+- `Io.readBinary(path)`
 - `Io.write(file, data)`
 - `Io.writeLine(file, data)`
+- `Io.writeBinary(path, buffer)`
 - `Io.close(file)`
 - `Io.tempPath()`
 - `Io.EOL`
@@ -233,8 +235,7 @@ Object: `Gc`
 Object: `Buffer`
 - `Buffer.alloc(size)`
 - `Buffer.size(buffer)`
-- `Buffer.fromString(string)`
-- `Buffer.toString(buffer)`
+- `Buffer.slice(buffer, offset, length)`
 
 ### 7.4 Event
 Object: `Event`

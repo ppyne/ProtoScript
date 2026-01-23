@@ -1,7 +1,9 @@
 #include "ps_ast.h"
 #include "ps_eval.h"
-#include "ps_vm.h"
 #include "ps_parser.h"
+#include "ps_vm.h"
+#include "ps_object.h"
+#include "ps_string.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,6 +71,45 @@ static char *read_stream(FILE *fp, size_t *out_len) {
     return buf;
 }
 
+static void define_protoscript_info(PSVM *vm, int argc, char **argv) {
+    if (!vm || !vm->global) return;
+    PSObject *info = ps_object_new(vm->object_proto);
+    if (!info) return;
+
+    PSObject *args = ps_object_new(vm->array_proto ? vm->array_proto : vm->object_proto);
+    if (args) {
+        args->kind = PS_OBJ_KIND_ARRAY;
+        for (int i = 0; i < argc; i++) {
+            char idx_buf[32];
+            snprintf(idx_buf, sizeof(idx_buf), "%d", i);
+            ps_object_define(args,
+                             ps_string_from_cstr(idx_buf),
+                             ps_value_string(ps_string_from_cstr(argv[i] ? argv[i] : "")),
+                             PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+        }
+        ps_object_define(args,
+                         ps_string_from_cstr("length"),
+                         ps_value_number((double)argc),
+                         PS_ATTR_READONLY | PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
+    }
+
+    if (args) {
+        ps_object_define(info,
+                         ps_string_from_cstr("args"),
+                         ps_value_object(args),
+                         PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    }
+    ps_object_define(info,
+                     ps_string_from_cstr("version"),
+                     ps_value_string(ps_string_from_cstr("v1.0.0 ECMAScript 262 (ES1)")),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+
+    ps_object_define(vm->global,
+                     ps_string_from_cstr("ProtoScript"),
+                     ps_value_object(info),
+                     PS_ATTR_NONE);
+}
+
 int main(int argc, char **argv) {
     size_t source_len = 0;
     char *source = NULL;
@@ -92,6 +133,8 @@ int main(int argc, char **argv) {
         free(source);
         return 1;
     }
+
+    define_protoscript_info(vm, argc, argv);
 
     const char *source_path = NULL;
     if (argc >= 2 && strcmp(argv[1], "-") != 0) {

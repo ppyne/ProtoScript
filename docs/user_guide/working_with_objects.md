@@ -393,6 +393,7 @@ Operations:
 - `Fs.mv(source, destination)`
 - `Fs.pathInfo(path)`
 - `Fs.pwd()`
+- `Fs.cd(path)`
 - `Fs.rmdir(path)`
 - `Fs.rm(path)`
 
@@ -472,6 +473,8 @@ for (info in infos) Io.print(info + ': ' + infos[info] + Io.EOL);
 
 ```js
 Fs.pwd();
+
+Fs.cd("tmp");
 ```
 
 ```js

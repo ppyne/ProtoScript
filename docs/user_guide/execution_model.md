@@ -67,6 +67,18 @@ Top-level `var` and function declarations are hoisted, so they are visible
 throughout the script even before the declaration is reached (with the usual
 JavaScript 1.x initialization rules).
 
+ProtoScript also exposes a global `ProtoScript` object with runtime metadata:
+
+- `ProtoScript.args`: readonly array of command-line arguments (`argv`)
+- `ProtoScript.version`: `"v1.0.0 ECMAScript 262 (ES1)"`
+
+Example:
+
+```js
+Io.print(ProtoScript.version + "\n");
+Io.print(ProtoScript.args.length + "\n");
+```
+
 ---
 
 ## Input and Output

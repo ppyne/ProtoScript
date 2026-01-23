@@ -208,6 +208,13 @@ run_case 150-io-eof 0
 run_case 151-io-bom 0
 run_case 152-array-elision 0
 run_case 153-io-sprintf 0
+run_case 154-binary-literals 0
+run_case 156-protoscript-info 0
+
+display_enabled=$(awk '/^#define PS_ENABLE_MODULE_DISPLAY/ {print $3}' include/ps_config.h)
+if [ "${display_enabled:-0}" -eq 1 ]; then
+    run_case 155-display-blit-limit 0
+fi
 
 fs_enabled=$(awk '/^#define PS_ENABLE_MODULE_FS/ {print $3}' include/ps_config.h)
 if [ "${fs_enabled:-0}" -eq 1 ]; then
@@ -237,6 +244,7 @@ if [ "${fs_enabled:-0}" -eq 1 ]; then
 
     run_case 160-fs-basic 0
     run_case 161-fs-edge 0
+    run_case 162-fs-cd 0
 else
     run_case 159-fs-disabled 1
 fi

@@ -216,6 +216,11 @@ Constructors:
 
 ## 7. Host extensions
 
+### 7.0 ProtoScript
+Object: `ProtoScript`
+- `ProtoScript.args`
+- `ProtoScript.version`
+
 ### 7.1 Io
 Object: `Io`
 - `Io.print(value)`
@@ -249,6 +254,7 @@ Object: `Fs`
 - `Fs.mv(source, destination)`
 - `Fs.pathInfo(path)`
 - `Fs.pwd()`
+- `Fs.cd(path)`
 - `Fs.rmdir(path)`
 - `Fs.rm(path)`
 

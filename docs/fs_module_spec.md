@@ -395,6 +395,25 @@ Fs.pwd();
 
 ---
 
+## Fs.cd(path) : bool
+
+### Description
+Changes the current working directory.
+
+### Parameters
+- **path**: string — directory path.
+
+### Return Value
+- `true` on success.
+- `false` on failure.
+
+### Example
+```js
+Fs.cd("tmp");
+```
+
+---
+
 ## Fs.rmdir(path) : bool
 
 ### Description

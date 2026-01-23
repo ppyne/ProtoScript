@@ -330,6 +330,17 @@ static PSValue ps_native_fs_pwd(PSVM *vm, PSValue this_val, int argc, PSValue *a
     return out;
 }
 
+static PSValue ps_native_fs_cd(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)vm;
+    (void)this_val;
+    if (argc < 1) return ps_value_boolean(0);
+    char *path = fs_value_to_cstr(argv[0]);
+    if (!path) return ps_value_boolean(0);
+    int ok = (chdir(path) == 0);
+    free(path);
+    return ps_value_boolean(ok);
+}
+
 static PSValue ps_native_fs_path_info(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
     (void)vm;
     (void)this_val;
@@ -579,6 +590,7 @@ void ps_fs_init(PSVM *vm) {
     PSObject *mkdir_fn = ps_function_new_native(ps_native_fs_mkdir);
     PSObject *mv_fn = ps_function_new_native(ps_native_fs_mv);
     PSObject *path_info_fn = ps_function_new_native(ps_native_fs_path_info);
+    PSObject *cd_fn = ps_function_new_native(ps_native_fs_cd);
     PSObject *pwd_fn = ps_function_new_native(ps_native_fs_pwd);
     PSObject *rmdir_fn = ps_function_new_native(ps_native_fs_rmdir);
     PSObject *rm_fn = ps_function_new_native(ps_native_fs_rm);
@@ -597,6 +609,7 @@ void ps_fs_init(PSVM *vm) {
     if (mkdir_fn) ps_function_setup(mkdir_fn, vm->function_proto, vm->object_proto, NULL);
     if (mv_fn) ps_function_setup(mv_fn, vm->function_proto, vm->object_proto, NULL);
     if (path_info_fn) ps_function_setup(path_info_fn, vm->function_proto, vm->object_proto, NULL);
+    if (cd_fn) ps_function_setup(cd_fn, vm->function_proto, vm->object_proto, NULL);
     if (pwd_fn) ps_function_setup(pwd_fn, vm->function_proto, vm->object_proto, NULL);
     if (rmdir_fn) ps_function_setup(rmdir_fn, vm->function_proto, vm->object_proto, NULL);
     if (rm_fn) ps_function_setup(rm_fn, vm->function_proto, vm->object_proto, NULL);
@@ -615,6 +628,7 @@ void ps_fs_init(PSVM *vm) {
     if (mkdir_fn) ps_object_define(fs, ps_string_from_cstr("mkdir"), ps_value_object(mkdir_fn), PS_ATTR_NONE);
     if (mv_fn) ps_object_define(fs, ps_string_from_cstr("mv"), ps_value_object(mv_fn), PS_ATTR_NONE);
     if (path_info_fn) ps_object_define(fs, ps_string_from_cstr("pathInfo"), ps_value_object(path_info_fn), PS_ATTR_NONE);
+    if (cd_fn) ps_object_define(fs, ps_string_from_cstr("cd"), ps_value_object(cd_fn), PS_ATTR_NONE);
     if (pwd_fn) ps_object_define(fs, ps_string_from_cstr("pwd"), ps_value_object(pwd_fn), PS_ATTR_NONE);
     if (rmdir_fn) ps_object_define(fs, ps_string_from_cstr("rmdir"), ps_value_object(rmdir_fn), PS_ATTR_NONE);
     if (rm_fn) ps_object_define(fs, ps_string_from_cstr("rm"), ps_value_object(rm_fn), PS_ATTR_NONE);

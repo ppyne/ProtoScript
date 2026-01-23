@@ -89,9 +89,9 @@ Remove everything that was built.
 make clean
 ```
 
-### WebAssembly (WASM)
+### WebAssembly (WASM ou WebASM)
 
-Note that ProtoScript may already be built in the `web` directory (you don't need to do the following).
+Note that ProtoScript is already be built in the `web` directory (you don't need to do the following).
 
 If you really need to rebuild ProtoScript for WebAssembly, you must have Emscripten installed. Then you can do this:
 

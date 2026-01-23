@@ -71,12 +71,18 @@ ProtoScript also exposes a global `ProtoScript` object with runtime metadata:
 
 - `ProtoScript.args`: readonly array of command-line arguments (`argv`)
 - `ProtoScript.version`: `"v1.0.0 ECMAScript 262 (ES1)"`
+- `ProtoScript.exit(code = 0)`: exit the interpreter with a status code
+- `ProtoScript.sleep(seconds)`: sleep in seconds (integer)
+- `ProtoScript.usleep(microseconds)`: sleep in microseconds (integer)
 
 Example:
 
 ```js
 Io.print(ProtoScript.version + "\n");
 Io.print(ProtoScript.args.length + "\n");
+// ProtoScript.exit(0);
+// ProtoScript.sleep(1);
+// ProtoScript.usleep(500000);
 ```
 
 ---

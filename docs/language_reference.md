@@ -220,6 +220,9 @@ Constructors:
 Object: `ProtoScript`
 - `ProtoScript.args`
 - `ProtoScript.version`
+- `ProtoScript.exit(code = 0)`
+- `ProtoScript.sleep(seconds)`
+- `ProtoScript.usleep(microseconds)`
 
 ### 7.1 Io
 Object: `Io`
@@ -276,7 +279,14 @@ Object: `Buffer`
 Object: `Event`
 - `Event.next()`
 
-### 7.6 Display (optional)
+### 7.6 Image (optional)
+Object: `Image` (requires `PS_ENABLE_MODULE_IMG=1`)
+- `Image.detectFormat(buffer)`
+- `Image.decodePNG(buffer)`
+- `Image.decodeJPEG(buffer)`
+- `Image.resample(image, newWidth, newHeight, mode)`
+
+### 7.7 Display (optional)
 Object: `Display` (requires `PS_ENABLE_MODULE_DISPLAY=1`)
 - `Display.open(width, height, title, options)`
 - `Display.close()`
@@ -287,6 +297,7 @@ Object: `Display` (requires `PS_ENABLE_MODULE_DISPLAY=1`)
 - `Display.rect(x, y, w, h, r, g, b)`
 - `Display.fillRect(x, y, w, h, r, g, b)`
 - `Display.framebuffer()`
+- `Display.blitRGBA(buffer, srcW, srcH, dstX, dstY, destW?, destH?)`
 - `Display.present()`
 
 ---
@@ -299,4 +310,5 @@ Defined in `include/ps_config.h` (0 = disabled, 1 = enabled):
 - `PS_ENABLE_ARGUMENTS_ALIASING`
 - `PS_ENABLE_MODULE_FS`
 - `PS_ENABLE_MODULE_DISPLAY`
+- `PS_ENABLE_MODULE_IMG`
 - `PS_EVENT_QUEUE_CAPACITY`

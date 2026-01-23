@@ -4,10 +4,14 @@
 #include "ps_vm.h"
 #include "ps_object.h"
 #include "ps_string.h"
+#include "ps_function.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+#include <limits.h>
+#include <unistd.h>
 
 static char *read_file(const char *path, size_t *out_len) {
     FILE *fp = fopen(path, "rb");
@@ -71,6 +75,58 @@ static char *read_stream(FILE *fp, size_t *out_len) {
     return buf;
 }
 
+static PSValue ps_native_protoscript_exit(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    int code = 0;
+    if (argc > 0) {
+        double num = ps_to_number(vm, argv[0]);
+        if (vm && vm->has_pending_throw) return ps_value_undefined();
+        if (!isnan(num) && !isinf(num)) {
+            code = (int)num;
+        }
+    }
+    exit(code);
+    return ps_value_undefined();
+}
+
+static void protoscript_throw(PSVM *vm, const char *name, const char *message) {
+    if (!vm) return;
+    vm->pending_throw = ps_vm_make_error(vm, name ? name : "Error", message ? message : "");
+    vm->has_pending_throw = 1;
+}
+
+static PSValue ps_native_protoscript_sleep(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    double num = 0.0;
+    if (argc > 0) {
+        num = ps_to_number(vm, argv[0]);
+        if (vm && vm->has_pending_throw) return ps_value_undefined();
+    }
+    if (isnan(num) || isinf(num) || num < 0.0 || floor(num) != num) {
+        protoscript_throw(vm, "RangeError", "Invalid sleep duration");
+        return ps_value_undefined();
+    }
+    unsigned int seconds = (num > (double)UINT_MAX) ? UINT_MAX : (unsigned int)num;
+    sleep(seconds);
+    return ps_value_undefined();
+}
+
+static PSValue ps_native_protoscript_usleep(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    double num = 0.0;
+    if (argc > 0) {
+        num = ps_to_number(vm, argv[0]);
+        if (vm && vm->has_pending_throw) return ps_value_undefined();
+    }
+    if (isnan(num) || isinf(num) || num < 0.0 || floor(num) != num) {
+        protoscript_throw(vm, "RangeError", "Invalid sleep duration");
+        return ps_value_undefined();
+    }
+    useconds_t usec = (num > (double)UINT_MAX) ? (useconds_t)UINT_MAX : (useconds_t)num;
+    usleep(usec);
+    return ps_value_undefined();
+}
+
 static void define_protoscript_info(PSVM *vm, int argc, char **argv) {
     if (!vm || !vm->global) return;
     PSObject *info = ps_object_new(vm->object_proto);
@@ -103,6 +159,31 @@ static void define_protoscript_info(PSVM *vm, int argc, char **argv) {
                      ps_string_from_cstr("version"),
                      ps_value_string(ps_string_from_cstr("v1.0.0 ECMAScript 262 (ES1)")),
                      PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+
+    PSObject *exit_fn = ps_function_new_native(ps_native_protoscript_exit);
+    PSObject *sleep_fn = ps_function_new_native(ps_native_protoscript_sleep);
+    PSObject *usleep_fn = ps_function_new_native(ps_native_protoscript_usleep);
+    if (exit_fn) {
+        ps_function_setup(exit_fn, vm->function_proto, vm->object_proto, NULL);
+        ps_object_define(info,
+                         ps_string_from_cstr("exit"),
+                         ps_value_object(exit_fn),
+                         PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    }
+    if (sleep_fn) {
+        ps_function_setup(sleep_fn, vm->function_proto, vm->object_proto, NULL);
+        ps_object_define(info,
+                         ps_string_from_cstr("sleep"),
+                         ps_value_object(sleep_fn),
+                         PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    }
+    if (usleep_fn) {
+        ps_function_setup(usleep_fn, vm->function_proto, vm->object_proto, NULL);
+        ps_object_define(info,
+                         ps_string_from_cstr("usleep"),
+                         ps_value_object(usleep_fn),
+                         PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    }
 
     ps_object_define(vm->global,
                      ps_string_from_cstr("ProtoScript"),

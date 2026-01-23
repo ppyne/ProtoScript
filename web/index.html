@@ -92,6 +92,14 @@
         line-height: 1.5;
       }
 
+      a:link, a:visited, a:hover  {
+        color: #7fd1ff;
+      }
+
+      a:active {
+        color: hotpink;
+      } 
+
       .CodeMirror {
         height: 320px;
         border: 1px solid var(--border);
@@ -104,6 +112,25 @@
         padding: 4px;
         overflow: hidden;
       }
+
+      .CodeMirror .cm-keyword { color: #f08d49; }
+      .CodeMirror .cm-atom { color: #7fd1ff; }
+      .CodeMirror .cm-number { color: #7fd1ff; }
+      .CodeMirror .cm-def { color: #ffd166; }
+      .CodeMirror .cm-variable { color: #e6edf3; }
+      .CodeMirror .cm-variable-2 { color: #8ecae6; }
+      .CodeMirror .cm-variable-3 { color: #b388eb; }
+      .CodeMirror .cm-property { color: #9ad5ff; }
+      .CodeMirror .cm-operator { color: #f2f2f2; }
+      .CodeMirror .cm-string { color: #7bd88f; }
+      .CodeMirror .cm-string-2 { color: #a7f3d0; }
+      .CodeMirror .cm-comment { color: #6b7b86; }
+      .CodeMirror .cm-builtin { color: #ffd166; }
+      .CodeMirror .cm-tag { color: #ff7b7b; }
+      .CodeMirror .cm-attribute { color: #ffd166; }
+      .CodeMirror .cm-qualifier { color: #9ad5ff; }
+      .CodeMirror .cm-meta { color: #f6c356; }
+      .CodeMirror .cm-error { color: #ff6b6b; background: #3a1c1c; }
 
       .CodeMirror-gutters {
         background: #0c1114;

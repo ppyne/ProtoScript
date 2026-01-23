@@ -290,6 +290,18 @@ Mode flags:
 - `"r"` read text, `"w"` write text, `"a"` append text.
 - Add `"b"` for binary: `"rb"`, `"wb"`, `"ab"`.
 
+Writing to stderr:
+
+```js
+Io.stderr.write("error\n");
+```
+
+You can also use:
+
+```js
+console.error("error", "detail");
+```
+
 Standard streams:
 - `Io.stdin`, `Io.stdout`, `Io.stderr` are always open and cannot be closed.
 
@@ -600,12 +612,14 @@ var buf = f.read();
 f.close();
 
 var format = Image.detectFormat(buf);
-if (format == "png") {
-    Io.print("format png\n");
+var img;
+if (format == 'png') img = Image.decodePNG(buf);
+else if (format == 'jpeg') img = Image.decodeJPEG(buf);
+else {
+    Io.stderr.write("Unsupported image format\n");
+    ProtoScript.exit(0);
 }
 
-var img = Image.decodePNG(buf);
-// For JPEG buffers: Image.decodeJPEG(buf);
 var half = Image.resample(img, img.width / 2, img.height / 2, "linear");
 Io.print(half.width + "x" + half.height + "\n");
 ```

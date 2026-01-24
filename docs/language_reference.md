@@ -222,6 +222,18 @@ Object: `JSON`
 Constructors:
 `Error`, `TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`, `EvalError`
 
+Instances:
+- `name`, `message`
+- `stack` (ProtoScript): stack trace with function names and locations.
+- `file`, `line`, `column` (ProtoScript): source location when available.
+- `cause` (ProtoScript): optional nested error or value (from constructor options).
+- `code` (ProtoScript): error code string for native errors (for example `ERR_INVALID_ARG`).
+
+Diagnostics (format examples):
+- Parse errors: `path:line:column Parse error: expected X but found Y`
+- Uncaught errors: `path:line:column Uncaught <Type>: <message>`
+- Display argument errors: `RangeError: Display.open: invalid width`
+
 ---
 
 ## 7. Host extensions

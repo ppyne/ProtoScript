@@ -493,7 +493,7 @@ Documentation intended for users **must**:
 
 ### Examples validation & repository layout
 
-- All examples **must** be placed in the `examples/` directory of the ProtoScript repository.
+- All examples **must** be placed in the `examples/` directory (or subdirectories) of the ProtoScript repository.
 - Each example file must be:
   - self-contained,
   - clearly named,

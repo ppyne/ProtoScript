@@ -65,6 +65,7 @@ struct PSAstNode {
     PSAstKind kind;
     size_t line;
     size_t column;
+    const char *source_path;
 
     union {
         /* Program / Block */

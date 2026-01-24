@@ -74,7 +74,123 @@ static PSObject *ps_vm_error_proto_for_name(PSVM *vm, const char *name) {
     return vm->error_proto;
 }
 
-static PSValue ps_vm_make_error_with_message(PSVM *vm, const char *name, PSString *message) {
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} PSStackBuilder;
+
+static int stack_builder_reserve(PSStackBuilder *b, size_t extra) {
+    if (!b) return 0;
+    size_t need = b->len + extra + 1;
+    if (need <= b->cap) return 1;
+    size_t new_cap = b->cap ? b->cap * 2 : 128;
+    while (new_cap < need) {
+        new_cap *= 2;
+    }
+    char *next = (char *)realloc(b->data, new_cap);
+    if (!next) return 0;
+    b->data = next;
+    b->cap = new_cap;
+    return 1;
+}
+
+static int stack_builder_append(PSStackBuilder *b, const char *s, size_t len) {
+    if (!b || !s || len == 0) return 1;
+    if (!stack_builder_reserve(b, len)) return 0;
+    memcpy(b->data + b->len, s, len);
+    b->len += len;
+    b->data[b->len] = '\0';
+    return 1;
+}
+
+static int stack_builder_append_cstr(PSStackBuilder *b, const char *s) {
+    if (!s) return 1;
+    return stack_builder_append(b, s, strlen(s));
+}
+
+static int stack_builder_append_size(PSStackBuilder *b, size_t value) {
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%zu", value);
+    if (n <= 0) return 0;
+    return stack_builder_append(b, buf, (size_t)n);
+}
+
+static int stack_builder_append_psstring(PSStackBuilder *b, const PSString *s) {
+    if (!s || !s->utf8 || s->byte_len == 0) return 1;
+    return stack_builder_append(b, s->utf8, s->byte_len);
+}
+
+static void stack_builder_add_frame(PSStackBuilder *b,
+                                    const PSString *name,
+                                    const char *path,
+                                    size_t line,
+                                    size_t column,
+                                    int is_top) {
+    const char *fallback = is_top ? "<global>" : "<anonymous>";
+    stack_builder_append_cstr(b, "at ");
+    if (name && name->byte_len > 0) {
+        stack_builder_append_psstring(b, name);
+    } else {
+        stack_builder_append_cstr(b, fallback);
+    }
+    if ((path && path[0]) || (line > 0 && column > 0)) {
+        stack_builder_append_cstr(b, " (");
+        if (path && path[0]) {
+            stack_builder_append_cstr(b, path);
+            if (line > 0 && column > 0) {
+                stack_builder_append_cstr(b, ":");
+            }
+        }
+        if (line > 0 && column > 0) {
+            stack_builder_append_size(b, line);
+            stack_builder_append_cstr(b, ":");
+            stack_builder_append_size(b, column);
+        }
+        stack_builder_append_cstr(b, ")");
+    }
+    stack_builder_append_cstr(b, "\n");
+}
+
+static PSString *ps_vm_build_stack(PSVM *vm) {
+    if (!vm) return NULL;
+    if (!vm->current_node && vm->stack_depth == 0) return NULL;
+    PSStackBuilder b = {0};
+    PSFunction *current_func = NULL;
+    if (vm->current_callee) {
+        current_func = ps_function_from_object(vm->current_callee);
+    }
+    size_t line = vm->current_node ? vm->current_node->line : 0;
+    size_t column = vm->current_node ? vm->current_node->column : 0;
+    const char *path = vm->current_node ? vm->current_node->source_path : NULL;
+    stack_builder_add_frame(&b,
+                            current_func ? current_func->name : NULL,
+                            path,
+                            line,
+                            column,
+                            1);
+    for (size_t i = vm->stack_depth; i > 0; i--) {
+        const PSStackFrame *frame = &vm->stack_frames[i - 1];
+        stack_builder_add_frame(&b,
+                                frame->function_name,
+                                frame->source_path,
+                                frame->line,
+                                frame->column,
+                                0);
+    }
+    if (!b.data || b.len == 0) {
+        free(b.data);
+        return NULL;
+    }
+    PSString *stack = ps_string_from_utf8(b.data, b.len);
+    free(b.data);
+    return stack;
+}
+
+static PSValue ps_vm_make_error_with_message_and_code(PSVM *vm,
+                                                      const char *name,
+                                                      PSString *message,
+                                                      const char *code) {
     PSObject *proto = ps_vm_error_proto_for_name(vm, name);
     PSObject *obj = ps_object_new(proto ? proto : (vm ? vm->object_proto : NULL));
     if (!obj) return ps_value_undefined();
@@ -86,6 +202,12 @@ static PSValue ps_vm_make_error_with_message(PSVM *vm, const char *name, PSStrin
                      ps_string_from_cstr("message"),
                      ps_value_string(message ? message : ps_string_from_cstr("")),
                      PS_ATTR_DONTENUM);
+    if (code && code[0]) {
+        ps_object_define(obj,
+                         ps_string_from_cstr("code"),
+                         ps_value_string(ps_string_from_cstr(code)),
+                         PS_ATTR_DONTENUM);
+    }
     if (vm && vm->current_node && vm->current_node->line && vm->current_node->column) {
         ps_object_define(obj,
                          ps_string_from_cstr("line"),
@@ -95,24 +217,71 @@ static PSValue ps_vm_make_error_with_message(PSVM *vm, const char *name, PSStrin
                          ps_string_from_cstr("column"),
                          ps_value_number((double)vm->current_node->column),
                          PS_ATTR_DONTENUM);
+        if (vm->current_node->source_path) {
+            ps_object_define(obj,
+                             ps_string_from_cstr("file"),
+                             ps_value_string(ps_string_from_cstr(vm->current_node->source_path)),
+                             PS_ATTR_DONTENUM);
+        }
+    }
+    PSString *stack = ps_vm_build_stack(vm);
+    if (stack) {
+        ps_object_define(obj,
+                         ps_string_from_cstr("stack"),
+                         ps_value_string(stack),
+                         PS_ATTR_DONTENUM);
     }
     return ps_value_object(obj);
 }
 
+static PSValue ps_vm_make_error_with_message(PSVM *vm, const char *name, PSString *message) {
+    return ps_vm_make_error_with_message_and_code(vm, name, message, NULL);
+}
+
 PSValue ps_vm_make_error(PSVM *vm, const char *name, const char *message) {
     PSString *msg = ps_string_from_cstr(message ? message : "");
-    return ps_vm_make_error_with_message(vm, name, msg);
+    return ps_vm_make_error_with_message_and_code(vm, name, msg, NULL);
+}
+
+PSValue ps_vm_make_error_with_code(PSVM *vm, const char *name, const char *message, const char *code) {
+    PSString *msg = ps_string_from_cstr(message ? message : "");
+    return ps_vm_make_error_with_message_and_code(vm, name, msg, code);
 }
 
 void ps_vm_throw_type_error(PSVM *vm, const char *message) {
     if (!vm) return;
-    vm->pending_throw = ps_vm_make_error(vm, "TypeError", message ? message : "");
+    const char *msg = message ? message : "";
+    if (message && strcmp(message, "Invalid receiver") == 0) {
+        PSFunction *func = vm->current_callee ? ps_function_from_object(vm->current_callee) : NULL;
+        if (func && func->name && func->name->byte_len > 0) {
+            size_t name_len = func->name->byte_len;
+            const char *prefix = "Invalid receiver: ";
+            size_t prefix_len = strlen(prefix);
+            char *buf = (char *)malloc(prefix_len + name_len + 1);
+            if (buf) {
+                memcpy(buf, prefix, prefix_len);
+                memcpy(buf + prefix_len, func->name->utf8, name_len);
+                buf[prefix_len + name_len] = '\0';
+                msg = buf;
+            }
+        }
+    }
+    vm->pending_throw = ps_vm_make_error_with_code(vm,
+                                                   "TypeError",
+                                                   msg,
+                                                   "ERR_INVALID_ARG");
+    if (msg != message && message && strcmp(message, "Invalid receiver") == 0) {
+        free((void *)msg);
+    }
     vm->has_pending_throw = 1;
 }
 
 static void ps_vm_throw_range_error(PSVM *vm, const char *message) {
     if (!vm) return;
-    vm->pending_throw = ps_vm_make_error(vm, "RangeError", message ? message : "");
+    vm->pending_throw = ps_vm_make_error_with_code(vm,
+                                                   "RangeError",
+                                                   message ? message : "",
+                                                   "ERR_OUT_OF_RANGE");
     vm->has_pending_throw = 1;
 }
 
@@ -124,6 +293,10 @@ static void ps_vm_throw_syntax_error(PSVM *vm, const char *message) {
 
 static void ps_define_function_props(PSObject *fn, const char *name, int length) {
     if (!fn) return;
+    PSFunction *func = ps_function_from_object(fn);
+    if (func && name) {
+        func->name = ps_string_from_cstr(name);
+    }
     ps_object_define(fn,
                      ps_string_from_cstr("length"),
                      ps_value_number((double)length),
@@ -138,6 +311,21 @@ static void ps_define_function_props(PSObject *fn, const char *name, int length)
 
 static void ps_object_set_length(PSObject *obj, size_t len);
 static PSValue ps_native_regexp_exec(PSVM *vm, PSValue this_val, int argc, PSValue *argv);
+
+static void ps_error_apply_options(PSVM *vm, PSValue error_val, int argc, PSValue *argv) {
+    (void)vm;
+    if (argc < 2) return;
+    if (error_val.type != PS_T_OBJECT || !error_val.as.object) return;
+    if (argv[1].type != PS_T_OBJECT || !argv[1].as.object) return;
+    int found = 0;
+    PSValue cause_val = ps_object_get(argv[1].as.object, ps_string_from_cstr("cause"), &found);
+    if (found) {
+        ps_object_define(error_val.as.object,
+                         ps_string_from_cstr("cause"),
+                         cause_val,
+                         PS_ATTR_DONTENUM);
+    }
+}
 
 static PSValue ps_native_error_to_string(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
     (void)argc;
@@ -170,7 +358,9 @@ static PSValue ps_native_error(PSVM *vm, PSValue this_val, int argc, PSValue *ar
         message = ps_to_string(vm, argv[0]);
     }
     if (vm && vm->has_pending_throw) return ps_value_undefined();
-    return ps_vm_make_error_with_message(vm, "Error", message);
+    PSValue out = ps_vm_make_error_with_message(vm, "Error", message);
+    ps_error_apply_options(vm, out, argc, argv);
+    return out;
 }
 
 static PSValue ps_native_type_error(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
@@ -180,7 +370,9 @@ static PSValue ps_native_type_error(PSVM *vm, PSValue this_val, int argc, PSValu
         message = ps_to_string(vm, argv[0]);
     }
     if (vm && vm->has_pending_throw) return ps_value_undefined();
-    return ps_vm_make_error_with_message(vm, "TypeError", message);
+    PSValue out = ps_vm_make_error_with_message(vm, "TypeError", message);
+    ps_error_apply_options(vm, out, argc, argv);
+    return out;
 }
 
 static PSValue ps_native_reference_error(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
@@ -190,7 +382,9 @@ static PSValue ps_native_reference_error(PSVM *vm, PSValue this_val, int argc, P
         message = ps_to_string(vm, argv[0]);
     }
     if (vm && vm->has_pending_throw) return ps_value_undefined();
-    return ps_vm_make_error_with_message(vm, "ReferenceError", message);
+    PSValue out = ps_vm_make_error_with_message(vm, "ReferenceError", message);
+    ps_error_apply_options(vm, out, argc, argv);
+    return out;
 }
 
 static PSValue ps_native_syntax_error(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
@@ -200,7 +394,9 @@ static PSValue ps_native_syntax_error(PSVM *vm, PSValue this_val, int argc, PSVa
         message = ps_to_string(vm, argv[0]);
     }
     if (vm && vm->has_pending_throw) return ps_value_undefined();
-    return ps_vm_make_error_with_message(vm, "SyntaxError", message);
+    PSValue out = ps_vm_make_error_with_message(vm, "SyntaxError", message);
+    ps_error_apply_options(vm, out, argc, argv);
+    return out;
 }
 
 static PSValue ps_native_eval_error(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
@@ -210,7 +406,9 @@ static PSValue ps_native_eval_error(PSVM *vm, PSValue this_val, int argc, PSValu
         message = ps_to_string(vm, argv[0]);
     }
     if (vm && vm->has_pending_throw) return ps_value_undefined();
-    return ps_vm_make_error_with_message(vm, "EvalError", message);
+    PSValue out = ps_vm_make_error_with_message(vm, "EvalError", message);
+    ps_error_apply_options(vm, out, argc, argv);
+    return out;
 }
 
 static PSValue ps_native_range_error(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
@@ -220,7 +418,9 @@ static PSValue ps_native_range_error(PSVM *vm, PSValue this_val, int argc, PSVal
         message = ps_to_string(vm, argv[0]);
     }
     if (vm && vm->has_pending_throw) return ps_value_undefined();
-    return ps_vm_make_error_with_message(vm, "RangeError", message);
+    PSValue out = ps_vm_make_error_with_message(vm, "RangeError", message);
+    ps_error_apply_options(vm, out, argc, argv);
+    return out;
 }
 
 static PSValue ps_native_object(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
@@ -736,7 +936,9 @@ static PSValue ps_native_array(PSVM *vm, PSValue this_val, int argc, PSValue *ar
         double num = ps_to_number(vm, argv[0]);
         if (vm && vm->has_pending_throw) return ps_value_undefined();
         if (!isfinite(num) || num < 0.0 || floor(num) != num || num > 4294967295.0) {
-            ps_vm_throw_range_error(vm, "Invalid array length");
+            char msg[96];
+            snprintf(msg, sizeof(msg), "Invalid array length: %.15g", num);
+            ps_vm_throw_range_error(vm, msg);
             return ps_value_undefined();
         }
         ps_object_define(obj,
@@ -1661,7 +1863,32 @@ static PSValue ps_native_regexp(PSVM *vm, PSValue this_val, int argc, PSValue *a
 
     PSRegex *compiled = ps_re_compile(pattern, flag_g, flag_i);
     if (!compiled) {
-        ps_vm_throw_syntax_error(vm, "Invalid regular expression");
+        const char *flags = flag_g && flag_i ? "gi" : (flag_g ? "g" : (flag_i ? "i" : ""));
+        size_t pat_len = pattern ? pattern->byte_len : 0;
+        size_t flags_len = strlen(flags);
+        size_t total = sizeof("Invalid regular expression: //") - 1 + pat_len + flags_len;
+        char *msg = (char *)malloc(total + 1);
+        if (msg) {
+            size_t pos = 0;
+            const char *prefix = "Invalid regular expression: /";
+            size_t prefix_len = strlen(prefix);
+            memcpy(msg + pos, prefix, prefix_len);
+            pos += prefix_len;
+            if (pattern && pattern->utf8 && pat_len > 0) {
+                memcpy(msg + pos, pattern->utf8, pat_len);
+                pos += pat_len;
+            }
+            msg[pos++] = '/';
+            if (flags_len > 0) {
+                memcpy(msg + pos, flags, flags_len);
+                pos += flags_len;
+            }
+            msg[pos] = '\0';
+            ps_vm_throw_syntax_error(vm, msg);
+            free(msg);
+        } else {
+            ps_vm_throw_syntax_error(vm, "Invalid regular expression");
+        }
         return ps_value_undefined();
     }
 
@@ -1721,7 +1948,13 @@ static int ps_object_call_method(PSVM *vm, PSObject *obj, const char *name, PSVa
     PSValue method = ps_object_get(obj, ps_string_from_cstr(name), &found);
     if (!found || method.type != PS_T_OBJECT || !method.as.object ||
         method.as.object->kind != PS_OBJ_KIND_FUNCTION) {
-        ps_vm_throw_type_error(vm, "Not a callable object");
+        if (name && name[0]) {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "Not a callable object: %s", name);
+            ps_vm_throw_type_error(vm, msg);
+        } else {
+            ps_vm_throw_type_error(vm, "Not a callable object");
+        }
         return 0;
     }
     int did_throw = 0;
@@ -2125,12 +2358,16 @@ static PSValue ps_native_number_to_string(PSVM *vm, PSValue this_val, int argc, 
         double r = ps_to_number(vm, argv[0]);
         if (vm && vm->has_pending_throw) return ps_value_undefined();
         if (isnan(r) || isinf(r)) {
-            ps_vm_throw_range_error(vm, "Invalid radix");
+            char msg[96];
+            snprintf(msg, sizeof(msg), "Invalid radix: %.15g", r);
+            ps_vm_throw_range_error(vm, msg);
             return ps_value_undefined();
         }
         int r_int = (r < 0.0) ? (int)ceil(r) : (int)floor(r);
         if (r_int < 2 || r_int > 36) {
-            ps_vm_throw_range_error(vm, "Invalid radix");
+            char msg[96];
+            snprintf(msg, sizeof(msg), "Invalid radix: %.15g", r);
+            ps_vm_throw_range_error(vm, msg);
             return ps_value_undefined();
         }
         radix = r_int;
@@ -5584,6 +5821,7 @@ void ps_vm_free(PSVM *vm) {
 #endif
     free(vm->event_queue);
     free(vm->index_cache);
+    free(vm->stack_frames);
     free(vm);
 }
 

@@ -29,6 +29,13 @@ typedef struct PSPerfStats {
     uint64_t native_call_count;
 } PSPerfStats;
 
+typedef struct PSStackFrame {
+    PSString *function_name;
+    size_t line;
+    size_t column;
+    const char *source_path;
+} PSStackFrame;
+
 typedef struct PSVM {
     PSObject *global;   /* Global Object */
     PSEnv    *env;      /* Current Environment */
@@ -67,6 +74,9 @@ typedef struct PSVM {
     struct PSAstNode *current_node;
     PSString **index_cache;
     size_t index_cache_size;
+    PSStackFrame *stack_frames;
+    size_t stack_depth;
+    size_t stack_capacity;
     PSPerfStats perf;
     PSGC gc;
 } PSVM;
@@ -96,6 +106,7 @@ PSObject *ps_vm_wrap_primitive(PSVM *vm, const PSValue *v);
 
 /* Error helpers */
 PSValue ps_vm_make_error(PSVM *vm, const char *name, const char *message);
+PSValue ps_vm_make_error_with_code(PSVM *vm, const char *name, const char *message, const char *code);
 void ps_vm_throw_type_error(PSVM *vm, const char *message);
 
 #endif /* PS_VM_H */

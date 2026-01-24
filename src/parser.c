@@ -28,10 +28,40 @@ typedef struct PSIncludeStack {
     size_t count;
 } PSIncludeStack;
 
+typedef struct {
+    char **items;
+    size_t count;
+    size_t cap;
+} PSSourcePathPool;
+
 static jmp_buf *g_parse_jmp = NULL;
 static PSParser *g_parse_parser = NULL;
 static size_t g_parse_error_line = 0;
 static size_t g_parse_error_column = 0;
+static PSSourcePathPool g_source_paths = {0};
+
+static const char *intern_source_path(const char *path) {
+    if (!path || !path[0]) return NULL;
+    for (size_t i = 0; i < g_source_paths.count; i++) {
+        if (strcmp(g_source_paths.items[i], path) == 0) {
+            return g_source_paths.items[i];
+        }
+    }
+    char *copy = strdup(path);
+    if (!copy) return NULL;
+    if (g_source_paths.count == g_source_paths.cap) {
+        size_t new_cap = g_source_paths.cap ? g_source_paths.cap * 2 : 8;
+        char **next = (char **)realloc(g_source_paths.items, sizeof(char *) * new_cap);
+        if (!next) {
+            free(copy);
+            return NULL;
+        }
+        g_source_paths.items = next;
+        g_source_paths.cap = new_cap;
+    }
+    g_source_paths.items[g_source_paths.count++] = copy;
+    return copy;
+}
 
 static void parse_error(const char *msg) {
     size_t line = 0;
@@ -77,6 +107,7 @@ static PSAstNode *set_pos(PSAstNode *node, PSToken tok) {
     if (node) {
         node->line = tok.line;
         node->column = tok.column;
+        node->source_path = g_parse_parser ? g_parse_parser->source_path : NULL;
     }
     return node;
 }
@@ -85,6 +116,7 @@ static PSAstNode *set_pos_from_node(PSAstNode *node, PSAstNode *source) {
     if (node && source) {
         node->line = source->line;
         node->column = source->column;
+        node->source_path = source->source_path;
     }
     return node;
 }
@@ -108,10 +140,108 @@ static int match(PSParser *p, PSTokenType type) {
     return 0;
 }
 
+static const char *token_repr(PSToken tok, char *buf, size_t buf_len) {
+    if (!buf || buf_len == 0) return "token";
+    buf[0] = '\0';
+    switch (tok.type) {
+        case TOK_EOF: return "end of input";
+        case TOK_IDENTIFIER:
+            if (tok.length > 0) {
+                snprintf(buf, buf_len, "identifier '%.*s'", (int)tok.length, tok.start);
+                return buf;
+            }
+            return "identifier";
+        case TOK_NUMBER: return "number";
+        case TOK_STRING: return "string literal";
+        case TOK_VAR: return "'var'";
+        case TOK_IF: return "'if'";
+        case TOK_ELSE: return "'else'";
+        case TOK_WHILE: return "'while'";
+        case TOK_DO: return "'do'";
+        case TOK_FOR: return "'for'";
+        case TOK_IN: return "'in'";
+        case TOK_OF: return "'of'";
+        case TOK_SWITCH: return "'switch'";
+        case TOK_CASE: return "'case'";
+        case TOK_DEFAULT: return "'default'";
+        case TOK_FUNCTION: return "'function'";
+        case TOK_RETURN: return "'return'";
+        case TOK_BREAK: return "'break'";
+        case TOK_CONTINUE: return "'continue'";
+        case TOK_WITH: return "'with'";
+        case TOK_TRY: return "'try'";
+        case TOK_CATCH: return "'catch'";
+        case TOK_FINALLY: return "'finally'";
+        case TOK_THROW: return "'throw'";
+        case TOK_NEW: return "'new'";
+        case TOK_INSTANCEOF: return "'instanceof'";
+        case TOK_TRUE: return "'true'";
+        case TOK_FALSE: return "'false'";
+        case TOK_NULL: return "'null'";
+        case TOK_THIS: return "'this'";
+        case TOK_TYPEOF: return "'typeof'";
+        case TOK_VOID: return "'void'";
+        case TOK_DELETE: return "'delete'";
+        case TOK_INCLUDE: return "'include'";
+        case TOK_LPAREN: return "'('";
+        case TOK_RPAREN: return "')'";
+        case TOK_LBRACE: return "'{'";
+        case TOK_RBRACE: return "'}'";
+        case TOK_LBRACKET: return "'['";
+        case TOK_RBRACKET: return "']'";
+        case TOK_SEMI: return "';'";
+        case TOK_COMMA: return "','";
+        case TOK_DOT: return "'.'";
+        case TOK_QUESTION: return "'?'";
+        case TOK_COLON: return "':'";
+        case TOK_ASSIGN: return "'='";
+        case TOK_PLUS: return "'+'";
+        case TOK_MINUS: return "'-'";
+        case TOK_STAR: return "'*'";
+        case TOK_SLASH: return "'/'";
+        case TOK_PERCENT: return "'%'";
+        case TOK_PLUS_PLUS: return "'++'";
+        case TOK_MINUS_MINUS: return "'--'";
+        case TOK_PLUS_ASSIGN: return "'+='";
+        case TOK_MINUS_ASSIGN: return "'-='";
+        case TOK_STAR_ASSIGN: return "'*='";
+        case TOK_SLASH_ASSIGN: return "'/='";
+        case TOK_PERCENT_ASSIGN: return "'%='";
+        case TOK_LT: return "'<'";
+        case TOK_LTE: return "'<='";
+        case TOK_GT: return "'>'";
+        case TOK_GTE: return "'>='";
+        case TOK_EQ: return "'=='";
+        case TOK_NEQ: return "'!='";
+        case TOK_STRICT_EQ: return "'==='";
+        case TOK_STRICT_NEQ: return "'!=='";
+        case TOK_NOT: return "'!'";
+        case TOK_BIT_NOT: return "'~'";
+        case TOK_AND: return "'&'";
+        case TOK_OR: return "'|'";
+        case TOK_XOR: return "'^'";
+        case TOK_AND_AND: return "'&&'";
+        case TOK_OR_OR: return "'||'";
+        case TOK_SHL: return "'<<'";
+        case TOK_SHR: return "'>>'";
+        case TOK_USHR: return "'>>>'";
+        case TOK_AND_ASSIGN: return "'&='";
+        case TOK_OR_ASSIGN: return "'|='";
+        case TOK_XOR_ASSIGN: return "'^='";
+        case TOK_SHL_ASSIGN: return "'<<='";
+        case TOK_SHR_ASSIGN: return "'>>='";
+        case TOK_USHR_ASSIGN: return "'>>>='";
+        default:
+            return "token";
+    }
+}
+
 static void expect(PSParser *p, PSTokenType type, const char *msg) {
     if (!match(p, type)) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "Parse error: expected %s", msg);
+        char buf[160];
+        char tok_buf[64];
+        const char *got = token_repr(p->current, tok_buf, sizeof(tok_buf));
+        snprintf(buf, sizeof(buf), "Parse error: expected %s but found %s", msg, got);
         parse_error(buf);
     }
 }
@@ -470,7 +600,7 @@ static PSAstNode *parse_include_statement(PSParser *p, PSToken include_tok);
 static PSAstNode *parse_source_with_path(const char *source, const char *path, PSIncludeStack *stack) {
     PSParser p;
     ps_lexer_init(&p.lexer, source);
-    p.source_path = path;
+    p.source_path = intern_source_path(path);
     p.include_stack = stack;
     p.context_level = 0;
     p.saw_non_include = 0;

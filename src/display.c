@@ -11,6 +11,7 @@
 #if PS_ENABLE_MODULE_DISPLAY
 #include <SDL.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -26,6 +27,15 @@ static int display_sdl_ready = 0;
 static void display_throw(PSVM *vm, const char *name, const char *message) {
     if (!vm) return;
     vm->pending_throw = ps_vm_make_error(vm, name ? name : "Error", message ? message : "");
+    vm->has_pending_throw = 1;
+}
+
+static void display_throw_code(PSVM *vm, const char *name, const char *message, const char *code) {
+    if (!vm) return;
+    vm->pending_throw = ps_vm_make_error_with_code(vm,
+                                                   name ? name : "Error",
+                                                   message ? message : "",
+                                                   code);
     vm->has_pending_throw = 1;
 }
 
@@ -51,22 +61,38 @@ static uint8_t display_clamp_color(double v) {
     return (uint8_t)v;
 }
 
-static int display_parse_size(PSVM *vm, PSValue value, int *out) {
+static int display_parse_size(PSVM *vm, PSValue value, const char *context, const char *label, int *out) {
     double num = ps_to_number(vm, value);
     if (vm && vm->has_pending_throw) return 0;
     if (isnan(num) || isinf(num) || num <= 0.0 || floor(num) != num) {
-        display_throw(vm, "RangeError", "Invalid display size");
+        char msg[128];
+        if (context && label) {
+            snprintf(msg, sizeof(msg), "%s: invalid %s", context, label);
+        } else if (label) {
+            snprintf(msg, sizeof(msg), "Invalid %s", label);
+        } else {
+            snprintf(msg, sizeof(msg), "Invalid display size");
+        }
+        display_throw_code(vm, "RangeError", msg, "ERR_INVALID_ARG");
         return 0;
     }
     if (out) *out = (int)num;
     return 1;
 }
 
-static int display_parse_coord(PSVM *vm, PSValue value, int *out) {
+static int display_parse_coord(PSVM *vm, PSValue value, const char *context, const char *label, int *out) {
     double num = ps_to_number(vm, value);
     if (vm && vm->has_pending_throw) return 0;
     if (isnan(num) || isinf(num) || floor(num) != num) {
-        display_throw(vm, "RangeError", "Invalid display coordinate");
+        char msg[128];
+        if (context && label) {
+            snprintf(msg, sizeof(msg), "%s: invalid %s", context, label);
+        } else if (label) {
+            snprintf(msg, sizeof(msg), "Invalid %s", label);
+        } else {
+            snprintf(msg, sizeof(msg), "Invalid display coordinate");
+        }
+        display_throw_code(vm, "RangeError", msg, "ERR_INVALID_ARG");
         return 0;
     }
     if (out) *out = (int)num;
@@ -323,8 +349,12 @@ static PSValue ps_native_display_open(PSVM *vm, PSValue this_val, int argc, PSVa
     }
     int width = 0;
     int height = 0;
-    if (!display_parse_size(vm, argv[0], &width)) return ps_value_undefined();
-    if (!display_parse_size(vm, argv[1], &height)) return ps_value_undefined();
+    if (!display_parse_size(vm, argv[0], "Display.open", "width", &width)) {
+        return ps_value_undefined();
+    }
+    if (!display_parse_size(vm, argv[1], "Display.open", "height", &height)) {
+        return ps_value_undefined();
+    }
     PSString *title_s = ps_to_string(vm, argv[2]);
     if (vm && vm->has_pending_throw) return ps_value_undefined();
     int resizable = 0;
@@ -649,22 +679,22 @@ static PSValue ps_native_display_blit_rgba(PSVM *vm, PSValue this_val, int argc,
 
     int src_w = 0;
     int src_h = 0;
-    if (!display_parse_size(vm, argv[1], &src_w) ||
-        !display_parse_size(vm, argv[2], &src_h)) {
+    if (!display_parse_size(vm, argv[1], "Display.blitRGBA", "srcW", &src_w) ||
+        !display_parse_size(vm, argv[2], "Display.blitRGBA", "srcH", &src_h)) {
         return ps_value_undefined();
     }
     int dst_x = 0;
     int dst_y = 0;
-    if (!display_parse_coord(vm, argv[3], &dst_x) ||
-        !display_parse_coord(vm, argv[4], &dst_y)) {
+    if (!display_parse_coord(vm, argv[3], "Display.blitRGBA", "dstX", &dst_x) ||
+        !display_parse_coord(vm, argv[4], "Display.blitRGBA", "dstY", &dst_y)) {
         return ps_value_undefined();
     }
 
     int dest_w = 0;
     int dest_h = 0;
     if (argc >= 7) {
-        if (!display_parse_size(vm, argv[5], &dest_w) ||
-            !display_parse_size(vm, argv[6], &dest_h)) {
+        if (!display_parse_size(vm, argv[5], "Display.blitRGBA", "destW", &dest_w) ||
+            !display_parse_size(vm, argv[6], "Display.blitRGBA", "destH", &dest_h)) {
             return ps_value_undefined();
         }
     }

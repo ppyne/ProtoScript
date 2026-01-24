@@ -134,11 +134,11 @@ echo 'Io.print("Hello world\n");'| ./protoscript
 
 Examples show core language usage and host modules:
 
-- `examples/hello.js`: minimal run
-- `examples/basics.js`: variables, loops, functions
-- `examples/arrays.js`: arrays
-- `examples/strings.js`: strings
-- `examples/objects.js`: objects
-- `examples/image_display.js`: PNG decode + Display blit
+- `examples/misc/hello.js`: minimal run
+- `examples/misc/basics.js`: variables, loops, functions
+- `examples/misc/arrays.js`: arrays
+- `examples/misc/strings.js`: strings
+- `examples/misc/objects.js`: objects
+- `examples/image/image_display.js`: PNG decode + Display blit
 
 and more in the `examples/` directory.

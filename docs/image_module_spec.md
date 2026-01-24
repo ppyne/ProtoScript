@@ -279,7 +279,7 @@ n### User Guide MUST include
 - explanation of RGBA memory layout
 
 Examples MUST:
-- be placed in the `examples/` directory
+- be placed in the `examples/` directory (or subdirectories)
 - be tested at least once
 - compile and run without errors
 

@@ -37,6 +37,7 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
 static PSValue eval_block(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *ctl);
 static PSValue ps_eval_source(PSVM *vm, PSEnv *env, PSString *source, PSEvalControl *ctl);
 static void hoist_decls(PSVM *vm, PSEnv *env, PSAstNode *node);
+static PSString *ps_identifier_string(PSAstNode *node);
 
 static int ps_value_is_nan(double v) {
     return isnan(v);
@@ -69,9 +70,16 @@ static void ps_print_uncaught(PSVM *vm, PSValue thrown) {
     }
 
     if (vm && vm->current_node && vm->current_node->line && vm->current_node->column) {
-        fprintf(stderr, "%zu:%zu ",
-                vm->current_node->line,
-                vm->current_node->column);
+        if (vm->current_node->source_path) {
+            fprintf(stderr, "%s:%zu:%zu ",
+                    vm->current_node->source_path,
+                    vm->current_node->line,
+                    vm->current_node->column);
+        } else {
+            fprintf(stderr, "%zu:%zu ",
+                    vm->current_node->line,
+                    vm->current_node->column);
+        }
     }
 
     fprintf(stderr, "Uncaught ");
@@ -87,6 +95,108 @@ static void ps_print_uncaught(PSVM *vm, PSValue thrown) {
         fprintf(stderr, "exception");
     }
     fprintf(stderr, "\n");
+}
+
+static char *ps_alloc_cstr_from_psstring(const PSString *s) {
+    if (!s || !s->utf8 || s->byte_len == 0) return NULL;
+    char *out = (char *)malloc(s->byte_len + 1);
+    if (!out) return NULL;
+    memcpy(out, s->utf8, s->byte_len);
+    out[s->byte_len] = '\0';
+    return out;
+}
+
+static const char *ps_object_kind_label(const PSObject *obj) {
+    if (!obj) return "null";
+    switch (obj->kind) {
+        case PS_OBJ_KIND_FUNCTION: return "Function";
+        case PS_OBJ_KIND_ARRAY: return "Array";
+        case PS_OBJ_KIND_STRING: return "String";
+        case PS_OBJ_KIND_NUMBER: return "Number";
+        case PS_OBJ_KIND_BOOLEAN: return "Boolean";
+        case PS_OBJ_KIND_DATE: return "Date";
+        case PS_OBJ_KIND_REGEXP: return "RegExp";
+        default: return "Object";
+    }
+}
+
+static char *ps_format_call_target_name(PSAstNode *callee) {
+    if (!callee) return NULL;
+    if (callee->kind == AST_IDENTIFIER) {
+        PSString *name = ps_identifier_string(callee);
+        return ps_alloc_cstr_from_psstring(name);
+    }
+    if (callee->kind != AST_MEMBER) {
+        return NULL;
+    }
+
+    PSAstNode *obj = callee->as.member.object;
+    PSAstNode *prop = callee->as.member.property;
+    int computed = callee->as.member.computed;
+    char *obj_name = NULL;
+    char *prop_name = NULL;
+
+    if (obj && obj->kind == AST_IDENTIFIER) {
+        obj_name = ps_alloc_cstr_from_psstring(ps_identifier_string(obj));
+    }
+
+    if (prop) {
+        if (prop->kind == AST_IDENTIFIER) {
+            prop_name = ps_alloc_cstr_from_psstring(ps_identifier_string(prop));
+        } else if (prop->kind == AST_LITERAL &&
+                   prop->as.literal.value.type == PS_T_STRING) {
+            prop_name = ps_alloc_cstr_from_psstring(prop->as.literal.value.as.string);
+        }
+    }
+
+    if (obj_name && prop_name) {
+        size_t obj_len = strlen(obj_name);
+        size_t prop_len = strlen(prop_name);
+        size_t extra = computed ? 2 : 1;
+        char *out = (char *)malloc(obj_len + prop_len + extra + 1);
+        if (out) {
+            memcpy(out, obj_name, obj_len);
+            if (computed) {
+                out[obj_len] = '[';
+                memcpy(out + obj_len + 1, prop_name, prop_len);
+                out[obj_len + 1 + prop_len] = ']';
+                out[obj_len + 2 + prop_len] = '\0';
+            } else {
+                out[obj_len] = '.';
+                memcpy(out + obj_len + 1, prop_name, prop_len);
+                out[obj_len + 1 + prop_len] = '\0';
+            }
+        }
+        free(obj_name);
+        free(prop_name);
+        return out;
+    }
+
+    if (obj_name) return obj_name;
+    if (prop_name) return prop_name;
+    return NULL;
+}
+
+static void ps_vm_push_frame(PSVM *vm, PSFunction *func) {
+    if (!vm) return;
+    if (vm->stack_depth == vm->stack_capacity) {
+        size_t new_cap = vm->stack_capacity ? vm->stack_capacity * 2 : 8;
+        PSStackFrame *next = (PSStackFrame *)realloc(vm->stack_frames,
+                                                     sizeof(PSStackFrame) * new_cap);
+        if (!next) return;
+        vm->stack_frames = next;
+        vm->stack_capacity = new_cap;
+    }
+    PSStackFrame *frame = &vm->stack_frames[vm->stack_depth++];
+    frame->function_name = func ? func->name : NULL;
+    frame->line = vm->current_node ? vm->current_node->line : 0;
+    frame->column = vm->current_node ? vm->current_node->column : 0;
+    frame->source_path = vm->current_node ? vm->current_node->source_path : NULL;
+}
+
+static void ps_vm_pop_frame(PSVM *vm) {
+    if (!vm || vm->stack_depth == 0) return;
+    vm->stack_depth--;
 }
 
 static int ps_call_method(PSVM *vm, PSObject *obj, const char *name, PSValue *out) {
@@ -662,7 +772,9 @@ static int ps_array_set_length(PSVM *vm, PSObject *obj, PSValue value, PSEvalCon
     if (ps_check_pending_throw(vm, ctl)) return -1;
     if (isnan(num) || isinf(num) || num < 0.0 || floor(num) != num || num > 4294967295.0) {
         ctl->did_throw = 1;
-        ctl->throw_value = ps_vm_make_error(vm, "RangeError", "Invalid array length");
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Invalid array length: %.15g", num);
+        ctl->throw_value = ps_vm_make_error(vm, "RangeError", msg);
         return -1;
     }
 
@@ -882,14 +994,24 @@ PSValue ps_eval_call_function(PSVM *vm,
 
     if (!fn_obj || fn_obj->kind != PS_OBJ_KIND_FUNCTION) {
         if (did_throw) *did_throw = 1;
-        if (throw_value) *throw_value = ps_vm_make_error(vm, "TypeError", "Not a callable object");
+        if (throw_value) {
+            const char *kind = ps_object_kind_label(fn_obj);
+            char msg[96];
+            snprintf(msg, sizeof(msg), "Not a callable object: %s", kind);
+            *throw_value = ps_vm_make_error(vm, "TypeError", msg);
+        }
         return throw_value ? *throw_value : ps_value_undefined();
     }
 
     PSFunction *func = ps_function_from_object(fn_obj);
     if (!func) {
         if (did_throw) *did_throw = 1;
-        if (throw_value) *throw_value = ps_vm_make_error(vm, "TypeError", "Not a callable object");
+        if (throw_value) {
+            const char *kind = ps_object_kind_label(fn_obj);
+            char msg[96];
+            snprintf(msg, sizeof(msg), "Not a callable object: %s", kind);
+            *throw_value = ps_vm_make_error(vm, "TypeError", msg);
+        }
         return throw_value ? *throw_value : ps_value_undefined();
     }
 #if PS_ENABLE_PERF
@@ -912,9 +1034,23 @@ PSValue ps_eval_call_function(PSVM *vm,
 
     if (func->is_native) {
         PSObject *prev = vm ? vm->current_callee : NULL;
-        if (vm) vm->current_callee = fn_obj;
+        size_t prev_depth = vm ? vm->stack_depth : 0;
+        int pushed = 0;
+        if (vm) {
+            PSFunction *prev_func = prev ? ps_function_from_object(prev) : NULL;
+            ps_vm_push_frame(vm, prev_func);
+            if (vm->stack_depth > prev_depth) {
+                pushed = 1;
+            }
+            vm->current_callee = fn_obj;
+        }
         PSValue result = func->native(vm, this_val, argc, argv);
-        if (vm) vm->current_callee = prev;
+        if (vm) {
+            vm->current_callee = prev;
+            if (pushed) {
+                ps_vm_pop_frame(vm);
+            }
+        }
         if (vm && vm->has_pending_throw) {
             if (did_throw) *did_throw = 1;
             if (throw_value) *throw_value = vm->pending_throw;
@@ -949,6 +1085,18 @@ PSValue ps_eval_call_function(PSVM *vm,
     if (!call_env) return ps_value_undefined();
     if (vm && vm->object_proto && call_env->record) {
         call_env->record->prototype = vm->object_proto;
+    }
+
+    PSObject *prev_callee = vm ? vm->current_callee : NULL;
+    size_t prev_depth = vm ? vm->stack_depth : 0;
+    int pushed = 0;
+    if (vm) {
+        PSFunction *prev_func = prev_callee ? ps_function_from_object(prev_callee) : NULL;
+        ps_vm_push_frame(vm, prev_func);
+        if (vm->stack_depth > prev_depth) {
+            pushed = 1;
+        }
+        vm->current_callee = fn_obj;
     }
 
     ps_object_define(call_env->record,
@@ -997,6 +1145,12 @@ PSValue ps_eval_call_function(PSVM *vm,
         PSValue default_val = eval_expression(vm, call_env, default_expr, &default_ctl);
         if (default_ctl.did_throw) {
             ps_env_free(call_env);
+            if (vm) {
+                vm->current_callee = prev_callee;
+                if (pushed) {
+                    ps_vm_pop_frame(vm);
+                }
+            }
             if (did_throw) *did_throw = 1;
             if (throw_value) *throw_value = default_ctl.throw_value;
             return throw_value ? *throw_value : ps_value_undefined();
@@ -1031,6 +1185,12 @@ PSValue ps_eval_call_function(PSVM *vm,
         ps_gc_root_pop(vm, root_count);
     }
     ps_env_free(call_env);
+    if (vm) {
+        vm->current_callee = prev_callee;
+        if (pushed) {
+            ps_vm_pop_frame(vm);
+        }
+    }
     if (inner.did_throw) {
         if (did_throw) *did_throw = 1;
         if (throw_value) *throw_value = inner.throw_value;
@@ -1836,7 +1996,22 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             PSValue v = ps_env_get(env, name, &found);
             if (!found) {
                 ctl->did_throw = 1;
-                ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", "Identifier not defined");
+                const char *prefix = "Identifier not defined: ";
+                size_t prefix_len = strlen(prefix);
+                size_t name_len = name ? name->byte_len : 0;
+                char *msg = NULL;
+                if (name && name->utf8 && name_len > 0) {
+                    msg = (char *)malloc(prefix_len + name_len + 1);
+                }
+                if (msg) {
+                    memcpy(msg, prefix, prefix_len);
+                    memcpy(msg + prefix_len, name->utf8, name_len);
+                    msg[prefix_len + name_len] = '\0';
+                    ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", msg);
+                    free(msg);
+                } else {
+                    ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", "Identifier not defined");
+                }
                 return ctl->throw_value;
             }
             return v;
@@ -2021,8 +2196,29 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                 (void)ps_env_update_arguments(env, obj, prop, new_value);
                 return new_value;
             }
-            fprintf(stderr, "Invalid assignment target\n");
-            return ps_value_undefined();
+            ctl->did_throw = 1;
+            {
+                char *target = ps_format_call_target_name(node->as.assign.target);
+                if (target) {
+                    const char *prefix = "Invalid assignment target: ";
+                    size_t prefix_len = strlen(prefix);
+                    size_t target_len = strlen(target);
+                    char *msg = (char *)malloc(prefix_len + target_len + 1);
+                    if (msg) {
+                        memcpy(msg, prefix, prefix_len);
+                        memcpy(msg + prefix_len, target, target_len);
+                        msg[prefix_len + target_len] = '\0';
+                        ctl->throw_value = ps_vm_make_error(vm, "SyntaxError", msg);
+                        free(msg);
+                    } else {
+                        ctl->throw_value = ps_vm_make_error(vm, "SyntaxError", "Invalid assignment target");
+                    }
+                    free(target);
+                } else {
+                    ctl->throw_value = ps_vm_make_error(vm, "SyntaxError", "Invalid assignment target");
+                }
+            }
+            return ctl->throw_value;
         }
 
         case AST_BINARY: {
@@ -2437,14 +2633,50 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
 
             if (callee.type != PS_T_OBJECT) {
                 ctl->did_throw = 1;
-                ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Call of non-object");
+                const char *prefix = "Call of non-object: ";
+                char *target = ps_format_call_target_name(node->as.call.callee);
+                if (target) {
+                    size_t prefix_len = strlen(prefix);
+                    size_t target_len = strlen(target);
+                    char *msg = (char *)malloc(prefix_len + target_len + 1);
+                    if (msg) {
+                        memcpy(msg, prefix, prefix_len);
+                        memcpy(msg + prefix_len, target, target_len);
+                        msg[prefix_len + target_len] = '\0';
+                        ctl->throw_value = ps_vm_make_error(vm, "TypeError", msg);
+                        free(msg);
+                    } else {
+                        ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Call of non-object");
+                    }
+                    free(target);
+                } else {
+                    ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Call of non-object");
+                }
                 return ctl->throw_value;
             }
 
             PSFunction *func = ps_function_from_object(callee.as.object);
             if (!func) {
                 ctl->did_throw = 1;
-                ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Not a callable object");
+                const char *prefix = "Not a callable object: ";
+                char *target = ps_format_call_target_name(node->as.call.callee);
+                if (target) {
+                    size_t prefix_len = strlen(prefix);
+                    size_t target_len = strlen(target);
+                    char *msg = (char *)malloc(prefix_len + target_len + 1);
+                    if (msg) {
+                        memcpy(msg, prefix, prefix_len);
+                        memcpy(msg + prefix_len, target, target_len);
+                        msg[prefix_len + target_len] = '\0';
+                        ctl->throw_value = ps_vm_make_error(vm, "TypeError", msg);
+                        free(msg);
+                    } else {
+                        ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Not a callable object");
+                    }
+                    free(target);
+                } else {
+                    ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Not a callable object");
+                }
                 return ctl->throw_value;
             }
 

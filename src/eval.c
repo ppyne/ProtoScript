@@ -745,9 +745,17 @@ PSValue ps_eval_call_function(PSVM *vm,
 
     PSEvalControl inner = {0};
     PSEnv *prev_env = vm ? vm->env : NULL;
+    size_t root_count = 0;
+    if (vm && prev_env) {
+        ps_gc_root_push(vm, PS_GC_ROOT_ENV, prev_env);
+        root_count = 1;
+    }
     if (vm) vm->env = call_env;
     PSValue ret = eval_node(vm, call_env, func->body, &inner);
     if (vm) vm->env = prev_env;
+    if (vm && root_count) {
+        ps_gc_root_pop(vm, root_count);
+    }
     ps_env_free(call_env);
     if (inner.did_throw) {
         if (did_throw) *did_throw = 1;

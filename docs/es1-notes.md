@@ -2,7 +2,7 @@
 
 # ProtoScript — ES1 Deviations Only
 
-This document lists only the remaining deviations from [ECMA-262 Edition 1](ECMA-262_1st_edition_june_1997.pdf).
+This document lists only the remaining deviations from [ECMA-262 Edition 1](specs/ECMA-262_1st_edition_june_1997.pdf).
 
 ## 1. String model (UTF-8 / glyphs)
 

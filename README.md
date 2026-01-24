@@ -23,13 +23,14 @@ You can test ProtoScript immediately thanks to a demo running on the web via Web
 ## Documentation
 
 - The technical foundation: [Object Creation with ES1](docs/object_creation.md)
+- Prototype-based OO explained through a linked list: [One example can change everything](docs/prototype_based_oo_explained.md)
 - User guide: [`docs/user_guide/toc.md`](docs/user_guide/toc.md)
 - Language reference: [`docs/language_reference.md`](docs/language_reference.md)
 - ES1 deviations: [`docs/es1-notes.md`](docs/es1-notes.md)
-- String model spec: [`docs/string-spec.md`](docs/string-spec.md)
-- Io module spec: [`docs/io_unified_spec.md`](docs/io_unified_spec.md)
-- GC spec: [`docs/gc_spec.md`](docs/gc_spec.md)
-- ECMA-262 Edition 1 (June 1997): [`docs/ECMA-262_1st_edition_june_1997.pdf`](docs/ECMA-262_1st_edition_june_1997.pdf)
+- String model spec: [`docs/specs/string-spec.md`](docs/specs/string-spec.md)
+- Io module spec: [`docs/specs/io_unified_spec.md`](docs/specs/io_unified_spec.md)
+- GC spec: [`docs/specs/gc_spec.md`](docs/specs/gc_spec.md)
+- ECMA-262 Edition 1 (June 1997): [`docs/specs/ECMA-262_1st_edition_june_1997.pdf`](docs/specs/ECMA-262_1st_edition_june_1997.pdf)
 - License (BSD-3-Clause): [`LICENSE`](LICENSE)
 
 ## Build (Simple, Complete)

@@ -1,6 +1,6 @@
 # ProtoScript — Io Binary Extension
 
-**Status:** Superseded by `docs/io_unified_spec.md` (v1.2). This document is
+**Status:** Superseded by `docs/specs/io_unified_spec.md` (v1.2). This document is
 kept for historical reference only.
 
 **Specification v1.0**

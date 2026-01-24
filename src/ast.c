@@ -205,6 +205,7 @@ PSAstNode *ps_ast_identifier(const char *name, size_t length) {
     copy[length] = '\0';
     n->as.identifier.name = copy;
     n->as.identifier.length = length;
+    n->as.identifier.str = ps_string_from_utf8(copy, length);
     return n;
 }
 

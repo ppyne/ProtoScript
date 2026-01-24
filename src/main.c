@@ -127,6 +127,59 @@ static PSValue ps_native_protoscript_usleep(PSVM *vm, PSValue this_val, int argc
     return ps_value_undefined();
 }
 
+static PSValue ps_native_protoscript_perf_stats(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+
+    if (!vm) return ps_value_undefined();
+    PSObject *obj = ps_object_new(vm->object_proto);
+    if (!obj) return ps_value_undefined();
+
+    ps_object_define(obj,
+                     ps_string_from_cstr("allocCount"),
+                     ps_value_number((double)vm->perf.alloc_count),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("allocBytes"),
+                     ps_value_number((double)vm->perf.alloc_bytes),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("objectNew"),
+                     ps_value_number((double)vm->perf.object_new),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("stringNew"),
+                     ps_value_number((double)vm->perf.string_new),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("functionNew"),
+                     ps_value_number((double)vm->perf.function_new),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("envNew"),
+                     ps_value_number((double)vm->perf.env_new),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("callCount"),
+                     ps_value_number((double)vm->perf.call_count),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("nativeCallCount"),
+                     ps_value_number((double)vm->perf.native_call_count),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("gcCollections"),
+                     ps_value_number((double)vm->gc.collections),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("gcLiveBytes"),
+                     ps_value_number((double)vm->gc.live_bytes_last),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+
+    return ps_value_object(obj);
+}
+
 static void define_protoscript_info(PSVM *vm, int argc, char **argv) {
     if (!vm || !vm->global) return;
     PSObject *info = ps_object_new(vm->object_proto);
@@ -163,6 +216,7 @@ static void define_protoscript_info(PSVM *vm, int argc, char **argv) {
     PSObject *exit_fn = ps_function_new_native(ps_native_protoscript_exit);
     PSObject *sleep_fn = ps_function_new_native(ps_native_protoscript_sleep);
     PSObject *usleep_fn = ps_function_new_native(ps_native_protoscript_usleep);
+    PSObject *perf_fn = ps_function_new_native(ps_native_protoscript_perf_stats);
     if (exit_fn) {
         ps_function_setup(exit_fn, vm->function_proto, vm->object_proto, NULL);
         ps_object_define(info,
@@ -182,6 +236,13 @@ static void define_protoscript_info(PSVM *vm, int argc, char **argv) {
         ps_object_define(info,
                          ps_string_from_cstr("usleep"),
                          ps_value_object(usleep_fn),
+                         PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    }
+    if (perf_fn) {
+        ps_function_setup(perf_fn, vm->function_proto, vm->object_proto, NULL);
+        ps_object_define(info,
+                         ps_string_from_cstr("perfStats"),
+                         ps_value_object(perf_fn),
                          PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
     }
 

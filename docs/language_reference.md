@@ -233,6 +233,7 @@ Object: `ProtoScript`
 - `ProtoScript.exit(code = 0)`
 - `ProtoScript.sleep(seconds)`
 - `ProtoScript.usleep(microseconds)`
+- `ProtoScript.perfStats()`
 
 ### 7.1 Io
 Object: `Io`

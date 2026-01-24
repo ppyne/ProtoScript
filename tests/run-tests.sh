@@ -150,7 +150,10 @@ run_case 87-tonumber-grammar 0
 run_case 88-date-local 0
 run_case 89-regexp-ignorecase-unicode 0
 run_case 90-regexp-robustness 0
-run_case 91-identifier-unicode 0
+unicode_ids=$(awk '/^#define PS_ENABLE_UNICODE_IDENTIFIERS/ {print $3}' include/ps_config.h)
+if [ "${unicode_ids:-0}" -eq 1 ]; then
+    run_case 91-identifier-unicode 0
+fi
 run_case 93-activation-object 0
 run_case 95-activation-attrs 0
 run_case 96-function-constructor 0
@@ -180,7 +183,9 @@ run_case 122-string-search 0
 run_case 123-regexp-static-captures 0
 run_case 124-regexp-static-captures-dot 0
 run_case 125-numeric-literals 0
-run_case 126-unicode-identifiers 0
+if [ "${unicode_ids:-0}" -eq 1 ]; then
+    run_case 126-unicode-identifiers 0
+fi
 run_case 127-default-params 0
 run_case 128-json-parse 0
 run_case 129-json-stringify 0
@@ -219,6 +224,7 @@ run_case 166-this-binding 0
 run_case 167-regexp-ignorecase-latin-extb 0
 run_case 168-fib-recursion 0
 run_case 169-object-proto 0
+run_case 170-perf-stats 0
 
 display_enabled=$(awk '/^#define PS_ENABLE_MODULE_DISPLAY/ {print $3}' include/ps_config.h)
 if [ "${display_enabled:-0}" -eq 1 ]; then

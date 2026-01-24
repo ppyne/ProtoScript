@@ -25,6 +25,8 @@ typedef struct PSProperty {
 typedef struct PSObject {
     struct PSObject *prototype; /* [[Prototype]] */
     PSProperty      *props;     /* own properties */
+    PSString        *cache_name; /* last property lookup key */
+    PSProperty      *cache_prop; /* last property lookup result */
     int              kind;      /* internal type tag */
     void            *internal;  /* internal data */
 } PSObject;

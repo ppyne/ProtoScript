@@ -1,4 +1,5 @@
 #include "ps_lexer.h"
+#include "ps_config.h"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -190,18 +191,19 @@ PSToken ps_lexer_next(PSLexer *lx) {
     }
 
     /* Identifiers / keywords */
-    if (isalpha((unsigned char)c) || c == '_' || c == '$' || (unsigned char)c >= 128 ||
-        (c == '\\' && unicode_escape_after_backslash(lx))) {
+    if (isalpha((unsigned char)c) || c == '_' || c == '$' ||
+        (PS_ENABLE_UNICODE_IDENTIFIERS && (unsigned char)c >= 128) ||
+        (PS_ENABLE_UNICODE_IDENTIFIERS && c == '\\' && unicode_escape_after_backslash(lx))) {
         if (c == '\\') {
             consume_unicode_escape_after_backslash(lx);
         }
         for (;;) {
             if (isalnum((unsigned char)peek(lx)) || peek(lx) == '_' || peek(lx) == '$' ||
-                (unsigned char)peek(lx) >= 128) {
+                (PS_ENABLE_UNICODE_IDENTIFIERS && (unsigned char)peek(lx) >= 128)) {
                 advance(lx);
                 continue;
             }
-            if (peek(lx) == '\\') {
+            if (PS_ENABLE_UNICODE_IDENTIFIERS && peek(lx) == '\\') {
                 advance(lx);
                 if (unicode_escape_after_backslash(lx)) {
                     consume_unicode_escape_after_backslash(lx);

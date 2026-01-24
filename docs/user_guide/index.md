@@ -213,6 +213,7 @@ This index lists core **ProtoScript language concepts**, operators, statements, 
   - `ProtoScript.exit`
   - `ProtoScript.sleep`
   - `ProtoScript.usleep`
+  - `ProtoScript.perfStats`
 
 ---
 

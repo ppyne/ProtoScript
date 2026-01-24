@@ -1,5 +1,7 @@
 #include "ps_object.h"
 #include "ps_gc.h"
+#include "ps_config.h"
+#include "ps_vm.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -17,18 +19,21 @@ static int ps_string_equals(const PSString *a, const PSString *b) {
 
 static PSProperty *find_prop(PSObject *obj, const PSString *name) {
     if (!obj || !name) return NULL;
+    if (obj->cache_prop && obj->cache_name && ps_string_equals(obj->cache_name, name)) {
+        return obj->cache_prop;
+    }
     for (PSProperty *p = obj->props; p; p = p->next) {
-        if (ps_string_equals(p->name, name)) return p;
+        if (ps_string_equals(p->name, name)) {
+            obj->cache_name = p->name;
+            obj->cache_prop = p;
+            return p;
+        }
     }
     return NULL;
 }
 
 static const PSProperty *find_prop_const(const PSObject *obj, const PSString *name) {
-    if (!obj || !name) return NULL;
-    for (const PSProperty *p = obj->props; p; p = p->next) {
-        if (ps_string_equals(p->name, name)) return p;
-    }
-    return NULL;
+    return find_prop((PSObject *)obj, name);
 }
 
 /* --------------------------------------------------------- */
@@ -38,8 +43,16 @@ static const PSProperty *find_prop_const(const PSObject *obj, const PSString *na
 PSObject *ps_object_new(PSObject *prototype) {
     PSObject *o = (PSObject *)ps_gc_alloc(PS_GC_OBJECT, sizeof(PSObject));
     if (!o) return NULL;
+#if PS_ENABLE_PERF
+    PSVM *vm = ps_gc_active_vm();
+    if (vm) {
+        vm->perf.object_new++;
+    }
+#endif
     o->prototype = prototype;
     o->props = NULL;
+    o->cache_name = NULL;
+    o->cache_prop = NULL;
     o->kind = PS_OBJ_KIND_PLAIN;
     o->internal = NULL;
     return o;
@@ -122,6 +135,8 @@ int ps_object_define(PSObject *obj, PSString *name, PSValue value, uint8_t attrs
         }
         p->value = value;
         p->attrs = attrs;
+        obj->cache_name = p->name;
+        obj->cache_prop = p;
         return 1;
     }
 
@@ -135,6 +150,8 @@ int ps_object_define(PSObject *obj, PSString *name, PSValue value, uint8_t attrs
     /* Insert at head (stable enough for now; order is implementation-defined) */
     p->next = obj->props;
     obj->props = p;
+    obj->cache_name = p->name;
+    obj->cache_prop = p;
 
     return 1;
 }
@@ -148,6 +165,8 @@ int ps_object_put(PSObject *obj, PSString *name, PSValue value) {
             return 0;
         }
         p->value = value;
+        obj->cache_name = p->name;
+        obj->cache_prop = p;
         return 1;
     }
 
@@ -175,6 +194,10 @@ int ps_object_delete(PSObject *obj, const PSString *name, int *deleted) {
             if (prev) prev->next = p->next;
             else obj->props = p->next;
 
+            if (obj->cache_prop == p) {
+                obj->cache_prop = NULL;
+                obj->cache_name = NULL;
+            }
             free(p);
             if (deleted) *deleted = 1;
             return 1;

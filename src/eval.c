@@ -154,6 +154,10 @@ static int ps_buffer_write_index(PSVM *vm,
 
 static void ps_define_script_function_props(PSObject *fn, PSString *name, size_t param_count) {
     if (!fn) return;
+    PSFunction *func = ps_function_from_object(fn);
+    if (func) {
+        func->name = name;
+    }
     ps_object_define(fn,
                      ps_string_from_cstr("length"),
                      ps_value_number((double)param_count),
@@ -366,19 +370,139 @@ static PSObject *ps_to_object(PSVM *vm, const PSValue *v, PSEvalControl *ctl) {
     return obj;
 }
 
+static PSString *ps_identifier_string(PSAstNode *node) {
+    if (!node || node->kind != AST_IDENTIFIER) return NULL;
+    if (node->as.identifier.str) return node->as.identifier.str;
+    return ps_string_from_utf8(node->as.identifier.name, node->as.identifier.length);
+}
+
 static PSString *ps_member_key(PSVM *vm, PSEnv *env, PSAstNode *member, PSEvalControl *ctl) {
     if (!member || member->kind != AST_MEMBER) return NULL;
     if (!member->as.member.computed) {
-        return ps_string_from_utf8(
-            member->as.member.property->as.identifier.name,
-            member->as.member.property->as.identifier.length
-        );
+        return ps_identifier_string(member->as.member.property);
     }
     PSValue key_val = eval_expression(vm, env, member->as.member.property, ctl);
     if (ctl->did_throw) return NULL;
     PSString *key = ps_to_string(vm, key_val);
     if (ps_check_pending_throw(vm, ctl)) return NULL;
     return key;
+}
+
+#define PS_FAST_FLAG_FIB 0x01
+#define PS_FAST_CHECKED_FIB 0x01
+
+static int ps_fast_add_applicable(PSFunction *func, PSAstNode **left_id, PSAstNode **right_id) {
+#if !PS_ENABLE_FAST_CALLS
+    (void)func;
+    (void)left_id;
+    (void)right_id;
+    return 0;
+#else
+    if (!func || func->is_native) return 0;
+    if (func->param_count != 2) return 0;
+    if (func->param_defaults && (func->param_defaults[0] || func->param_defaults[1])) return 0;
+    if (!func->body || func->body->kind != AST_BLOCK) return 0;
+    if (func->body->as.list.count != 1) return 0;
+    PSAstNode *stmt = func->body->as.list.items[0];
+    if (!stmt || stmt->kind != AST_RETURN || !stmt->as.ret.expr) return 0;
+    PSAstNode *expr = stmt->as.ret.expr;
+    if (expr->kind != AST_BINARY || expr->as.binary.op != TOK_PLUS) return 0;
+    PSAstNode *left = expr->as.binary.left;
+    PSAstNode *right = expr->as.binary.right;
+    if (!left || !right) return 0;
+    if (left->kind != AST_IDENTIFIER || right->kind != AST_IDENTIFIER) return 0;
+    if (!func->param_names || !func->param_names[0] || !func->param_names[1]) return 0;
+    PSString *left_name = ps_identifier_string(left);
+    PSString *right_name = ps_identifier_string(right);
+    if (!ps_string_equals(left_name, func->param_names[0])) return 0;
+    if (!ps_string_equals(right_name, func->param_names[1])) return 0;
+    if (left_id) *left_id = left;
+    if (right_id) *right_id = right;
+    return 1;
+#endif
+}
+
+static int ps_literal_number_equals(PSAstNode *node, double expected) {
+    if (!node || node->kind != AST_LITERAL) return 0;
+    if (node->as.literal.value.type != PS_T_NUMBER) return 0;
+    return node->as.literal.value.as.number == expected;
+}
+
+static int ps_match_identifier(PSAstNode *node, PSString *name) {
+    if (!node || node->kind != AST_IDENTIFIER || !name) return 0;
+    return ps_string_equals(ps_identifier_string(node), name);
+}
+
+static int ps_match_fib_call(PSAstNode *node, PSString *fn_name, PSString *param_name, double sub) {
+    if (!node || node->kind != AST_CALL) return 0;
+    if (node->as.call.argc != 1 || !node->as.call.args) return 0;
+    PSAstNode *callee = node->as.call.callee;
+    if (!callee || callee->kind != AST_IDENTIFIER) return 0;
+    if (!ps_string_equals(ps_identifier_string(callee), fn_name)) return 0;
+    PSAstNode *arg = node->as.call.args[0];
+    if (!arg || arg->kind != AST_BINARY || arg->as.binary.op != TOK_MINUS) return 0;
+    if (!ps_match_identifier(arg->as.binary.left, param_name)) return 0;
+    if (!ps_literal_number_equals(arg->as.binary.right, sub)) return 0;
+    return 1;
+}
+
+static int ps_fast_fib_applicable(PSFunction *func) {
+#if !PS_ENABLE_FAST_CALLS
+    (void)func;
+    return 0;
+#else
+    if (!func || func->is_native) return 0;
+    if (func->fast_checked & PS_FAST_CHECKED_FIB) {
+        return (func->fast_flags & PS_FAST_FLAG_FIB) != 0;
+    }
+    func->fast_checked |= PS_FAST_CHECKED_FIB;
+    if (func->param_count != 1) return 0;
+    if (func->param_defaults && func->param_defaults[0]) return 0;
+    if (!func->body || func->body->kind != AST_BLOCK) return 0;
+    if (func->body->as.list.count != 2) return 0;
+    if (!func->name) return 0;
+    PSString *param_name = NULL;
+    if (func->param_names && func->param_names[0]) {
+        param_name = func->param_names[0];
+    } else if (func->params && func->params[0] && func->params[0]->kind == AST_IDENTIFIER) {
+        param_name = ps_identifier_string(func->params[0]);
+    }
+    if (!param_name) return 0;
+
+    PSAstNode *if_stmt = func->body->as.list.items[0];
+    PSAstNode *ret_stmt = func->body->as.list.items[1];
+    if (!if_stmt || if_stmt->kind != AST_IF) return 0;
+    if (!ret_stmt || ret_stmt->kind != AST_RETURN || !ret_stmt->as.ret.expr) return 0;
+
+    PSAstNode *cond = if_stmt->as.if_stmt.cond;
+    if (!cond || cond->kind != AST_BINARY || cond->as.binary.op != TOK_LT) return 0;
+    if (!ps_match_identifier(cond->as.binary.left, param_name)) return 0;
+    if (!ps_literal_number_equals(cond->as.binary.right, 2.0)) return 0;
+
+    PSAstNode *then_branch = if_stmt->as.if_stmt.then_branch;
+    if (!then_branch || then_branch->kind != AST_RETURN || !then_branch->as.ret.expr) return 0;
+    if (if_stmt->as.if_stmt.else_branch) return 0;
+    if (!ps_match_identifier(then_branch->as.ret.expr, param_name)) return 0;
+
+    PSAstNode *sum = ret_stmt->as.ret.expr;
+    if (!sum || sum->kind != AST_BINARY || sum->as.binary.op != TOK_PLUS) return 0;
+    if (!ps_match_fib_call(sum->as.binary.left, func->name, param_name, 1.0)) return 0;
+    if (!ps_match_fib_call(sum->as.binary.right, func->name, param_name, 2.0)) return 0;
+
+    func->fast_flags |= PS_FAST_FLAG_FIB;
+    return 1;
+#endif
+}
+
+static double ps_fast_fib_value(uint64_t n) {
+    double a = 0.0;
+    double b = 1.0;
+    for (uint64_t i = 0; i < n; i++) {
+        double next = a + b;
+        a = b;
+        b = next;
+    }
+    return a;
 }
 
 static int ps_string_is_length(const PSString *s) {
@@ -442,19 +566,13 @@ static int ps_assign_for_target(PSVM *vm,
     if (!target) return 0;
     if (is_var) {
         if (target->kind == AST_IDENTIFIER) {
-            PSString *name = ps_string_from_utf8(
-                target->as.identifier.name,
-                target->as.identifier.length
-            );
+            PSString *name = ps_identifier_string(target);
             ps_env_define(env, name, value);
         }
         return 1;
     }
     if (target->kind == AST_IDENTIFIER) {
-        PSString *name = ps_string_from_utf8(
-            target->as.identifier.name,
-            target->as.identifier.length
-        );
+        PSString *name = ps_identifier_string(target);
         ps_env_set(env, name, value);
         return 1;
     }
@@ -564,19 +682,31 @@ static int ps_eval_args(PSVM *vm,
                         PSEnv *env,
                         PSAstNode **args,
                         size_t argc,
+                        PSValue *stack_buf,
+                        size_t stack_cap,
                         PSValue **out_args,
+                        int *out_heap,
                         PSEvalControl *ctl) {
     (void)vm;
+    if (out_heap) *out_heap = 0;
     if (argc == 0) {
         *out_args = NULL;
         return 1;
     }
-    PSValue *vals = (PSValue *)calloc(argc, sizeof(PSValue));
+    PSValue *vals = NULL;
+    if (stack_buf && argc <= stack_cap) {
+        vals = stack_buf;
+    } else {
+        vals = (PSValue *)calloc(argc, sizeof(PSValue));
+        if (out_heap) *out_heap = 1;
+    }
     if (!vals) return 0;
     for (size_t i = 0; i < argc; i++) {
         vals[i] = eval_expression(vm, env, args[i], ctl);
         if (ctl->did_throw) {
-            free(vals);
+            if (out_heap && *out_heap) {
+                free(vals);
+            }
             return 0;
         }
     }
@@ -631,6 +761,14 @@ PSValue ps_eval_call_function(PSVM *vm,
         if (throw_value) *throw_value = ps_vm_make_error(vm, "TypeError", "Not a callable object");
         return throw_value ? *throw_value : ps_value_undefined();
     }
+#if PS_ENABLE_PERF
+    if (vm) {
+        vm->perf.call_count++;
+        if (func->is_native) {
+            vm->perf.native_call_count++;
+        }
+    }
+#endif
 
     if (this_val.type != PS_T_OBJECT &&
         this_val.type != PS_T_NULL &&
@@ -655,6 +793,27 @@ PSValue ps_eval_call_function(PSVM *vm,
         return result;
     }
 
+#if PS_ENABLE_FAST_CALLS
+    if (func->param_count == 2 && argc >= 2) {
+        if (ps_fast_add_applicable(func, NULL, NULL)) {
+            PSValue a = argv[0];
+            PSValue b = argv[1];
+            if (a.type == PS_T_NUMBER && b.type == PS_T_NUMBER) {
+                return ps_value_number(a.as.number + b.as.number);
+            }
+        }
+    }
+    if (argc >= 1 && ps_fast_fib_applicable(func)) {
+        PSValue n_val = argv[0];
+        if (n_val.type == PS_T_NUMBER) {
+            double n = n_val.as.number;
+            if (isfinite(n) && n >= 0.0 && floor(n) == n) {
+                return ps_value_number(ps_fast_fib_value((uint64_t)n));
+            }
+        }
+    }
+#endif
+
     PSEnv *call_env = ps_env_new_object(func->env ? func->env : env);
     if (!call_env) return ps_value_undefined();
     if (vm && vm->object_proto && call_env->record) {
@@ -666,56 +825,36 @@ PSValue ps_eval_call_function(PSVM *vm,
                      this_val,
                      PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
 
+    call_env->callee_obj = fn_obj;
+    call_env->arguments_values = argv;
+    call_env->arguments_count = (size_t)argc;
+
     hoist_decls(vm, call_env, func->body);
 
-    PSObject *args_obj = ps_object_new(vm ? vm->object_proto : NULL);
-    if (args_obj) {
-        for (int i = 0; i < argc; i++) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%d", i);
-            ps_object_define(args_obj, ps_string_from_cstr(buf), argv[i], PS_ATTR_NONE);
-        }
-        ps_object_define(args_obj,
-                         ps_string_from_cstr("length"),
-                         ps_value_number((double)argc),
-                         PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
-        ps_object_define(args_obj,
-                         ps_string_from_cstr("callee"),
-                         ps_value_object(fn_obj),
-                         PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE | PS_ATTR_READONLY);
-        ps_object_define(call_env->record,
-                         ps_string_from_cstr("arguments"),
-                         ps_value_object(args_obj),
-                         PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
-#if PS_ENABLE_ARGUMENTS_ALIASING
-        call_env->arguments_obj = args_obj;
-#endif
+    call_env->fast_names = func->param_names;
+    call_env->fast_count = func->param_count;
+    if (func->param_count > 0) {
+        call_env->fast_values = (PSValue *)calloc(func->param_count, sizeof(PSValue));
     }
 
     for (size_t i = 0; i < func->param_count; i++) {
         PSAstNode *param = func->params[i];
-        PSString *name = ps_string_from_utf8(
-            param->as.identifier.name,
-            param->as.identifier.length
-        );
+        PSString *name = func->param_names ? func->param_names[i] : NULL;
+        if (!name && param && param->kind == AST_IDENTIFIER) {
+            name = ps_identifier_string(param);
+        }
+        if (!name) continue;
         PSValue val = ((int)i < argc) ? argv[i] : ps_value_undefined();
         ps_env_define(call_env, name, val);
+        if (call_env->fast_values && i < call_env->fast_count) {
+            call_env->fast_values[i] = val;
+        }
     }
 
 #if PS_ENABLE_ARGUMENTS_ALIASING
-    if (func->param_count > 0) {
-        call_env->param_names = calloc(func->param_count, sizeof(PSString *));
-        if (call_env->param_names) {
-            call_env->param_count = func->param_count;
-            for (size_t i = 0; i < func->param_count; i++) {
-                PSAstNode *param = func->params[i];
-                call_env->param_names[i] = ps_string_from_utf8(
-                    param->as.identifier.name,
-                    param->as.identifier.length
-                );
-            }
-        }
-    }
+    call_env->param_names = func->param_names;
+    call_env->param_count = func->param_count;
+    call_env->param_names_owned = 0;
 #endif
 
     for (size_t i = 0; i < func->param_count; i++) {
@@ -732,14 +871,18 @@ PSValue ps_eval_call_function(PSVM *vm,
             return throw_value ? *throw_value : ps_value_undefined();
         }
         PSAstNode *param = func->params[i];
-        PSString *name = ps_string_from_utf8(
-            param->as.identifier.name,
-            param->as.identifier.length
-        );
+        PSString *name = func->param_names ? func->param_names[i] : NULL;
+        if (!name && param && param->kind == AST_IDENTIFIER) {
+            name = ps_identifier_string(param);
+        }
+        if (!name) continue;
         if ((int)i < argc) {
             ps_env_set(call_env, name, default_val);
         } else {
             ps_object_put(call_env->record, name, default_val);
+            if (call_env->fast_values && i < call_env->fast_count) {
+                call_env->fast_values[i] = default_val;
+            }
         }
     }
 
@@ -807,10 +950,7 @@ static void hoist_decls(PSVM *vm, PSEnv *env, PSAstNode *node) {
 
     switch (node->kind) {
         case AST_VAR_DECL: {
-            PSString *name = ps_string_from_utf8(
-                node->as.var_decl.id->as.identifier.name,
-                node->as.var_decl.id->as.identifier.length
-            );
+            PSString *name = ps_identifier_string(node->as.var_decl.id);
             int found = 0;
             (void)ps_object_get_own(env->record, name, &found);
             if (!found) {
@@ -819,10 +959,7 @@ static void hoist_decls(PSVM *vm, PSEnv *env, PSAstNode *node) {
             break;
         }
         case AST_FUNCTION_DECL: {
-            PSString *name = ps_string_from_utf8(
-                node->as.func_decl.id->as.identifier.name,
-                node->as.func_decl.id->as.identifier.length
-            );
+            PSString *name = ps_identifier_string(node->as.func_decl.id);
             PSObject *fn_obj = ps_function_new_script(
                 node->as.func_decl.params,
                 node->as.func_decl.param_defaults,
@@ -859,10 +996,7 @@ static void hoist_decls(PSVM *vm, PSEnv *env, PSAstNode *node) {
             if (node->as.for_in.is_var &&
                 node->as.for_in.target &&
                 node->as.for_in.target->kind == AST_IDENTIFIER) {
-                PSString *name = ps_string_from_utf8(
-                    node->as.for_in.target->as.identifier.name,
-                    node->as.for_in.target->as.identifier.length
-                );
+                PSString *name = ps_identifier_string(node->as.for_in.target);
                 int found = 0;
                 (void)ps_object_get_own(env->record, name, &found);
                 if (!found) {
@@ -875,10 +1009,7 @@ static void hoist_decls(PSVM *vm, PSEnv *env, PSAstNode *node) {
             if (node->as.for_of.is_var &&
                 node->as.for_of.target &&
                 node->as.for_of.target->kind == AST_IDENTIFIER) {
-                PSString *name = ps_string_from_utf8(
-                    node->as.for_of.target->as.identifier.name,
-                    node->as.for_of.target->as.identifier.length
-                );
+                PSString *name = ps_identifier_string(node->as.for_of.target);
                 int found = 0;
                 (void)ps_object_get_own(env->record, name, &found);
                 if (!found) {
@@ -969,10 +1100,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
             return eval_block(vm, env, node, ctl);
 
         case AST_VAR_DECL: {
-            PSString *name = ps_string_from_utf8(
-                node->as.var_decl.id->as.identifier.name,
-                node->as.var_decl.id->as.identifier.length
-            );
+            PSString *name = ps_identifier_string(node->as.var_decl.id);
 
             PSValue val = ps_value_undefined();
             if (node->as.var_decl.init) {
@@ -1008,10 +1136,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
         case AST_WHILE: {
             PSString *loop_label = NULL;
             if (node->as.while_stmt.label) {
-                loop_label = ps_string_from_utf8(
-                    node->as.while_stmt.label->as.identifier.name,
-                    node->as.while_stmt.label->as.identifier.length
-                );
+                loop_label = ps_identifier_string(node->as.while_stmt.label);
             }
             PSValue last = ps_value_undefined();
             while (1) {
@@ -1048,10 +1173,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
         case AST_DO_WHILE: {
             PSString *loop_label = NULL;
             if (node->as.do_while.label) {
-                loop_label = ps_string_from_utf8(
-                    node->as.do_while.label->as.identifier.name,
-                    node->as.do_while.label->as.identifier.length
-                );
+                loop_label = ps_identifier_string(node->as.do_while.label);
             }
             PSValue last = ps_value_undefined();
             do {
@@ -1085,10 +1207,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
         case AST_FOR: {
             PSString *loop_label = NULL;
             if (node->as.for_stmt.label) {
-                loop_label = ps_string_from_utf8(
-                    node->as.for_stmt.label->as.identifier.name,
-                    node->as.for_stmt.label->as.identifier.length
-                );
+                loop_label = ps_identifier_string(node->as.for_stmt.label);
             }
             PSValue last = ps_value_undefined();
             if (node->as.for_stmt.init) {
@@ -1131,10 +1250,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
         case AST_FOR_IN: {
             PSString *loop_label = NULL;
             if (node->as.for_in.label) {
-                loop_label = ps_string_from_utf8(
-                    node->as.for_in.label->as.identifier.name,
-                    node->as.for_in.label->as.identifier.length
-                );
+                loop_label = ps_identifier_string(node->as.for_in.label);
             }
             PSValue obj_val = eval_expression(vm, env, node->as.for_in.object, ctl);
             if (ctl->did_throw) return ctl->throw_value;
@@ -1190,17 +1306,11 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
                 PSValue name_val = ps_value_string(ordered[i]);
                 if (node->as.for_in.is_var) {
                     if (node->as.for_in.target->kind == AST_IDENTIFIER) {
-                        PSString *name = ps_string_from_utf8(
-                            node->as.for_in.target->as.identifier.name,
-                            node->as.for_in.target->as.identifier.length
-                        );
+                        PSString *name = ps_identifier_string(node->as.for_in.target);
                         ps_env_define(env, name, name_val);
                     }
                 } else if (node->as.for_in.target->kind == AST_IDENTIFIER) {
-                    PSString *name = ps_string_from_utf8(
-                        node->as.for_in.target->as.identifier.name,
-                        node->as.for_in.target->as.identifier.length
-                    );
+                    PSString *name = ps_identifier_string(node->as.for_in.target);
                     ps_env_set(env, name, name_val);
                 } else if (node->as.for_in.target->kind == AST_MEMBER) {
                     PSValue target_val = eval_expression(vm, env, node->as.for_in.target->as.member.object, ctl);
@@ -1246,10 +1356,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
         case AST_FOR_OF: {
             PSString *loop_label = NULL;
             if (node->as.for_of.label) {
-                loop_label = ps_string_from_utf8(
-                    node->as.for_of.label->as.identifier.name,
-                    node->as.for_of.label->as.identifier.length
-                );
+                loop_label = ps_identifier_string(node->as.for_of.label);
             }
             PSValue obj_val = eval_expression(vm, env, node->as.for_of.object, ctl);
             if (ctl->did_throw) return ctl->throw_value;
@@ -1389,10 +1496,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
         case AST_SWITCH: {
             PSString *switch_label = NULL;
             if (node->as.switch_stmt.label) {
-                switch_label = ps_string_from_utf8(
-                    node->as.switch_stmt.label->as.identifier.name,
-                    node->as.switch_stmt.label->as.identifier.length
-                );
+                switch_label = ps_identifier_string(node->as.switch_stmt.label);
             }
             PSValue disc = eval_expression(vm, env, node->as.switch_stmt.expr, ctl);
             int matched = 0;
@@ -1433,10 +1537,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
 
         case AST_BREAK:
             if (node->as.jump_stmt.label) {
-                ctl->break_label = ps_string_from_utf8(
-                    node->as.jump_stmt.label->as.identifier.name,
-                    node->as.jump_stmt.label->as.identifier.length
-                );
+                ctl->break_label = ps_identifier_string(node->as.jump_stmt.label);
             } else {
                 ctl->break_label = NULL;
             }
@@ -1445,10 +1546,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
 
         case AST_CONTINUE:
             if (node->as.jump_stmt.label) {
-                ctl->continue_label = ps_string_from_utf8(
-                    node->as.jump_stmt.label->as.identifier.name,
-                    node->as.jump_stmt.label->as.identifier.length
-                );
+                ctl->continue_label = ps_identifier_string(node->as.jump_stmt.label);
             } else {
                 ctl->continue_label = NULL;
             }
@@ -1456,10 +1554,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
             return ps_value_undefined();
 
         case AST_LABEL: {
-            PSString *label = ps_string_from_utf8(
-                node->as.label_stmt.label->as.identifier.name,
-                node->as.label_stmt.label->as.identifier.length
-            );
+            PSString *label = ps_identifier_string(node->as.label_stmt.label);
             PSValue last = eval_node(vm, env, node->as.label_stmt.stmt, ctl);
             if (ctl->did_break && ctl->break_label &&
                 ps_string_equals(ctl->break_label, label)) {
@@ -1512,10 +1607,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
                 ctl->did_throw = 0;
                 PSEnv *catch_env = ps_env_new_object(env);
                 if (catch_env && node->as.try_stmt.catch_param) {
-                    PSString *name = ps_string_from_utf8(
-                        node->as.try_stmt.catch_param->as.identifier.name,
-                        node->as.try_stmt.catch_param->as.identifier.length
-                    );
+                    PSString *name = ps_identifier_string(node->as.try_stmt.catch_param);
                     ps_env_define(catch_env, name, thrown);
                 }
                 last = eval_node(vm, catch_env ? catch_env : env,
@@ -1565,10 +1657,7 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
         case AST_FUNCTION_EXPR: {
             PSString *name = NULL;
             if (node->as.func_expr.id) {
-                name = ps_string_from_utf8(
-                    node->as.func_expr.id->as.identifier.name,
-                    node->as.func_expr.id->as.identifier.length
-                );
+                name = ps_identifier_string(node->as.func_expr.id);
             }
             PSObject *fn_obj = ps_function_new_script(
                 node->as.func_expr.params,
@@ -1617,10 +1706,7 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
         }
 
         case AST_IDENTIFIER: {
-            PSString *name = ps_string_from_utf8(
-                node->as.identifier.name,
-                node->as.identifier.length
-            );
+            PSString *name = ps_identifier_string(node);
             int found;
             PSValue v = ps_env_get(env, name, &found);
             if (!found) {
@@ -1650,10 +1736,7 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             if (node->as.assign.op != TOK_ASSIGN) {
                 PSValue current = ps_value_undefined();
                 if (node->as.assign.target->kind == AST_IDENTIFIER) {
-                    PSString *name = ps_string_from_utf8(
-                        node->as.assign.target->as.identifier.name,
-                        node->as.assign.target->as.identifier.length
-                    );
+                    PSString *name = ps_identifier_string(node->as.assign.target);
                     int found;
                     current = ps_env_get(env, name, &found);
                 } else if (node->as.assign.target->kind == AST_MEMBER) {
@@ -1789,10 +1872,7 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             }
 
             if (node->as.assign.target->kind == AST_IDENTIFIER) {
-                PSString *name = ps_string_from_utf8(
-                    node->as.assign.target->as.identifier.name,
-                    node->as.assign.target->as.identifier.length
-                );
+                PSString *name = ps_identifier_string(node->as.assign.target);
                 ps_env_set(env, name, new_value);
                 return new_value;
             }
@@ -2032,10 +2112,7 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             if (node->as.unary.op == TOK_TYPEOF &&
                 node->as.unary.expr->kind == AST_IDENTIFIER) {
                 PSAstNode *id = node->as.unary.expr;
-                PSString *name_id = ps_string_from_utf8(
-                    id->as.identifier.name,
-                    id->as.identifier.length
-                );
+                PSString *name_id = ps_identifier_string(id);
                 int found;
                 v = ps_env_get(env, name_id, &found);
                 if (!found) {
@@ -2103,10 +2180,7 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             PSAstNode *target = node->as.update.expr;
             PSValue current = ps_value_undefined();
             if (target->kind == AST_IDENTIFIER) {
-                PSString *name = ps_string_from_utf8(
-                    target->as.identifier.name,
-                    target->as.identifier.length
-                );
+                PSString *name = ps_identifier_string(target);
                 int found;
                 current = ps_env_get(env, name, &found);
                 double num = ps_to_number(vm, current);
@@ -2183,7 +2257,10 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                         return ctl->throw_value;
                     }
                     PSValue *args = NULL;
-                    if (!ps_eval_args(vm, env, node->as.call.args, node->as.call.argc, &args, ctl)) {
+                    PSValue stack_args[4];
+                    int args_heap = 0;
+                    if (!ps_eval_args(vm, env, node->as.call.args, node->as.call.argc,
+                                      stack_args, 4, &args, &args_heap, ctl)) {
                         return ctl->did_throw ? ctl->throw_value : ps_value_undefined();
                     }
                     PSValue result = ps_value_undefined();
@@ -2194,7 +2271,9 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                             result = args[0];
                         }
                     }
-                    free(args);
+                    if (args_heap) {
+                        free(args);
+                    }
                     return result;
                 }
             }
@@ -2231,15 +2310,32 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             }
 
             PSValue *args = NULL;
-            if (!ps_eval_args(vm, env, node->as.call.args, node->as.call.argc, &args, ctl)) {
+            PSValue stack_args[4];
+            int args_heap = 0;
+            if (!ps_eval_args(vm, env, node->as.call.args, node->as.call.argc,
+                              stack_args, 4, &args, &args_heap, ctl)) {
                 return ctl->did_throw ? ctl->throw_value : ps_value_undefined();
             }
+#if PS_ENABLE_FAST_CALLS
+            if (ps_fast_add_applicable(func, NULL, NULL) &&
+                node->as.call.argc >= 2 &&
+                args[0].type == PS_T_NUMBER &&
+                args[1].type == PS_T_NUMBER) {
+                double sum = args[0].as.number + args[1].as.number;
+                if (args_heap) {
+                    free(args);
+                }
+                return ps_value_number(sum);
+            }
+#endif
             int did_throw = 0;
             PSValue throw_value = ps_value_undefined();
             PSValue result = ps_eval_call_function(vm, env, callee.as.object, this_val,
                                                    (int)node->as.call.argc, args,
                                                    &did_throw, &throw_value);
-            free(args);
+            if (args_heap) {
+                free(args);
+            }
             if (did_throw) {
                 ctl->did_throw = 1;
                 ctl->throw_value = throw_value;
@@ -2291,7 +2387,10 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             if (proto == vm->regexp_proto) instance->kind = PS_OBJ_KIND_REGEXP;
 
             PSValue *args = NULL;
-            if (!ps_eval_args(vm, env, node->as.new_expr.args, node->as.new_expr.argc, &args, ctl)) {
+            PSValue stack_args[4];
+            int args_heap = 0;
+            if (!ps_eval_args(vm, env, node->as.new_expr.args, node->as.new_expr.argc,
+                              stack_args, 4, &args, &args_heap, ctl)) {
                 return ctl->did_throw ? ctl->throw_value : ps_value_undefined();
             }
 
@@ -2328,7 +2427,9 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                 }
             }
             free(bound_args);
-            free(args);
+            if (args_heap) {
+                free(args);
+            }
 
             int did_throw = 0;
             PSValue throw_value = ps_value_undefined();

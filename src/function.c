@@ -3,6 +3,8 @@
 #include "ps_ast.h"
 #include "ps_string.h"
 #include "ps_gc.h"
+#include "ps_config.h"
+#include "ps_vm.h"
 
 #include <stdlib.h>
 
@@ -15,8 +17,21 @@ PSObject *ps_function_new_native(PSNativeFunc fn) {
         ps_object_free(obj);
         return NULL;
     }
+#if PS_ENABLE_PERF
+    {
+        PSVM *vm = ps_gc_active_vm();
+        if (vm) {
+            vm->perf.function_new++;
+        }
+    }
+#endif
     func->is_native = 1;
     func->native = fn;
+    func->param_names = NULL;
+    func->name = NULL;
+    func->param_count = 0;
+    func->fast_flags = 0;
+    func->fast_checked = 0;
 
     obj->kind = PS_OBJ_KIND_FUNCTION;
     obj->internal = func;
@@ -36,6 +51,14 @@ PSObject *ps_function_new_script(PSAstNode **params,
         ps_object_free(obj);
         return NULL;
     }
+#if PS_ENABLE_PERF
+    {
+        PSVM *vm = ps_gc_active_vm();
+        if (vm) {
+            vm->perf.function_new++;
+        }
+    }
+#endif
 
     func->is_native = 0;
     func->params = params;
@@ -43,6 +66,28 @@ PSObject *ps_function_new_script(PSAstNode **params,
     func->param_count = param_count;
     func->body = body;
     func->env = env;
+    func->param_names = NULL;
+    func->name = NULL;
+    func->fast_flags = 0;
+    func->fast_checked = 0;
+    if (param_count > 0 && params) {
+        func->param_names = (PSString **)calloc(param_count, sizeof(PSString *));
+        if (func->param_names) {
+            for (size_t i = 0; i < param_count; i++) {
+                if (params[i] && params[i]->kind == AST_IDENTIFIER) {
+                    PSAstNode *param = params[i];
+                    if (param->as.identifier.str) {
+                        func->param_names[i] = param->as.identifier.str;
+                    } else {
+                        func->param_names[i] = ps_string_from_utf8(
+                            param->as.identifier.name,
+                            param->as.identifier.length
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     obj->kind = PS_OBJ_KIND_FUNCTION;
     obj->internal = func;

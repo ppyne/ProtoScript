@@ -1,5 +1,7 @@
 #include "ps_string.h"
 #include "ps_gc.h"
+#include "ps_config.h"
+#include "ps_vm.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +39,14 @@ static uint32_t utf8_decode(const unsigned char *p, int len) {
 PSString *ps_string_from_utf8(const char *data, size_t byte_len) {
     PSString *s = (PSString *)ps_gc_alloc(PS_GC_STRING, sizeof(PSString));
     if (!s) return NULL;
+#if PS_ENABLE_PERF
+    {
+        PSVM *vm = ps_gc_active_vm();
+        if (vm) {
+            vm->perf.string_new++;
+        }
+    }
+#endif
 
     s->utf8 = malloc(byte_len);
     if (!s->utf8) {

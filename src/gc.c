@@ -1,4 +1,7 @@
 #include "ps_gc.h"
+#include "ps_config.h"
+
+#include <stdlib.h>
 #include "ps_vm.h"
 #include "ps_object.h"
 #include "ps_string.h"
@@ -70,6 +73,10 @@ void *ps_gc_alloc_vm(PSVM *vm, PSGCType type, size_t size) {
     vm->gc.head = hdr;
     vm->gc.heap_bytes += size;
     vm->gc.bytes_since_gc += size;
+#if PS_ENABLE_PERF
+    vm->perf.alloc_count++;
+    vm->perf.alloc_bytes += (uint64_t)size;
+#endif
     if (vm->gc.bytes_since_gc >= vm->gc.threshold) {
         vm->gc.should_collect = 1;
     }
@@ -199,6 +206,9 @@ static void ps_gc_mark_ast_node(PSVM *vm, PSAstNode *node) {
             ps_gc_mark_ast_node(vm, node->as.func_expr.body);
             break;
         case AST_IDENTIFIER:
+            if (node->as.identifier.str) {
+                ps_gc_mark_string(vm, node->as.identifier.str);
+            }
             break;
         case AST_LITERAL:
             ps_gc_mark_value(vm, node->as.literal.value);
@@ -288,6 +298,12 @@ static void ps_gc_mark_function(PSVM *vm, PSFunction *fn) {
             ps_gc_mark_ast_node(vm, fn->param_defaults[i]);
         }
     }
+    if (fn->param_names) {
+        for (size_t i = 0; i < fn->param_count; i++) {
+            ps_gc_mark_string(vm, fn->param_names[i]);
+        }
+    }
+    ps_gc_mark_string(vm, fn->name);
 }
 
 static void ps_gc_mark_env(PSVM *vm, PSEnv *env) {
@@ -299,6 +315,7 @@ static void ps_gc_mark_env(PSVM *vm, PSEnv *env) {
     ps_gc_mark_env(vm, env->parent);
     ps_gc_mark_object(vm, env->record);
     ps_gc_mark_object(vm, env->arguments_obj);
+    ps_gc_mark_object(vm, env->callee_obj);
     if (env->param_names) {
         for (size_t i = 0; i < env->param_count; i++) {
             ps_gc_mark_string(vm, env->param_names[i]);
@@ -457,13 +474,21 @@ static void ps_gc_finalize_string(PSString *s) {
 
 static void ps_gc_finalize_env(PSEnv *env) {
     if (!env) return;
-    free(env->param_names);
+    if (env->param_names_owned) {
+        free(env->param_names);
+    }
     env->param_names = NULL;
     env->param_count = 0;
+    env->param_names_owned = 0;
+    free(env->fast_values);
+    env->fast_values = NULL;
+    env->fast_count = 0;
 }
 
 static void ps_gc_finalize_function(PSFunction *fn) {
     if (!fn) return;
+    free(fn->param_names);
+    fn->param_names = NULL;
     /* Function references are owned by AST or env; nothing to free here. */
 }
 

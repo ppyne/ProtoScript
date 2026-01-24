@@ -229,7 +229,7 @@ Errors:
 ## 5. Host extensions (non-ES1)
 
 Global objects beyond ES1:
-- `ProtoScript` (`args`, `version`, `exit`, `sleep`, `usleep`)
+- `ProtoScript` (`args`, `version`, `exit`, `sleep`, `usleep`, `perfStats`)
 - `Io` (`print`, `sprintf`, file I/O, streams)
 - `Fs` (POSIX filesystem helpers)
 - `Buffer` (byte buffers)

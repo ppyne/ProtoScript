@@ -74,6 +74,7 @@ ProtoScript also exposes a global `ProtoScript` object with runtime metadata:
 - `ProtoScript.exit(code = 0)`: exit the interpreter with a status code
 - `ProtoScript.sleep(seconds)`: sleep in seconds (integer)
 - `ProtoScript.usleep(microseconds)`: sleep in microseconds (integer)
+- `ProtoScript.perfStats()`: returns a snapshot of runtime counters
 
 Example:
 
@@ -83,6 +84,7 @@ Io.print(ProtoScript.args.length + "\n");
 // ProtoScript.exit(0);
 // ProtoScript.sleep(1);
 // ProtoScript.usleep(500000);
+// ProtoScript.perfStats();
 ```
 
 ---

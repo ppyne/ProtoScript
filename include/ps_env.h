@@ -4,13 +4,22 @@
 #include "ps_object.h"
 #include "ps_value.h"
 
+struct PSAstNode;
+
 typedef struct PSEnv {
     struct PSEnv *parent;
     PSObject     *record;
     int           owns_record;
     PSObject     *arguments_obj;
+    PSObject     *callee_obj;
+    PSValue      *arguments_values;
+    size_t        arguments_count;
+    PSString    **fast_names;
+    PSValue      *fast_values;
+    size_t        fast_count;
     PSString    **param_names;
     size_t        param_count;
+    int           param_names_owned;
 } PSEnv;
 
 PSEnv  *ps_env_new(PSEnv *parent, PSObject *record, int owns_record);

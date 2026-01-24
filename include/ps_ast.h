@@ -204,6 +204,7 @@ struct PSAstNode {
         struct {
             const char *name;
             size_t      length;
+            PSString   *str;
         } identifier;
 
         /* literal (number, string, boolean, null, undefined) */

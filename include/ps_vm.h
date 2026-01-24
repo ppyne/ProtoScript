@@ -7,6 +7,8 @@
 #include "ps_env.h"
 #include "ps_gc.h"
 
+#include <stdint.h>
+
 struct PSAstNode;
 struct PSDisplay;
 
@@ -16,6 +18,17 @@ struct PSDisplay;
  * This structure represents a single execution environment.
  * It owns the global object and all host-provided bindings.
  */
+typedef struct PSPerfStats {
+    uint64_t alloc_count;
+    uint64_t alloc_bytes;
+    uint64_t object_new;
+    uint64_t string_new;
+    uint64_t function_new;
+    uint64_t env_new;
+    uint64_t call_count;
+    uint64_t native_call_count;
+} PSPerfStats;
+
 typedef struct PSVM {
     PSObject *global;   /* Global Object */
     PSEnv    *env;      /* Current Environment */
@@ -52,6 +65,7 @@ typedef struct PSVM {
     struct PSAstNode *root_ast;
     struct PSAstNode *current_ast;
     struct PSAstNode *current_node;
+    PSPerfStats perf;
     PSGC gc;
 } PSVM;
 

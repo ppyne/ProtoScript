@@ -2,6 +2,7 @@
 #define PS_FUNCTION_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "ps_value.h"
 #include "ps_object.h"
@@ -18,8 +19,12 @@ typedef struct PSFunction {
     struct PSAstNode *body;
     struct PSAstNode **params;
     struct PSAstNode **param_defaults;
+    PSString         **param_names;
+    PSString         *name;
     size_t           param_count;
     struct PSEnv    *env;
+    uint8_t          fast_flags;
+    uint8_t          fast_checked;
 } PSFunction;
 
 PSObject   *ps_function_new_native(PSNativeFunc fn);

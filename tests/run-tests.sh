@@ -228,7 +228,19 @@ run_case 170-perf-stats 0
 
 display_enabled=$(awk '/^#define PS_ENABLE_MODULE_DISPLAY/ {print $3}' include/ps_config.h)
 if [ "${display_enabled:-0}" -eq 1 ]; then
-    run_case 155-display-blit-limit 0
+    display_ok=0
+    if ./protoscript - >/dev/null 2>/dev/null <<'EOF'; then
+Display.open(1, 1, "probe");
+Display.close();
+Io.print("ok\n");
+EOF
+        display_ok=1
+    fi
+    if [ "$display_ok" -eq 1 ]; then
+        run_case 155-display-blit-limit 0
+    else
+        echo "155-display-blit-limit: SKIP (no display)"
+    fi
 fi
 
 fs_enabled=$(awk '/^#define PS_ENABLE_MODULE_FS/ {print $3}' include/ps_config.h)

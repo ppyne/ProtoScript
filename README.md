@@ -77,8 +77,9 @@ make test
 ```
 
 Note: test `155-display-blit-limit` opens an SDL window. In headless environments or CI,
-`make test` may fail if `PS_ENABLE_MODULE_DISPLAY=1`. To run this test, you need a
-working SDL2 setup with an available display server (macOS with a logged-in GUI,
+`make test` will auto-skip it if a display cannot be created, even when
+`PS_ENABLE_MODULE_DISPLAY=1`. To run this test, you need a working SDL2 setup with an
+available display server (macOS with a logged-in GUI,
 Linux X11/Wayland, or Windows desktop).
 
 ### Clean

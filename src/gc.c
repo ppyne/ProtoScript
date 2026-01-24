@@ -394,6 +394,11 @@ static void ps_gc_mark_roots(PSVM *vm) {
             ps_gc_mark_value(vm, vm->event_queue[idx]);
         }
     }
+    if (vm->index_cache && vm->index_cache_size > 0) {
+        for (size_t i = 0; i < vm->index_cache_size; i++) {
+            ps_gc_mark_string(vm, vm->index_cache[i]);
+        }
+    }
     for (size_t i = 0; i < vm->gc.root_count; i++) {
         PSGCRoot *root = &vm->gc.roots[i];
         switch (root->type) {
@@ -427,6 +432,8 @@ static void ps_gc_finalize_object(PSObject *obj) {
         p = next;
     }
     obj->props = NULL;
+    free(obj->buckets);
+    obj->buckets = NULL;
     if (!obj->internal) return;
     switch (obj->kind) {
         case PS_OBJ_KIND_FUNCTION:

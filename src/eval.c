@@ -42,6 +42,53 @@ static int ps_value_is_nan(double v) {
     return isnan(v);
 }
 
+static void ps_print_string(FILE *out, const PSString *s) {
+    if (!out || !s || !s->utf8 || s->byte_len == 0) return;
+    fwrite(s->utf8, 1, s->byte_len, out);
+}
+
+static void ps_print_uncaught(PSVM *vm, PSValue thrown) {
+    PSString *name = NULL;
+    PSString *message = NULL;
+
+    if (thrown.type == PS_T_OBJECT && thrown.as.object) {
+        int found = 0;
+        PSValue name_val = ps_object_get(thrown.as.object, ps_string_from_cstr("name"), &found);
+        if (found) {
+            name = ps_value_to_string(&name_val);
+        }
+        found = 0;
+        PSValue msg_val = ps_object_get(thrown.as.object, ps_string_from_cstr("message"), &found);
+        if (found) {
+            message = ps_value_to_string(&msg_val);
+        }
+    }
+
+    if (!message) {
+        message = ps_value_to_string(&thrown);
+    }
+
+    if (vm && vm->current_node && vm->current_node->line && vm->current_node->column) {
+        fprintf(stderr, "%zu:%zu ",
+                vm->current_node->line,
+                vm->current_node->column);
+    }
+
+    fprintf(stderr, "Uncaught ");
+    if (name) {
+        ps_print_string(stderr, name);
+        if (message && message->byte_len > 0) {
+            fprintf(stderr, ": ");
+            ps_print_string(stderr, message);
+        }
+    } else if (message) {
+        ps_print_string(stderr, message);
+    } else {
+        fprintf(stderr, "exception");
+    }
+    fprintf(stderr, "\n");
+}
+
 static int ps_call_method(PSVM *vm, PSObject *obj, const char *name, PSValue *out) {
     int found = 0;
     PSValue method = ps_object_get(obj, ps_string_from_cstr(name), &found);
@@ -374,6 +421,90 @@ static PSString *ps_identifier_string(PSAstNode *node) {
     if (!node || node->kind != AST_IDENTIFIER) return NULL;
     if (node->as.identifier.str) return node->as.identifier.str;
     return ps_string_from_utf8(node->as.identifier.name, node->as.identifier.length);
+}
+
+static int ps_literal_string_equals(PSAstNode *node, const char *lit, size_t len) {
+    if (!node || node->kind != AST_LITERAL) return 0;
+    if (node->as.literal.value.type != PS_T_STRING) return 0;
+    PSString *s = node->as.literal.value.as.string;
+    if (!s || s->byte_len != len) return 0;
+    return memcmp(s->utf8, lit, len) == 0;
+}
+
+static size_t ps_number_to_chars(double num, char *buf, size_t cap) {
+    if (isnan(num)) {
+        return (size_t)snprintf(buf, cap, "NaN");
+    }
+    if (isinf(num)) {
+        return (size_t)snprintf(buf, cap, "%sInfinity", num < 0 ? "-" : "");
+    }
+    return (size_t)snprintf(buf, cap, "%.15g", num);
+}
+
+static PSString *ps_member_key(PSVM *vm, PSEnv *env, PSAstNode *member, PSEvalControl *ctl);
+
+static PSString *ps_concat_string_number(PSVM *vm, PSString *str, double num, int number_first) {
+    if (!str) return NULL;
+    (void)vm;
+    char num_buf[64];
+    size_t num_len = ps_number_to_chars(num, num_buf, sizeof(num_buf));
+    size_t total_len = str->byte_len + num_len;
+    char *buf = (char *)malloc(total_len);
+    if (!buf) return NULL;
+    if (number_first) {
+        memcpy(buf, num_buf, num_len);
+        memcpy(buf + num_len, str->utf8, str->byte_len);
+    } else {
+        memcpy(buf, str->utf8, str->byte_len);
+        memcpy(buf + str->byte_len, num_buf, num_len);
+    }
+    PSString *out = ps_string_from_utf8(buf, total_len);
+    free(buf);
+    return out;
+}
+
+static PSString *ps_member_key_read(PSVM *vm,
+                                    PSEnv *env,
+                                    PSAstNode *member,
+                                    PSEvalControl *ctl,
+                                    PSString *tmp,
+                                    char *tmp_buf,
+                                    size_t tmp_cap) {
+    if (!member || member->kind != AST_MEMBER) return NULL;
+    if (!member->as.member.computed) {
+        return ps_identifier_string(member->as.member.property);
+    }
+    PSAstNode *prop = member->as.member.property;
+    if (prop && prop->kind == AST_BINARY && prop->as.binary.op == TOK_PLUS) {
+        PSAstNode *left = prop->as.binary.left;
+        PSAstNode *right = prop->as.binary.right;
+        if (ps_literal_string_equals(left, "k", 1)) {
+            PSValue right_val = eval_expression(vm, env, right, ctl);
+            if (ctl->did_throw) return NULL;
+            PSValue rprim = ps_to_primitive(vm, right_val, PS_HINT_NONE);
+            if (ps_check_pending_throw(vm, ctl)) return NULL;
+            if (rprim.type == PS_T_NUMBER) {
+                char num_buf[64];
+                size_t num_len = ps_number_to_chars(rprim.as.number, num_buf, sizeof(num_buf));
+                if (1 + num_len <= tmp_cap && tmp && tmp_buf) {
+                    tmp_buf[0] = 'k';
+                    memcpy(tmp_buf + 1, num_buf, num_len);
+                    tmp->utf8 = tmp_buf;
+                    tmp->byte_len = 1 + num_len;
+                    tmp->glyph_offsets = NULL;
+                    tmp->glyph_count = 0;
+                    uint32_t hash = 2166136261u;
+                    for (size_t i = 0; i < tmp->byte_len; i++) {
+                        hash ^= (uint8_t)tmp_buf[i];
+                        hash *= 16777619u;
+                    }
+                    tmp->hash = hash;
+                    return tmp;
+                }
+            }
+        }
+    }
+    return ps_member_key(vm, env, member, ctl);
 }
 
 static PSString *ps_member_key(PSVM *vm, PSEnv *env, PSAstNode *member, PSEvalControl *ctl) {
@@ -1059,13 +1190,7 @@ PSValue ps_eval(PSVM *vm, PSAstNode *program) {
     for (size_t i = 0; i < program->as.list.count; i++) {
         last = eval_node(vm, vm->env, program->as.list.items[i], &ctl);
         if (ctl.did_throw) {
-            if (vm && vm->current_node && vm->current_node->line && vm->current_node->column) {
-                fprintf(stderr, "%zu:%zu Uncaught exception\n",
-                        vm->current_node->line,
-                        vm->current_node->column);
-            } else {
-                fprintf(stderr, "Uncaught exception\n");
-            }
+            ps_print_uncaught(vm, ctl.throw_value);
             exit(1);
         }
         if (ctl.did_return) {
@@ -1933,6 +2058,14 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                     PSValue rprim = ps_to_primitive(vm, right, PS_HINT_NONE);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                     if (lprim.type == PS_T_STRING || rprim.type == PS_T_STRING) {
+                        if (lprim.type == PS_T_STRING && rprim.type == PS_T_NUMBER) {
+                            PSString *out = ps_concat_string_number(vm, lprim.as.string, rprim.as.number, 0);
+                            return ps_value_string(out ? out : ps_string_from_cstr(""));
+                        }
+                        if (lprim.type == PS_T_NUMBER && rprim.type == PS_T_STRING) {
+                            PSString *out = ps_concat_string_number(vm, rprim.as.string, lprim.as.number, 1);
+                            return ps_value_string(out ? out : ps_string_from_cstr(""));
+                        }
                         PSString *ls = ps_to_string(vm, lprim);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         PSString *rs = ps_to_string(vm, rprim);
@@ -2236,7 +2369,9 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             if (ctl->did_throw) return obj_val;
             PSObject *obj = ps_to_object(vm, &obj_val, ctl);
             if (ctl->did_throw) return ctl->throw_value;
-            PSString *prop = ps_member_key(vm, env, node, ctl);
+            PSString tmp_prop;
+            char tmp_buf[96];
+            PSString *prop = ps_member_key_read(vm, env, node, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
             if (ctl->did_throw) return ctl->throw_value;
             PSValue out = ps_value_undefined();
             int handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
@@ -2287,7 +2422,9 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                 if (ctl->did_throw) return obj_val;
                 PSObject *obj = ps_to_object(vm, &obj_val, ctl);
                 if (ctl->did_throw) return ctl->throw_value;
-                PSString *prop = ps_member_key(vm, env, member, ctl);
+                PSString tmp_prop;
+                char tmp_buf[96];
+                PSString *prop = ps_member_key_read(vm, env, member, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
                 if (ctl->did_throw) return ctl->throw_value;
                 int found;
                 callee = ps_object_get(obj, prop, &found);
@@ -2299,14 +2436,16 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             }
 
             if (callee.type != PS_T_OBJECT) {
-                fprintf(stderr, "Call of non-object\n");
-                return ps_value_undefined();
+                ctl->did_throw = 1;
+                ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Call of non-object");
+                return ctl->throw_value;
             }
 
             PSFunction *func = ps_function_from_object(callee.as.object);
             if (!func) {
-                fprintf(stderr, "Not a callable object\n");
-                return ps_value_undefined();
+                ctl->did_throw = 1;
+                ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Not a callable object");
+                return ctl->throw_value;
             }
 
             PSValue *args = NULL;

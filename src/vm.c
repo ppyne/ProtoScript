@@ -86,6 +86,16 @@ static PSValue ps_vm_make_error_with_message(PSVM *vm, const char *name, PSStrin
                      ps_string_from_cstr("message"),
                      ps_value_string(message ? message : ps_string_from_cstr("")),
                      PS_ATTR_DONTENUM);
+    if (vm && vm->current_node && vm->current_node->line && vm->current_node->column) {
+        ps_object_define(obj,
+                         ps_string_from_cstr("line"),
+                         ps_value_number((double)vm->current_node->line),
+                         PS_ATTR_DONTENUM);
+        ps_object_define(obj,
+                         ps_string_from_cstr("column"),
+                         ps_value_number((double)vm->current_node->column),
+                         PS_ATTR_DONTENUM);
+    }
     return ps_value_object(obj);
 }
 
@@ -2429,8 +2439,15 @@ static PSString *ps_string_substring(const PSString *s, size_t start, size_t end
         return ps_string_from_cstr("");
     }
     if (end > s->glyph_count) end = s->glyph_count;
-    size_t byte_start = s->glyph_offsets[start];
-    size_t byte_end = (end < s->glyph_count) ? s->glyph_offsets[end] : s->byte_len;
+    size_t byte_start = 0;
+    size_t byte_end = 0;
+    if (!s->glyph_offsets) {
+        byte_start = start;
+        byte_end = end;
+    } else {
+        byte_start = s->glyph_offsets[start];
+        byte_end = (end < s->glyph_count) ? s->glyph_offsets[end] : s->byte_len;
+    }
     return ps_string_from_utf8(s->utf8 + byte_start, byte_end - byte_start);
 }
 
@@ -2951,8 +2968,22 @@ static void ps_object_set_length(PSObject *obj, size_t len) {
                      PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
 }
 
+static PSString *ps_string_from_index_cached(PSVM *vm, size_t index) {
+    if (vm && vm->index_cache && index < vm->index_cache_size) {
+        PSString *cached = vm->index_cache[index];
+        if (cached) return cached;
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%zu", index);
+        cached = ps_string_from_cstr(buf);
+        vm->index_cache[index] = cached;
+        return cached;
+    }
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%zu", index);
+    return ps_string_from_cstr(buf);
+}
+
 static PSValue ps_native_array_join(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
-    (void)vm;
     if (this_val.type == PS_T_NULL || this_val.type == PS_T_UNDEFINED) {
         ps_vm_throw_type_error(vm, "Invalid receiver");
         return ps_value_undefined();
@@ -2965,20 +2996,61 @@ static PSValue ps_native_array_join(PSVM *vm, PSValue this_val, int argc, PSValu
         sep = ps_to_string(vm, argv[0]);
     }
     size_t len = ps_object_length(this_val.as.object);
-    PSString *result = ps_string_from_cstr("");
+    if (len == 0) {
+        return ps_value_string(ps_string_from_cstr(""));
+    }
+
+    PSString **elems = (PSString **)calloc(len, sizeof(PSString *));
+    if (!elems) {
+        return ps_value_string(ps_string_from_cstr(""));
+    }
+
+    size_t total_len = (len > 0) ? (sep->byte_len * (len - 1)) : 0;
     for (size_t i = 0; i < len; i++) {
-        if (i > 0) {
-            result = ps_string_concat(result, sep);
-        }
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%zu", i);
         int found = 0;
-        PSValue elem = ps_object_get(this_val.as.object, ps_string_from_cstr(buf), &found);
+        PSValue elem = ps_object_get(this_val.as.object,
+                                     ps_string_from_index_cached(vm, i),
+                                     &found);
         if (!found || elem.type == PS_T_UNDEFINED || elem.type == PS_T_NULL) {
+            elems[i] = NULL;
             continue;
         }
         PSString *elem_str = ps_to_string(vm, elem);
-        result = ps_string_concat(result, elem_str);
+        elems[i] = elem_str;
+        if (elem_str) {
+            total_len += elem_str->byte_len;
+        }
+    }
+
+    if (total_len == 0) {
+        free(elems);
+        return ps_value_string(ps_string_from_cstr(""));
+    }
+
+    char *buf = (char *)malloc(total_len);
+    if (!buf) {
+        free(elems);
+        return ps_value_string(ps_string_from_cstr(""));
+    }
+
+    char *p = buf;
+    for (size_t i = 0; i < len; i++) {
+        if (i > 0 && sep && sep->byte_len > 0) {
+            memcpy(p, sep->utf8, sep->byte_len);
+            p += sep->byte_len;
+        }
+        PSString *elem_str = elems[i];
+        if (elem_str && elem_str->byte_len > 0) {
+            memcpy(p, elem_str->utf8, elem_str->byte_len);
+            p += elem_str->byte_len;
+        }
+    }
+
+    PSString *result = ps_string_from_utf8(buf, total_len);
+    free(buf);
+    free(elems);
+    if (!result) {
+        return ps_value_string(ps_string_from_cstr(""));
     }
     return ps_value_string(result);
 }
@@ -4398,11 +4470,80 @@ static PSValue ps_native_regexp_exec(PSVM *vm, PSValue this_val, int argc, PSVal
 }
 
 static PSValue ps_native_regexp_test(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
-    PSValue res = ps_native_regexp_exec(vm, this_val, argc, argv);
-    if (vm && vm->has_pending_throw) {
+    if (this_val.type != PS_T_OBJECT || !this_val.as.object ||
+        this_val.as.object->kind != PS_OBJ_KIND_REGEXP) {
+        ps_vm_throw_type_error(vm, "Invalid receiver");
         return ps_value_undefined();
     }
-    return ps_value_boolean(res.type != PS_T_NULL);
+    PSObject *re = this_val.as.object;
+    PSRegex *regex = (PSRegex *)re->internal;
+    if (!regex) {
+        ps_vm_throw_type_error(vm, "Invalid receiver");
+        return ps_value_undefined();
+    }
+    PSString *input = ps_string_from_cstr("");
+    if (argc > 0) {
+        input = ps_to_string(vm, argv[0]);
+    }
+    size_t len = ps_string_length(input);
+    size_t start_index = 0;
+    int found = 0;
+    PSValue global_val = ps_object_get(re, ps_string_from_cstr("global"), &found);
+    int global = found && global_val.type == PS_T_BOOLEAN && global_val.as.boolean;
+    if (global) {
+        PSValue last_index_val = ps_object_get(re, ps_string_from_cstr("lastIndex"), &found);
+        if (found) {
+            double n = ps_to_number(vm, last_index_val);
+            if (!isnan(n) && n > 0) start_index = (size_t)n;
+        }
+    }
+    if (start_index > len) {
+        if (global) {
+            ps_object_put(re, ps_string_from_cstr("lastIndex"), ps_value_number(0.0));
+        }
+        return ps_value_boolean(0);
+    }
+
+    int cap_count = regex->capture_count + 1;
+    PSRegexCapture stack_caps[8];
+    PSRegexCapture *caps = stack_caps;
+    int heap_caps = 0;
+    if (cap_count > (int)(sizeof(stack_caps) / sizeof(stack_caps[0]))) {
+        caps = (PSRegexCapture *)calloc((size_t)cap_count, sizeof(PSRegexCapture));
+        if (!caps) return ps_value_boolean(0);
+        heap_caps = 1;
+    }
+
+    for (size_t pos = start_index; pos <= len; pos++) {
+        for (int i = 0; i < cap_count; i++) {
+            caps[i].defined = 0;
+            caps[i].start = 0;
+            caps[i].end = 0;
+        }
+        caps[0].defined = 1;
+        caps[0].start = (int)pos;
+        caps[0].end = (int)pos;
+        size_t end_pos = 0;
+        if (ps_re_match_node(regex->ast, NULL, input, pos, regex->ignore_case,
+                             caps, cap_count, &end_pos)) {
+            ps_regexp_update_static_captures(vm, input, caps, cap_count);
+            if (global) {
+                size_t next_index = end_pos;
+                if (end_pos == pos && next_index < len) next_index = pos + 1;
+                ps_object_put(re, ps_string_from_cstr("lastIndex"), ps_value_number((double)next_index));
+            }
+            if (heap_caps) free(caps);
+            return ps_value_boolean(1);
+        }
+        if (regex->ast && regex->ast->type == PS_RE_NODE_ANCHOR_START) {
+            break;
+        }
+    }
+    if (global) {
+        ps_object_put(re, ps_string_from_cstr("lastIndex"), ps_value_number(0.0));
+    }
+    if (heap_caps) free(caps);
+    return ps_value_boolean(0);
 }
 
 static PSValue ps_native_function_call(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
@@ -5411,7 +5552,8 @@ PSVM *ps_vm_new(void) {
     vm->root_ast = NULL;
     vm->current_ast = NULL;
     vm->current_node = NULL;
-
+    vm->index_cache_size = 10000;
+    vm->index_cache = (PSString **)calloc(vm->index_cache_size, sizeof(PSString *));
     /* Initialize built-ins and host extensions */
     ps_vm_init_builtins(vm);
     ps_vm_init_buffer(vm);
@@ -5441,6 +5583,7 @@ void ps_vm_free(PSVM *vm) {
     ps_display_shutdown(vm);
 #endif
     free(vm->event_queue);
+    free(vm->index_cache);
     free(vm);
 }
 

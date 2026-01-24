@@ -10,6 +10,7 @@ typedef struct PSString {
     size_t    byte_len;      /* length in bytes */
     uint32_t *glyph_offsets; /* byte offsets for each glyph */
     size_t    glyph_count;   /* number of glyphs */
+    uint32_t  hash;          /* cached hash of utf8 */
 } PSString;
 
 /* Creation */

@@ -20,6 +20,7 @@ typedef struct PSProperty {
     PSValue   value;         /* property value */
     uint8_t   attrs;         /* PSPropAttr bitmask */
     struct PSProperty *next; /* linked list */
+    struct PSProperty *hash_next; /* bucket chain */
 } PSProperty;
 
 typedef struct PSObject {
@@ -27,6 +28,9 @@ typedef struct PSObject {
     PSProperty      *props;     /* own properties */
     PSString        *cache_name; /* last property lookup key */
     PSProperty      *cache_prop; /* last property lookup result */
+    PSProperty     **buckets;   /* hash buckets for own props */
+    size_t           bucket_count;
+    size_t           prop_count;
     int              kind;      /* internal type tag */
     void            *internal;  /* internal data */
 } PSObject;

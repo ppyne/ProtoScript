@@ -13,14 +13,71 @@
 static int ps_string_equals(const PSString *a, const PSString *b) {
     if (a == b) return 1;
     if (!a || !b) return 0;
+    if (a->hash != b->hash) return 0;
     if (a->byte_len != b->byte_len) return 0;
     return memcmp(a->utf8, b->utf8, a->byte_len) == 0;
+}
+
+static size_t ps_object_bucket_index(const PSObject *obj, const PSString *name) {
+    return (size_t)name->hash & (obj->bucket_count - 1);
+}
+
+static void ps_object_rehash(PSObject *obj, size_t new_count) {
+    if (!obj || new_count == 0) return;
+    PSProperty **next = (PSProperty **)calloc(new_count, sizeof(PSProperty *));
+    if (!next) return;
+    size_t guard = 0;
+    size_t max_props = obj->prop_count ? obj->prop_count + 1024 : 65536;
+    for (PSProperty *p = obj->props; p; p = p->next) {
+        if (guard++ > max_props) {
+            free(next);
+            free(obj->buckets);
+            obj->buckets = NULL;
+            obj->bucket_count = 0;
+            return;
+        }
+        size_t idx = (size_t)p->name->hash & (new_count - 1);
+        p->hash_next = next[idx];
+        next[idx] = p;
+    }
+    free(obj->buckets);
+    obj->buckets = next;
+    obj->bucket_count = new_count;
+}
+
+static void ps_object_ensure_buckets(PSObject *obj) {
+    if (!obj || obj->buckets) return;
+    size_t count = 64;
+    ps_object_rehash(obj, count);
 }
 
 static PSProperty *find_prop(PSObject *obj, const PSString *name) {
     if (!obj || !name) return NULL;
     if (obj->cache_prop && obj->cache_name && ps_string_equals(obj->cache_name, name)) {
         return obj->cache_prop;
+    }
+    if (obj->buckets && obj->bucket_count > 0) {
+        size_t idx = ps_object_bucket_index(obj, name);
+        size_t guard = 0;
+        size_t max_props = obj->prop_count ? obj->prop_count + 1024 : 65536;
+        for (PSProperty *p = obj->buckets[idx]; p; p = p->hash_next) {
+            if (guard++ > max_props) {
+                free(obj->buckets);
+                obj->buckets = NULL;
+                obj->bucket_count = 0;
+                break;
+            }
+            if (ps_string_equals(p->name, name)) {
+                obj->cache_name = p->name;
+                obj->cache_prop = p;
+                return p;
+            }
+        }
+        if (!obj->buckets || obj->bucket_count == 0) {
+            /* fallback to linear scan if buckets are disabled */
+        } else {
+            return NULL;
+        }
     }
     for (PSProperty *p = obj->props; p; p = p->next) {
         if (ps_string_equals(p->name, name)) {
@@ -53,6 +110,9 @@ PSObject *ps_object_new(PSObject *prototype) {
     o->props = NULL;
     o->cache_name = NULL;
     o->cache_prop = NULL;
+    o->buckets = NULL;
+    o->bucket_count = 0;
+    o->prop_count = 0;
     o->kind = PS_OBJ_KIND_PLAIN;
     o->internal = NULL;
     return o;
@@ -73,6 +133,7 @@ void ps_object_free(PSObject *obj) {
         free(p);
         p = next;
     }
+    free(obj->buckets);
     free(obj);
 }
 
@@ -146,10 +207,24 @@ int ps_object_define(PSObject *obj, PSString *name, PSValue value, uint8_t attrs
     p->name  = name;
     p->value = value;
     p->attrs = attrs;
+    p->hash_next = NULL;
 
     /* Insert at head (stable enough for now; order is implementation-defined) */
     p->next = obj->props;
     obj->props = p;
+    obj->prop_count++;
+
+    if (!obj->buckets && obj->prop_count > 8) {
+        ps_object_ensure_buckets(obj);
+    }
+    if (obj->buckets && obj->bucket_count > 0) {
+        size_t idx = ps_object_bucket_index(obj, name);
+        p->hash_next = obj->buckets[idx];
+        obj->buckets[idx] = p;
+        if (obj->prop_count > obj->bucket_count * 2) {
+            ps_object_rehash(obj, obj->bucket_count * 2);
+        }
+    }
     obj->cache_name = p->name;
     obj->cache_prop = p;
 
@@ -193,6 +268,24 @@ int ps_object_delete(PSObject *obj, const PSString *name, int *deleted) {
 
             if (prev) prev->next = p->next;
             else obj->props = p->next;
+
+            if (obj->buckets && obj->bucket_count > 0) {
+                size_t idx = ps_object_bucket_index(obj, name);
+                PSProperty *hprev = NULL;
+                PSProperty *hp = obj->buckets[idx];
+                while (hp) {
+                    if (hp == p) {
+                        if (hprev) hprev->hash_next = hp->hash_next;
+                        else obj->buckets[idx] = hp->hash_next;
+                        break;
+                    }
+                    hprev = hp;
+                    hp = hp->hash_next;
+                }
+            }
+            if (obj->prop_count > 0) {
+                obj->prop_count--;
+            }
 
             if (obj->cache_prop == p) {
                 obj->cache_prop = NULL;

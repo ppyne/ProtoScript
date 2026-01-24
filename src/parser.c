@@ -51,7 +51,13 @@ static void parse_error(const char *msg) {
     g_parse_error_line = 0;
     g_parse_error_column = 0;
     if (line > 0 && column > 0) {
-        fprintf(stderr, "%zu:%zu %s\n", line, column, msg);
+        if (g_parse_parser && g_parse_parser->source_path) {
+            fprintf(stderr, "%s:%zu:%zu %s\n", g_parse_parser->source_path, line, column, msg);
+        } else {
+            fprintf(stderr, "%zu:%zu %s\n", line, column, msg);
+        }
+    } else if (g_parse_parser && g_parse_parser->source_path) {
+        fprintf(stderr, "%s: %s\n", g_parse_parser->source_path, msg);
     } else {
         fprintf(stderr, "%s\n", msg);
     }

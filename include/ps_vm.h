@@ -65,6 +65,8 @@ typedef struct PSVM {
     struct PSAstNode *root_ast;
     struct PSAstNode *current_ast;
     struct PSAstNode *current_node;
+    PSString **index_cache;
+    size_t index_cache_size;
     PSPerfStats perf;
     PSGC gc;
 } PSVM;

@@ -56,12 +56,22 @@ PSString *ps_string_from_utf8(const char *data, size_t byte_len) {
 
     memcpy(s->utf8, data, byte_len);
     s->byte_len = byte_len;
+    /* FNV-1a hash on bytes */
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < byte_len; i++) {
+        hash ^= (uint8_t)s->utf8[i];
+        hash *= 16777619u;
+    }
+    s->hash = hash;
 
     /* First pass: count glyphs */
     size_t i = 0;
     size_t count = 0;
+    int ascii_only = 1;
     while (i < byte_len) {
-        int len = utf8_glyph_len((unsigned char)s->utf8[i]);
+        unsigned char c = (unsigned char)s->utf8[i];
+        if (c & 0x80) ascii_only = 0;
+        int len = utf8_glyph_len(c);
         if (len <= 0 || i + len > byte_len) {
             /* invalid UTF-8 */
             ps_string_free(s);
@@ -69,6 +79,12 @@ PSString *ps_string_from_utf8(const char *data, size_t byte_len) {
         }
         i += len;
         count++;
+    }
+
+    if (ascii_only) {
+        s->glyph_count = byte_len;
+        s->glyph_offsets = NULL;
+        return s;
     }
 
     s->glyph_count = count;
@@ -111,6 +127,10 @@ PSString *ps_string_char_at(const PSString *s, size_t index) {
         return ps_string_from_cstr("");
     }
 
+    if (!s->glyph_offsets) {
+        return ps_string_from_utf8(s->utf8 + index, 1);
+    }
+
     size_t start = s->glyph_offsets[index];
     size_t end = (index + 1 < s->glyph_count)
         ? s->glyph_offsets[index + 1]
@@ -122,6 +142,10 @@ PSString *ps_string_char_at(const PSString *s, size_t index) {
 uint32_t ps_string_char_code_at(const PSString *s, size_t index) {
     if (!s || index >= s->glyph_count) {
         return 0; /* NaN handled at PSValue level */
+    }
+
+    if (!s->glyph_offsets) {
+        return (uint8_t)s->utf8[index];
     }
 
     size_t offset = s->glyph_offsets[index];

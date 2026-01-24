@@ -41,7 +41,7 @@ Key points:
 
 - Each invocation of `LinkedListNode` **with `new`** produces a fresh object instance: `var node = new LinkedListNode(value);`
 
-  The `new` operator is essential here: it allocates a new object, binds it to `this`, and links it to `LinkedListNode.prototype`. Without `new`, no node object would be created.
+  The `new` operator is essential here: it allocates a new object, binds it to `this`, and links it to `LinkedListNode.prototype`. Without `new`, the constructor doesn’t create a fresh instance.
 - `value` and `next` are *own properties*
 - The node does not know about the list it belongs to
 
@@ -228,22 +228,18 @@ list.push("c");
 list.prepend("a");
 
 var found = list.find("b");
-Io.print(found ? "found b
-" : "missing b
-");
+Io.print((found ? "found b" : "missing b") + Io.EOL);
 
 list.remove("a");
-Io.print("len=" + list.length + "
-");
+Io.print("len=" + list.length + Io.EOL);
 
 var values = list.toArray();
-Io.print(values.join(",") + "
-");
+Io.print(values.join(",") + Io.EOL);
 ```
 
 Several important observations can be made:
 
-- `include` performs a textual and semantic inclusion of the linked list implementation
+- `include` includes a source file statically and executes it in the same global scope
 - `LinkedList` is used as a plain constructor function
 - Method calls (`push`, `prepend`, `find`, `remove`) rely entirely on prototype delegation
 - The list exposes *behavior*, not iterators or hidden machinery

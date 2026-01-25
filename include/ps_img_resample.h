@@ -2,8 +2,19 @@
 #define PS_IMG_RESAMPLE_H
 
 /*
- * Minimal, standalone resampling API extracted and simplified from GIMP.
+ * Minimal, standalone resampling API.
  * Assumes tightly packed RGBA8 pixels (4 bytes per pixel).
+ *
+ * Origins and references (per src/img_resample.c):
+ * - LBB (Locally Bounded Bicubic): Nicolas Robidoux & Chantal Racette;
+ *   based on Brodlie/Mashwama/Butt, Computer & Graphics 19(4), 1995.
+ * - Nohalo / LBB-Nohalo: Robidoux & Racette.
+ * - ClampUpAxes (EWA clamp): ImageMagick resample.c; Robidoux & Racette,
+ *   with suggestions from Anthony Thyssen.
+ * - EWA ellipse clamping: Andreas Gustaffson, "Interactive Image Warping",
+ *   1993; SVD clamping per Craig DeForest (PDL::Transform).
+ * - Mitchell-Netravali weights: method of N. Robidoux.
+ * - Robidoux cubic: Keys cubic variant (see src/img_resample.c).
  */
 
 #include <stddef.h>

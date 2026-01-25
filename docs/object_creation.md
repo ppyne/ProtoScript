@@ -4,11 +4,10 @@
 
 This documentation explains **the real object creation model of JavaScript as it exists in ECMAScript 1**, deliberately restricted to the **minimal core of the language**.
 
-The chosen framework is **ProtoScript**, which explicitly aligns with the **ECMAScript 1 (1997)** mindset:
+The chosen framework is **ProtoScript**, but this document stays strictly within the **ECMAScript 1 (1997)** mindset:
 
 - no `class`
-- no `Object.create`
-- no ES5+ helpers
+- no ES5+ helpers (including `Object.create`)
 - only foundational mechanisms: functions, objects, prototypes, delegation
 
 The goal is not convenience, but **precise understanding of the conceptual engine**.
@@ -19,7 +18,7 @@ The goal is not convenience, but **precise understanding of the conceptual engin
 
 In JavaScript, **a function can act as an object constructor**. This mechanism exists **since ES1**.
 
-A function becomes a constructor **only when it is invoked with the ********\`\`******** operator**.
+A function becomes a constructor **only when it is invoked with the `new` operator**.
 
 ### Minimal example
 
@@ -28,7 +27,7 @@ function Person(name) {
     this.name = name;
 }
 
-const p = new Person("Alice");
+var p = new Person("Alice");
 ```
 
 ### What `new` actually does
@@ -50,7 +49,7 @@ is conceptually equivalent to:
 ### Equivalent pseudo-code
 
 ```js
-const obj = {};
+var obj = {};
 obj.[[Prototype]] = Person.prototype;
 Person.call(obj, "Alice");
 return obj;
@@ -99,8 +98,8 @@ p → Person.prototype → Object.prototype → null
 - Multiple instances share the same `prototype`
 
 ```js
-const p1 = new Person("Alice");
-const p2 = new Person("Bob");
+var p1 = new Person("Alice");
+var p2 = new Person("Bob");
 
 p1.sayHello === p2.sayHello; // true
 ```
@@ -175,7 +174,7 @@ Printer.prototype.getStatus = function () {
     return "printing";
 };
 
-const p = new Printer("LaserJet");
+var p = new Printer("LaserJet");
 p.getStatus(); // "printing"
 ```
 
@@ -209,7 +208,7 @@ No copying ever occurs.
 
 This ES1-style inheritance has **important limitations**:
 
-- Constructors are executed only once (when setting `Dog.prototype`)
+- Constructors are executed only once (when setting `Printer.prototype`)
 - Shared state can easily leak through the prototype
 - There is no clean way to call a "super" constructor
 - Inheritance and instantiation are tightly coupled
@@ -246,7 +245,7 @@ ProtoScript requires **different visual representations**.
 
 The correct mental and graphical model is a **directed graph of objects**, not a class hierarchy.
 
-Each node is an **object**. Each arrow represents a \`\`\*\* delegation link\*\*.
+Each node is an **object**. Each arrow represents a **delegation link**.
 
 Example:
 
@@ -382,7 +381,7 @@ Device.prototype.status = "idle";
 function Printer() {}
 Printer.prototype = new Device();
 
-const p = new Printer();
+var p = new Printer();
 
 p.status;
 ```
@@ -504,7 +503,7 @@ Every object in the chain is **shared state**.
 Base.prototype.flag = true;
 ```
 
-This affects \*\*all objects delegating to \*\*\`\`, including:
+This affects **all objects delegating to `Base.prototype`**, including:
 
 - objects you did not intend to modify
 - objects created earlier
@@ -633,7 +632,7 @@ Logger.prototype.log = function (msg) {
 function Service() {}
 Service.prototype = new Logger();
 
-const s = new Service();
+var s = new Service();
 s.log("hello");
 ```
 
@@ -668,7 +667,7 @@ function Service(logger) {
     };
 }
 
-const s = new Service(new Logger());
+var s = new Service(new Logger());
 ```
 
 Characteristics:
@@ -1935,4 +1934,3 @@ ES1 is not a limitation. It is a **stable conceptual core**.
 ES1 still matters today because it defines that nature.
 
 Understanding ES1 means understanding JavaScript — past, present, and future.
-

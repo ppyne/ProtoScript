@@ -273,19 +273,18 @@ Prototype-based programming is not just a syntax choice. It is a **cognitive shi
 
 Instead of designing a rigid architecture up front, you start with something concrete and let structure *emerge*.
 
-### Example 1: Specialization by Cloning
+### Example 1: Specialization by Delegation
 
-Rather than subclassing, you clone and adjust:
+Rather than subclassing, you create a new object and delegate:
 
 ```
-include "examples/utils/clone.js";
-
-baseOsc = {
+basicOsc = {
   freq: 440,
   play: function() { /* ... */ }
 };
 
-bassOsc = clone(baseOsc);
+bassOsc = {};
+Object.setPrototypeOf(bassOsc, basicOsc);
 bassOsc.freq = 110;
 ```
 
@@ -300,12 +299,10 @@ Each object tells its own story.
 You can add behavior *after* objects already exist:
 
 ```
-include "examples/utils/clone.js";
-
 filter = { cutoff: 1000 };
 
-osc = clone(baseOsc);
-osc.filter = filter;
+osc = {};
+Object.setPrototypeOf(osc, filter);
 ```
 
 Later:
@@ -314,7 +311,7 @@ Later:
 filter.process = function(signal) { /* ... */ };
 ```
 
-All objects delegating to `filter` gain the behavior instantly.
+All objects delegating to `filter` via the prototype chain gain the behavior instantly.
 
 This is not just flexibility. It is **live architecture**.
 
@@ -388,7 +385,7 @@ You design *flows of behavior*, not trees of types.
 
 
 
-## 7. How to Approach ProtoScript
+## 8. How to Approach ProtoScript
 
 To appreciate ProtoScript fully:
 
@@ -404,7 +401,7 @@ Mastery comes when prototype-based thinking feels *simpler* than class-based thi
 
 ---
 
-## 8. Rediscovering JavaScript’s Foundations
+## 9. Rediscovering JavaScript’s Foundations
 
 Modern JavaScript often hides its prototype-based nature behind `class`, transpilers, and frameworks.
 

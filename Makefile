@@ -9,6 +9,7 @@ else
 endif
 LDLIBS ?=
 PS_ENABLE_MODULE_DISPLAY ?= 1
+PS_ENABLE_PERF ?= 0
 export PATH := /opt/local/bin:$(PATH)
 PS_ENABLE_MODULE_IMG ?= $(strip $(shell awk '$$2=="PS_ENABLE_MODULE_IMG" {print $$3; found=1} END{if(!found) print 0}' include/ps_config.h))
 
@@ -31,6 +32,7 @@ endif
 
 CFLAGS += -DPS_ENABLE_MODULE_DISPLAY=$(PS_ENABLE_MODULE_DISPLAY)
 CFLAGS += -DPS_ENABLE_MODULE_IMG=$(PS_ENABLE_MODULE_IMG)
+CFLAGS += -DPS_ENABLE_PERF=$(PS_ENABLE_PERF)
 ifeq ($(PS_ENABLE_MODULE_DISPLAY),1)
   ifeq ($(strip $(SDL_CFLAGS)),)
     $(error SDL2 not found. Build submodule: \

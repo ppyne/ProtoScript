@@ -212,6 +212,8 @@ PSAstNode *ps_ast_identifier(const char *name, size_t length) {
     n->as.identifier.cache_record = NULL;
     n->as.identifier.cache_prop = NULL;
     n->as.identifier.cache_shape = 0;
+    n->as.identifier.fast_num_kind = 0;
+    n->as.identifier.fast_num_index = 0;
     return n;
 }
 
@@ -269,6 +271,7 @@ PSAstNode *ps_ast_call(PSAstNode *callee, PSAstNode **args, size_t argc) {
     n->as.call.callee = callee;
     n->as.call.args = args;
     n->as.call.argc = argc;
+    n->as.call.fast_num_math_id = 0;
     return n;
 }
 

@@ -63,6 +63,8 @@ PSString *ps_string_from_utf8(const char *data, size_t byte_len) {
         hash *= 16777619u;
     }
     s->hash = hash;
+    s->index_state = 0;
+    s->index_value = 0;
 
     /* First pass: count glyphs */
     size_t i = 0;

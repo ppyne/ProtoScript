@@ -218,6 +218,8 @@ struct PSAstNode {
             struct PSObject *cache_record;
             struct PSProperty *cache_prop;
             uint32_t      cache_shape;
+            uint8_t       fast_num_kind;
+            uint32_t      fast_num_index;
         } identifier;
 
         /* literal (number, string, boolean, null, undefined) */
@@ -264,6 +266,7 @@ struct PSAstNode {
             PSAstNode  *callee;
             PSAstNode **args;
             size_t      argc;
+            uint8_t     fast_num_math_id;
         } call;
 
         /* member access: obj.prop */

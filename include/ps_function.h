@@ -10,6 +10,7 @@
 struct PSAstNode;
 struct PSEnv;
 struct PSVM;
+struct PSFastNumOp;
 
 typedef PSValue (*PSNativeFunc)(struct PSVM *vm, PSValue this_val, int argc, PSValue *argv);
 
@@ -28,6 +29,18 @@ typedef struct PSFunction {
     size_t          *fast_param_index;
     size_t           fast_local_count;
     size_t           fast_this_index;
+    struct PSAstNode *fast_math_expr;
+    struct PSAstNode **fast_num_inits;
+    PSString         **fast_num_names;
+    size_t           fast_num_count;
+    struct PSAstNode *fast_num_return;
+    struct PSAstNode *fast_num_if_cond;
+    struct PSAstNode *fast_num_if_return;
+    struct PSFastNumOp *fast_num_ops;
+    size_t           fast_num_ops_count;
+    double           fast_clamp_min;
+    double           fast_clamp_max;
+    uint8_t          fast_clamp_use_floor;
     struct PSEnv    *fast_env;
     uint8_t          fast_env_in_use;
     uint8_t          fast_flags;

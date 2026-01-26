@@ -35,6 +35,18 @@ PSObject *ps_function_new_native(PSNativeFunc fn) {
     func->fast_param_index = NULL;
     func->fast_local_count = 0;
     func->fast_this_index = 0;
+    func->fast_math_expr = NULL;
+    func->fast_num_inits = NULL;
+    func->fast_num_names = NULL;
+    func->fast_num_count = 0;
+    func->fast_num_return = NULL;
+    func->fast_num_if_cond = NULL;
+    func->fast_num_if_return = NULL;
+    func->fast_num_ops = NULL;
+    func->fast_num_ops_count = 0;
+    func->fast_clamp_min = 0.0;
+    func->fast_clamp_max = 0.0;
+    func->fast_clamp_use_floor = 0;
     func->fast_env = NULL;
     func->fast_env_in_use = 0;
     func->fast_flags = 0;
@@ -82,6 +94,18 @@ PSObject *ps_function_new_script(PSAstNode **params,
     func->fast_param_index = NULL;
     func->fast_local_count = 0;
     func->fast_this_index = 0;
+    func->fast_math_expr = NULL;
+    func->fast_num_inits = NULL;
+    func->fast_num_names = NULL;
+    func->fast_num_count = 0;
+    func->fast_num_return = NULL;
+    func->fast_num_if_cond = NULL;
+    func->fast_num_if_return = NULL;
+    func->fast_num_ops = NULL;
+    func->fast_num_ops_count = 0;
+    func->fast_clamp_min = 0.0;
+    func->fast_clamp_max = 0.0;
+    func->fast_clamp_use_floor = 0;
     func->fast_env = NULL;
     func->fast_env_in_use = 0;
     if (param_count > 0 && params) {

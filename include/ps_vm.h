@@ -59,6 +59,19 @@ typedef struct PSStackFrame {
     const char *source_path;
 } PSStackFrame;
 
+typedef struct PSProfileEntry {
+    struct PSFunction *func;
+    uint64_t calls;
+    uint64_t total_ms;
+} PSProfileEntry;
+
+typedef struct PSProfile {
+    int enabled;
+    PSProfileEntry *items;
+    size_t count;
+    size_t cap;
+} PSProfile;
+
 typedef struct PSVM {
     PSObject *global;   /* Global Object */
     PSEnv    *env;      /* Current Environment */
@@ -73,6 +86,7 @@ typedef struct PSVM {
     PSObject *date_proto;
     PSObject *regexp_proto;
     PSObject *math_obj;
+    uint8_t  math_intrinsics_valid;
     PSObject *error_proto;
     PSObject *type_error_proto;
     PSObject *range_error_proto;
@@ -105,6 +119,7 @@ typedef struct PSVM {
     uint64_t perf_dump_interval_ms;
     uint64_t perf_dump_next_ms;
     PSPerfStats perf;
+    PSProfile profile;
     PSGC gc;
 } PSVM;
 
@@ -130,6 +145,7 @@ void ps_vm_init_img(PSVM *vm);
 void ps_vm_set_perf_interval(PSVM *vm, uint64_t interval_ms);
 void ps_vm_perf_poll(PSVM *vm);
 void ps_vm_perf_dump(PSVM *vm);
+void ps_vm_profile_add(PSVM *vm, struct PSFunction *func, uint64_t elapsed_ms);
 
 /* Primitive wrappers */
 PSObject *ps_vm_wrap_primitive(PSVM *vm, const PSValue *v);

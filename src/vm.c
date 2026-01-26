@@ -20,6 +20,8 @@
 #include <stdint.h>
 #include <time.h>
 
+static void ps_vm_profile_dump(PSVM *vm);
+
 /* Forward declaration (implemented in io.c) */
 void ps_io_init(PSVM *vm);
 void ps_buffer_init(PSVM *vm);
@@ -5761,6 +5763,17 @@ PSVM *ps_vm_new(void) {
     vm->current_node = NULL;
     vm->index_cache_size = 10000;
     vm->index_cache = (PSString **)calloc(vm->index_cache_size, sizeof(PSString *));
+    vm->math_intrinsics_valid = 0;
+    vm->profile.enabled = 0;
+    vm->profile.items = NULL;
+    vm->profile.count = 0;
+    vm->profile.cap = 0;
+    {
+        const char *prof_env = getenv("PS_PROFILE_CALLS");
+        if (prof_env && prof_env[0]) {
+            vm->profile.enabled = 1;
+        }
+    }
     /* Initialize built-ins and host extensions */
     ps_vm_init_builtins(vm);
     ps_vm_init_buffer(vm);
@@ -5849,7 +5862,9 @@ void ps_vm_perf_dump(PSVM *vm) {
 
 void ps_vm_free(PSVM *vm) {
     if (!vm) return;
-
+    if (vm->profile.enabled && vm->profile.count > 0) {
+        ps_vm_profile_dump(vm);
+    }
     ps_gc_destroy(vm);
     if (ps_gc_active_vm() == vm) {
         ps_gc_set_active_vm(NULL);
@@ -5861,7 +5876,61 @@ void ps_vm_free(PSVM *vm) {
     free(vm->index_cache);
     free(vm->intern_cache);
     free(vm->stack_frames);
+    free(vm->profile.items);
     free(vm);
+}
+
+static int ps_profile_entry_cmp(const void *a, const void *b) {
+    const PSProfileEntry *ea = (const PSProfileEntry *)a;
+    const PSProfileEntry *eb = (const PSProfileEntry *)b;
+    if (ea->total_ms < eb->total_ms) return 1;
+    if (ea->total_ms > eb->total_ms) return -1;
+    return 0;
+}
+
+static void ps_vm_profile_dump(PSVM *vm) {
+    if (!vm || !vm->profile.enabled || vm->profile.count == 0) return;
+    qsort(vm->profile.items, vm->profile.count, sizeof(PSProfileEntry), ps_profile_entry_cmp);
+    size_t limit = vm->profile.count < 32 ? vm->profile.count : 32;
+    fprintf(stderr, "profileCalls top=%zu\n", limit);
+    for (size_t i = 0; i < limit; i++) {
+        PSProfileEntry *e = &vm->profile.items[i];
+        const char *name_fallback = "<anon>";
+        PSString *name = e->func ? e->func->name : NULL;
+        fprintf(stderr, "profileCalls calls=%llu ms=%llu name=",
+                (unsigned long long)e->calls,
+                (unsigned long long)e->total_ms);
+        if (name && name->utf8 && name->byte_len > 0) {
+            fwrite(name->utf8, 1, name->byte_len, stderr);
+        } else {
+            fputs(name_fallback, stderr);
+        }
+        fprintf(stderr, " func=%p\n", (void *)e->func);
+    }
+}
+
+void ps_vm_profile_add(PSVM *vm, PSFunction *func, uint64_t elapsed_ms) {
+    if (!vm || !vm->profile.enabled || !func) return;
+    for (size_t i = 0; i < vm->profile.count; i++) {
+        PSProfileEntry *e = &vm->profile.items[i];
+        if (e->func == func) {
+            e->calls++;
+            e->total_ms += elapsed_ms;
+            return;
+        }
+    }
+    if (vm->profile.count == vm->profile.cap) {
+        size_t new_cap = vm->profile.cap ? vm->profile.cap * 2 : 32;
+        PSProfileEntry *next = (PSProfileEntry *)realloc(vm->profile.items,
+                                                         new_cap * sizeof(PSProfileEntry));
+        if (!next) return;
+        vm->profile.items = next;
+        vm->profile.cap = new_cap;
+    }
+    PSProfileEntry *slot = &vm->profile.items[vm->profile.count++];
+    slot->func = func;
+    slot->calls = 1;
+    slot->total_ms = elapsed_ms;
 }
 
 /* --------------------------------------------------------- */
@@ -7053,6 +7122,7 @@ void ps_vm_init_builtins(PSVM *vm) {
                          ps_string_from_cstr("Math"),
                          ps_value_object(vm->math_obj),
                          PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
+        vm->math_intrinsics_valid = 1;
     }
 
     PSObject *json_obj = ps_object_new(vm->object_proto);

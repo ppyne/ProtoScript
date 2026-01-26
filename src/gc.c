@@ -55,8 +55,8 @@ PSVM *ps_gc_active_vm(void) {
 void ps_gc_init(PSVM *vm) {
     if (!vm) return;
     memset(&vm->gc, 0, sizeof(vm->gc));
-    vm->gc.min_threshold = 256 * 1024;
-    vm->gc.growth_factor = 2.0;
+    vm->gc.min_threshold = 256 * 1024 * 1024;
+    vm->gc.growth_factor = 4.0;
     vm->gc.threshold = vm->gc.min_threshold;
     {
         const char *min_env = getenv("PS_GC_MIN_THRESHOLD");
@@ -429,7 +429,7 @@ static void ps_gc_mark_object(PSVM *vm, PSObject *obj) {
             if (!arr) break;
             size_t limit = arr->capacity < arr->length ? arr->capacity : arr->length;
             for (size_t i = 0; i < limit; i++) {
-                if (arr->present[i]) {
+                if (arr->dense || !arr->present || arr->present[i]) {
                     ps_gc_mark_value(vm, arr->items[i]);
                 }
             }
@@ -611,6 +611,12 @@ static void ps_gc_finalize_function(PSFunction *fn) {
     fn->fast_param_index = NULL;
     fn->fast_local_count = 0;
     fn->fast_this_index = 0;
+    free(fn->fast_num_inits);
+    fn->fast_num_inits = NULL;
+    free(fn->fast_num_names);
+    fn->fast_num_names = NULL;
+    fn->fast_num_count = 0;
+    fn->fast_num_return = NULL;
     fn->fast_env = NULL;
     fn->fast_env_in_use = 0;
     /* Function references are owned by AST or env; nothing to free here. */

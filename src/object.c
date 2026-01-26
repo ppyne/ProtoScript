@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 /* --------------------------------------------------------- */
 /* Internal helpers                                          */
@@ -19,6 +20,35 @@ static int ps_string_equals(const PSString *a, const PSString *b) {
     if (a->hash != b->hash) return 0;
     if (a->byte_len != b->byte_len) return 0;
     return memcmp(a->utf8, b->utf8, a->byte_len) == 0;
+}
+
+static int ps_string_is_length(const PSString *s) {
+    static const char *length_str = "length";
+    if (!s || s->byte_len != 6) return 0;
+    return memcmp(s->utf8, length_str, 6) == 0;
+}
+
+static void ps_math_intrinsics_invalidate(PSObject *obj) {
+    PSVM *vm = ps_gc_active_vm();
+    if (vm && obj == vm->math_obj && vm->math_intrinsics_valid) {
+        vm->math_intrinsics_valid = 0;
+    }
+}
+
+static int ps_string_to_k_index(const PSString *name, uint32_t *out_index) {
+    if (!name || name->byte_len < 2 || !name->utf8) return 0;
+    if (name->utf8[0] != 'k') return 0;
+    const unsigned char *p = (const unsigned char *)name->utf8 + 1;
+    size_t len = name->byte_len - 1;
+    if (len > 1 && p[0] == '0') return 0;
+    unsigned long long value = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (p[i] < '0' || p[i] > '9') return 0;
+        value = value * 10ULL + (unsigned long long)(p[i] - '0');
+        if (value > UINT32_MAX) return 0;
+    }
+    if (out_index) *out_index = (uint32_t)value;
+    return 1;
 }
 
 static size_t ps_object_bucket_index(const PSObject *obj, const PSString *name) {
@@ -151,16 +181,24 @@ int ps_object_has_own(const PSObject *obj, const PSString *name) {
     PSVM *vm = ps_gc_active_vm();
     if (vm) vm->perf.object_get++;
 #endif
+    if (obj && obj->kind == PS_OBJ_KIND_ARRAY && ps_string_is_length(name)) {
+        return 1;
+    }
     if (obj && obj->kind == PS_OBJ_KIND_PLAIN && obj->internal_kind == PS_INTERNAL_NUMMAP) {
         size_t index = 0;
-        if (ps_array_string_to_index(name, &index)) {
+        if (ps_array_string_to_index((PSString *)name, &index)) {
             PSValue out = ps_value_undefined();
             if (ps_num_map_get((PSObject *)obj, index, &out)) return 1;
+        }
+        uint32_t kindex = 0;
+        if (ps_string_to_k_index(name, &kindex)) {
+            PSValue out = ps_value_undefined();
+            if (ps_num_map_k_get((PSObject *)obj, kindex, &out)) return 1;
         }
     }
     if (obj && obj->kind == PS_OBJ_KIND_ARRAY) {
         size_t index = 0;
-        if (ps_array_string_to_index(name, &index)) {
+        if (ps_array_string_to_index((PSString *)name, &index)) {
             PSValue out = ps_value_undefined();
             if (ps_array_get_index(obj, index, &out)) return 1;
         }
@@ -173,11 +211,23 @@ PSValue ps_object_get_own(const PSObject *obj, const PSString *name, int *found)
     PSVM *vm = ps_gc_active_vm();
     if (vm) vm->perf.object_get++;
 #endif
+    if (obj && obj->kind == PS_OBJ_KIND_ARRAY && ps_string_is_length(name)) {
+        if (found) *found = 1;
+        return ps_value_number((double)ps_array_length(obj));
+    }
     if (obj && obj->kind == PS_OBJ_KIND_PLAIN && obj->internal_kind == PS_INTERNAL_NUMMAP) {
         size_t index = 0;
-        if (ps_array_string_to_index(name, &index)) {
+        if (ps_array_string_to_index((PSString *)name, &index)) {
             PSValue out = ps_value_undefined();
             if (ps_num_map_get((PSObject *)obj, index, &out)) {
+                if (found) *found = 1;
+                return out;
+            }
+        }
+        uint32_t kindex = 0;
+        if (ps_string_to_k_index(name, &kindex)) {
+            PSValue out = ps_value_undefined();
+            if (ps_num_map_k_get((PSObject *)obj, kindex, &out)) {
                 if (found) *found = 1;
                 return out;
             }
@@ -185,7 +235,7 @@ PSValue ps_object_get_own(const PSObject *obj, const PSString *name, int *found)
     }
     if (obj && obj->kind == PS_OBJ_KIND_ARRAY) {
         size_t index = 0;
-        if (ps_array_string_to_index(name, &index)) {
+        if (ps_array_string_to_index((PSString *)name, &index)) {
             PSValue out = ps_value_undefined();
             if (ps_array_get_index(obj, index, &out)) {
                 if (found) *found = 1;
@@ -221,13 +271,25 @@ PSValue ps_object_get(const PSObject *obj, const PSString *name, int *found) {
     PSVM *vm = ps_gc_active_vm();
     if (vm) vm->perf.object_get++;
 #endif
+    if (obj && obj->kind == PS_OBJ_KIND_ARRAY && ps_string_is_length(name)) {
+        if (found) *found = 1;
+        return ps_value_number((double)ps_array_length(obj));
+    }
     const PSObject *cur = obj;
     while (cur) {
         if (cur->kind == PS_OBJ_KIND_PLAIN && cur->internal_kind == PS_INTERNAL_NUMMAP) {
             size_t index = 0;
-            if (ps_array_string_to_index(name, &index)) {
+            if (ps_array_string_to_index((PSString *)name, &index)) {
                 PSValue out = ps_value_undefined();
                 if (ps_num_map_get((PSObject *)cur, index, &out)) {
+                    if (found) *found = 1;
+                    return out;
+                }
+            }
+            uint32_t kindex = 0;
+            if (ps_string_to_k_index(name, &kindex)) {
+                PSValue out = ps_value_undefined();
+                if (ps_num_map_k_get((PSObject *)cur, kindex, &out)) {
                     if (found) *found = 1;
                     return out;
                 }
@@ -235,7 +297,7 @@ PSValue ps_object_get(const PSObject *obj, const PSString *name, int *found) {
         }
         if (cur->kind == PS_OBJ_KIND_ARRAY) {
             size_t index = 0;
-            if (ps_array_string_to_index(name, &index)) {
+            if (ps_array_string_to_index((PSString *)name, &index)) {
                 PSValue out = ps_value_undefined();
                 if (ps_array_get_index(cur, index, &out)) {
                     if (found) *found = 1;
@@ -278,6 +340,7 @@ int ps_object_define(PSObject *obj, PSString *name, PSValue value, uint8_t attrs
         p->attrs = attrs;
         obj->cache_name = p->name;
         obj->cache_prop = p;
+        ps_math_intrinsics_invalidate(obj);
         return 1;
     }
 
@@ -285,18 +348,28 @@ int ps_object_define(PSObject *obj, PSString *name, PSValue value, uint8_t attrs
         attrs == PS_ATTR_NONE &&
         (obj->internal == NULL || obj->internal_kind == PS_INTERNAL_NUMMAP)) {
         size_t index = 0;
-        if (ps_array_string_to_index(name, &index)) {
+        if (ps_array_string_to_index((PSString *)name, &index)) {
             int is_new = 0;
             if (!ps_num_map_set(obj, index, value, &is_new)) return 0;
             if (is_new) obj->shape_id++;
+            ps_math_intrinsics_invalidate(obj);
+            return 1;
+        }
+        uint32_t kindex = 0;
+        if (ps_string_to_k_index(name, &kindex)) {
+            int is_new = 0;
+            if (!ps_num_map_k_set(obj, kindex, value, &is_new)) return 0;
+            if (is_new) obj->shape_id++;
+            ps_math_intrinsics_invalidate(obj);
             return 1;
         }
     }
 
     if (obj->kind == PS_OBJ_KIND_ARRAY && attrs == PS_ATTR_NONE) {
         size_t index = 0;
-        if (ps_array_string_to_index(name, &index)) {
+        if (ps_array_string_to_index((PSString *)name, &index)) {
             if (!ps_array_set_index(obj, index, value)) return 0;
+            ps_math_intrinsics_invalidate(obj);
             return 1;
         }
     }
@@ -328,6 +401,7 @@ int ps_object_define(PSObject *obj, PSString *name, PSValue value, uint8_t attrs
     }
     obj->cache_name = p->name;
     obj->cache_prop = p;
+    ps_math_intrinsics_invalidate(obj);
 
     return 1;
 }
@@ -348,29 +422,49 @@ int ps_object_put(PSObject *obj, PSString *name, PSValue value) {
         p->value = value;
         obj->cache_name = p->name;
         obj->cache_prop = p;
+        ps_math_intrinsics_invalidate(obj);
         return 1;
     }
 
     if (obj->kind == PS_OBJ_KIND_PLAIN &&
         (obj->internal == NULL || obj->internal_kind == PS_INTERNAL_NUMMAP)) {
         size_t index = 0;
-        if (ps_array_string_to_index(name, &index)) {
+        if (ps_array_string_to_index((PSString *)name, &index)) {
             int is_new = 0;
             if (!ps_num_map_set(obj, index, value, &is_new)) return 0;
             if (is_new) obj->shape_id++;
+            ps_math_intrinsics_invalidate(obj);
+            return 1;
+        }
+        uint32_t kindex = 0;
+        if (ps_string_to_k_index(name, &kindex)) {
+            int is_new = 0;
+            if (!ps_num_map_k_set(obj, kindex, value, &is_new)) return 0;
+            if (is_new) obj->shape_id++;
+            ps_math_intrinsics_invalidate(obj);
             return 1;
         }
     }
 
     if (obj->kind == PS_OBJ_KIND_ARRAY) {
         size_t index = 0;
-        if (ps_array_string_to_index(name, &index)) {
-            return ps_array_set_index(obj, index, value);
+        if (ps_array_string_to_index((PSString *)name, &index)) {
+            int ok = ps_array_set_index(obj, index, value);
+            if (ok) {
+                ps_math_intrinsics_invalidate(obj);
+            }
+            return ok;
         }
     }
 
     /* Default attributes: enumerable, writable, deletable */
-    return ps_object_define(obj, name, value, PS_ATTR_NONE);
+    {
+        int ok = ps_object_define(obj, name, value, PS_ATTR_NONE);
+        if (ok) {
+            ps_math_intrinsics_invalidate(obj);
+        }
+        return ok;
+    }
 }
 
 /* --------------------------------------------------------- */
@@ -388,10 +482,21 @@ int ps_object_delete(PSObject *obj, const PSString *name, int *deleted) {
 
     if (obj->kind == PS_OBJ_KIND_PLAIN && obj->internal_kind == PS_INTERNAL_NUMMAP) {
         size_t index = 0;
-        if (ps_array_string_to_index(name, &index)) {
+        if (ps_array_string_to_index((PSString *)name, &index)) {
             if (!find_prop(obj, name)) {
                 int did_delete = 0;
                 if (ps_num_map_delete(obj, index, &did_delete) && did_delete) {
+                    obj->shape_id++;
+                }
+                if (deleted) *deleted = did_delete ? 1 : 0;
+                return 1;
+            }
+        }
+        uint32_t kindex = 0;
+        if (ps_string_to_k_index(name, &kindex)) {
+            if (!find_prop(obj, name)) {
+                int did_delete = 0;
+                if (ps_num_map_k_delete(obj, kindex, &did_delete) && did_delete) {
                     obj->shape_id++;
                 }
                 if (deleted) *deleted = did_delete ? 1 : 0;
@@ -402,7 +507,7 @@ int ps_object_delete(PSObject *obj, const PSString *name, int *deleted) {
 
     if (obj->kind == PS_OBJ_KIND_ARRAY) {
         size_t index = 0;
-        if (ps_array_string_to_index(name, &index)) {
+        if (ps_array_string_to_index((PSString *)name, &index)) {
             if (!find_prop(obj, name)) {
                 int did_delete = ps_array_delete_index(obj, index);
                 if (deleted) *deleted = did_delete ? 1 : 0;
@@ -448,6 +553,7 @@ int ps_object_delete(PSObject *obj, const PSString *name, int *deleted) {
             }
             free(p);
             if (deleted) *deleted = 1;
+            ps_math_intrinsics_invalidate(obj);
             return 1;
         }
         prev = p;
@@ -493,6 +599,26 @@ int ps_object_enum_own(const PSObject *obj, PSPropEnumCallback cb, void *user) {
                 if (rc != 0) return rc;
             }
         }
+        if (map && map->k_capacity > 0) {
+            char buf[32];
+            for (size_t i = 0; i < map->k_capacity; i++) {
+                if (!map->k_present[i]) continue;
+                snprintf(buf, sizeof(buf), "k%zu", i);
+                PSString *name = ps_string_from_cstr(buf);
+                int rc = cb(name, map->k_items[i], PS_ATTR_NONE, user);
+                if (rc != 0) return rc;
+            }
+        }
+        if (map && map->k_hash_state && map->k_hash_cap > 0) {
+            char buf[32];
+            for (size_t i = 0; i < map->k_hash_cap; i++) {
+                if (map->k_hash_state[i] != 1) continue;
+                snprintf(buf, sizeof(buf), "k%u", map->k_hash_keys[i]);
+                PSString *name = ps_string_from_cstr(buf);
+                int rc = cb(name, map->k_hash_values[i], PS_ATTR_NONE, user);
+                if (rc != 0) return rc;
+            }
+        }
     }
 
     if (obj->kind == PS_OBJ_KIND_ARRAY && obj->internal) {
@@ -500,7 +626,7 @@ int ps_object_enum_own(const PSObject *obj, PSPropEnumCallback cb, void *user) {
         PSVM *vm = ps_gc_active_vm();
         size_t limit = arr->capacity < arr->length ? arr->capacity : arr->length;
         for (size_t i = 0; i < limit; i++) {
-            if (!arr->present[i]) continue;
+            if (!arr->dense && (!arr->present || !arr->present[i])) continue;
             PSString *name = ps_array_index_string(vm, i);
             int rc = cb(name, arr->items[i], PS_ATTR_NONE, user);
             if (rc != 0) return rc;

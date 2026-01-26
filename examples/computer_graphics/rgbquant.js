@@ -526,6 +526,7 @@ RgbQuant.prototype.orderedDither = function (img, kernel) {
 
 // reduces histogram to palette, remaps & memoizes reduced colors
 RgbQuant.prototype.buildPal = function buildPal(noSort) {
+    var ms = (new Date()).getTime();
     rq_debug("buildPal start");
     if (this.palLocked || this.idxrgb.length > 0 && this.idxrgb.length <= this.colors) return;
 
@@ -567,7 +568,7 @@ RgbQuant.prototype.buildPal = function buildPal(noSort) {
         this.sortPal();
 
     this.palLocked = true;
-    rq_debug("buildPal sorted=" + sorted.length + " palette=" + this.idxrgb.length);
+    rq_debug("buildPal sorted=" + sorted.length + " palette=" + this.idxrgb.length + " time=" + ((new Date()).getTime() - ms) + " ms" );
 };
 
 RgbQuant.prototype.palette = function palette(tuples, noSort) {

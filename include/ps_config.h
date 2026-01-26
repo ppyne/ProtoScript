@@ -15,7 +15,9 @@
 #define PS_ENABLE_FAST_CALLS 1
 #endif
 
+#ifndef PS_ENABLE_PERF
 #define PS_ENABLE_PERF 1
+#endif
 
 #ifndef PS_ENABLE_MODULE_DISPLAY
 #define PS_ENABLE_MODULE_DISPLAY 1

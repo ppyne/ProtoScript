@@ -21,11 +21,19 @@
 #include <stdint.h>
 #include <time.h>
 
+#define PS_PERF_POLL(vm) do { \
+    if ((vm) && (vm)->perf_dump_interval_ms) { \
+        ps_vm_perf_poll(vm); \
+    } \
+} while (0)
+
 static uint64_t ps_eval_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
 }
+
+static int ps_eval_trace_enabled = -1;
 
 static void ps_eval_trace_poll(PSVM *vm, PSAstNode *node) {
     static int init = 0;
@@ -51,6 +59,7 @@ static void ps_eval_trace_poll(PSVM *vm, PSAstNode *node) {
                 next_ms = ps_eval_now_ms() + interval_ms;
             }
         }
+        ps_eval_trace_enabled = (trace_every > 0 || interval_ms > 0) ? 1 : 0;
         init = 1;
     }
     if (trace_every > 0) {
@@ -95,6 +104,11 @@ static PSValue eval_block(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *
 static PSValue ps_eval_source(PSVM *vm, PSEnv *env, PSString *source, PSEvalControl *ctl);
 static void hoist_decls(PSVM *vm, PSEnv *env, PSAstNode *node);
 static PSString *ps_identifier_string(PSAstNode *node);
+static int ps_identifier_cached_get(PSEnv *env,
+                                    PSAstNode *id,
+                                    PSValue *out,
+                                    int *found);
+static int ps_string_to_index_size(PSString *name, size_t *out_index);
 static void ps_array_update_length(PSObject *obj, PSString *prop);
 static int ps_array_write_index_value(PSVM *vm,
                                       PSObject *obj,
@@ -547,6 +561,39 @@ static uint32_t ps_to_uint32(PSVM *vm, const PSValue *v) {
     return (uint32_t)val;
 }
 
+static int32_t ps_to_int32_num(double num) {
+    if (ps_value_is_nan(num) || num == 0.0 || isinf(num)) return 0;
+    double sign = num < 0 ? -1.0 : 1.0;
+    double abs = floor(fabs(num));
+    double val = fmod(sign * abs, 4294967296.0);
+    if (val >= 2147483648.0) val -= 4294967296.0;
+    return (int32_t)val;
+}
+
+static uint32_t ps_to_uint32_num(double num) {
+    if (ps_value_is_nan(num) || num == 0.0 || isinf(num)) return 0;
+    double sign = num < 0 ? -1.0 : 1.0;
+    double abs = floor(fabs(num));
+    double val = fmod(sign * abs, 4294967296.0);
+    if (val < 0) val += 4294967296.0;
+    return (uint32_t)val;
+}
+
+static double ps_to_number_fast(PSVM *vm, PSValue value) {
+    if (value.type == PS_T_NUMBER) return value.as.number;
+    return ps_to_number(vm, value);
+}
+
+static int32_t ps_to_int32_fast(PSVM *vm, PSValue value) {
+    if (value.type == PS_T_NUMBER) return ps_to_int32_num(value.as.number);
+    return ps_to_int32(vm, &value);
+}
+
+static uint32_t ps_to_uint32_fast(PSVM *vm, PSValue value) {
+    if (value.type == PS_T_NUMBER) return ps_to_uint32_num(value.as.number);
+    return ps_to_uint32(vm, &value);
+}
+
 static int ps_strict_equals(const PSValue *a, const PSValue *b) {
     if (a->type != b->type) return 0;
     switch (a->type) {
@@ -633,7 +680,9 @@ static PSObject *ps_to_object(PSVM *vm, const PSValue *v, PSEvalControl *ctl) {
 static PSString *ps_identifier_string(PSAstNode *node) {
     if (!node || node->kind != AST_IDENTIFIER) return NULL;
     if (node->as.identifier.str) return node->as.identifier.str;
-    return ps_string_from_utf8(node->as.identifier.name, node->as.identifier.length);
+    PSString *s = ps_string_from_utf8(node->as.identifier.name, node->as.identifier.length);
+    node->as.identifier.str = s;
+    return s;
 }
 
 static int ps_literal_string_equals(PSAstNode *node, const char *lit, size_t len) {
@@ -688,6 +737,21 @@ static PSString *ps_member_key_read(PSVM *vm,
         return ps_identifier_string(member->as.member.property);
     }
     PSAstNode *prop = member->as.member.property;
+    if (prop && prop->kind == AST_LITERAL) {
+        PSValue lit = prop->as.literal.value;
+        if (lit.type == PS_T_STRING) {
+            return lit.as.string;
+        }
+        if (lit.type == PS_T_NUMBER) {
+            double num = lit.as.number;
+            if (num >= 0.0 && num <= (double)SIZE_MAX) {
+                size_t idx = (size_t)num;
+                if ((double)idx == num) {
+                    return ps_array_index_string(vm, idx);
+                }
+            }
+        }
+    }
     if (prop && prop->kind == AST_BINARY && prop->as.binary.op == TOK_PLUS) {
         PSAstNode *left = prop->as.binary.left;
         PSAstNode *right = prop->as.binary.right;
@@ -706,6 +770,8 @@ static PSString *ps_member_key_read(PSVM *vm,
                     tmp->byte_len = 1 + num_len;
                     tmp->glyph_offsets = NULL;
                     tmp->glyph_count = 0;
+                    tmp->index_state = 0;
+                    tmp->index_value = 0;
                     uint32_t hash = 2166136261u;
                     for (size_t i = 0; i < tmp->byte_len; i++) {
                         hash ^= (uint8_t)tmp_buf[i];
@@ -729,9 +795,11 @@ static PSString *ps_member_key(PSVM *vm, PSEnv *env, PSAstNode *member, PSEvalCo
     if (ctl->did_throw) return NULL;
     if (key_val.type == PS_T_NUMBER) {
         double num = key_val.as.number;
-        if (!isnan(num) && !isinf(num) && num >= 0.0 && floor(num) == num) {
+        if (num >= 0.0 && num <= (double)SIZE_MAX) {
             size_t idx = (size_t)num;
-            return ps_array_index_string(vm, idx);
+            if ((double)idx == num) {
+                return ps_array_index_string(vm, idx);
+            }
         }
     }
     PSString *key = ps_to_string(vm, key_val);
@@ -741,8 +809,14 @@ static PSString *ps_member_key(PSVM *vm, PSEnv *env, PSAstNode *member, PSEvalCo
 
 #define PS_FAST_FLAG_FIB 0x01
 #define PS_FAST_FLAG_ENV 0x02
+#define PS_FAST_FLAG_MATH 0x04
+#define PS_FAST_FLAG_NUM 0x08
+#define PS_FAST_FLAG_CLAMP 0x10
 #define PS_FAST_CHECKED_FIB 0x01
 #define PS_FAST_CHECKED_ENV 0x02
+#define PS_FAST_CHECKED_MATH 0x04
+#define PS_FAST_CHECKED_NUM 0x08
+#define PS_FAST_CHECKED_CLAMP 0x10
 
 typedef struct {
     PSString **items;
@@ -1146,10 +1220,1456 @@ static double ps_fast_fib_value(uint64_t n) {
     return a;
 }
 
+static int ps_fast_math_param_index(PSFunction *func, PSString *name, size_t *out_index) {
+    if (!func || !name || !func->param_names) return 0;
+    for (size_t i = 0; i < func->param_count; i++) {
+        if (func->param_names[i] && ps_string_equals(func->param_names[i], name)) {
+            if (out_index) *out_index = i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int ps_fast_math_expr_ok(PSFunction *func, PSAstNode *expr) {
+    if (!expr || !func) return 0;
+    switch (expr->kind) {
+        case AST_LITERAL:
+            return expr->as.literal.value.type == PS_T_NUMBER;
+        case AST_IDENTIFIER:
+            return ps_fast_math_param_index(func, ps_identifier_string(expr), NULL);
+        case AST_UNARY:
+            if (expr->as.unary.op != TOK_PLUS && expr->as.unary.op != TOK_MINUS) return 0;
+            return ps_fast_math_expr_ok(func, expr->as.unary.expr);
+        case AST_BINARY: {
+            int op = expr->as.binary.op;
+            if (op != TOK_PLUS && op != TOK_MINUS && op != TOK_STAR &&
+                op != TOK_SLASH && op != TOK_PERCENT) {
+                return 0;
+            }
+            return ps_fast_math_expr_ok(func, expr->as.binary.left) &&
+                ps_fast_math_expr_ok(func, expr->as.binary.right);
+        }
+        default:
+            return 0;
+    }
+}
+
+static int ps_match_identifier_node(PSAstNode *node, PSString *name) {
+    if (!node || node->kind != AST_IDENTIFIER || !name) return 0;
+    return ps_string_equals(ps_identifier_string(node), name);
+}
+
+static int ps_match_math_floor_call(PSAstNode *expr, PSString *param_name) {
+    if (!expr || expr->kind != AST_CALL) return 0;
+    PSAstNode *callee = expr->as.call.callee;
+    if (!callee || callee->kind != AST_MEMBER) return 0;
+    PSAstNode *member = callee;
+    if (member->as.member.computed) return 0;
+    PSAstNode *obj = member->as.member.object;
+    PSAstNode *prop = member->as.member.property;
+    if (!obj || obj->kind != AST_IDENTIFIER) return 0;
+    PSString *obj_name = ps_identifier_string(obj);
+    if (!ps_string_equals_cstr(obj_name, "Math")) return 0;
+    if (!prop || prop->kind != AST_IDENTIFIER) return 0;
+    PSString *fn = ps_identifier_string(prop);
+    if (!ps_string_equals_cstr(fn, "floor")) return 0;
+    if (expr->as.call.argc != 1) return 0;
+    return ps_match_identifier_node(expr->as.call.args[0], param_name);
+}
+
+static void ps_fast_math_prepare(PSFunction *func) {
+    if (!func || func->is_native) return;
+    if (func->fast_checked & PS_FAST_CHECKED_MATH) return;
+    func->fast_checked |= PS_FAST_CHECKED_MATH;
+    if (!func->body || func->body->kind != AST_BLOCK) return;
+    if (func->body->as.list.count != 1) return;
+    PSAstNode *stmt = func->body->as.list.items[0];
+    if (!stmt || stmt->kind != AST_RETURN || !stmt->as.ret.expr) return;
+    if (!ps_fast_math_expr_ok(func, stmt->as.ret.expr)) return;
+    func->fast_flags |= PS_FAST_FLAG_MATH;
+    func->fast_math_expr = stmt->as.ret.expr;
+}
+
+static int ps_fast_math_eval(PSFunction *func,
+                             PSAstNode *expr,
+                             int argc,
+                             PSValue *argv,
+                             double *out) {
+    if (!expr || !func) return 0;
+    switch (expr->kind) {
+        case AST_LITERAL:
+            if (expr->as.literal.value.type != PS_T_NUMBER) return 0;
+            if (out) *out = expr->as.literal.value.as.number;
+            return 1;
+        case AST_IDENTIFIER: {
+            size_t idx = 0;
+            if (!ps_fast_math_param_index(func, ps_identifier_string(expr), &idx)) return 0;
+            if ((int)idx >= argc || !argv) return 0;
+            if (argv[idx].type != PS_T_NUMBER) return 0;
+            if (out) *out = argv[idx].as.number;
+            return 1;
+        }
+        case AST_UNARY: {
+            double v = 0.0;
+            if (!ps_fast_math_eval(func, expr->as.unary.expr, argc, argv, &v)) return 0;
+            if (expr->as.unary.op == TOK_MINUS) v = -v;
+            if (out) *out = v;
+            return 1;
+        }
+        case AST_BINARY: {
+            double l = 0.0;
+            double r = 0.0;
+            if (!ps_fast_math_eval(func, expr->as.binary.left, argc, argv, &l)) return 0;
+            if (!ps_fast_math_eval(func, expr->as.binary.right, argc, argv, &r)) return 0;
+            switch (expr->as.binary.op) {
+                case TOK_PLUS: l = l + r; break;
+                case TOK_MINUS: l = l - r; break;
+                case TOK_STAR: l = l * r; break;
+                case TOK_SLASH: l = l / r; break;
+                case TOK_PERCENT: l = fmod(l, r); break;
+                default: return 0;
+            }
+            if (out) *out = l;
+            return 1;
+        }
+        default:
+            return 0;
+    }
+}
+
+typedef struct {
+    PSVM *vm;
+    PSFunction *func;
+    int argc;
+    PSValue *argv;
+    PSString **local_names;
+    double *local_vals;
+    size_t local_count;
+} PSFastNumCtx;
+
+typedef struct PSFastNumOp {
+    uint8_t op;
+    uint8_t kind;
+    uint16_t pad;
+    uint32_t index;
+    double imm;
+    PSAstNode *node;
+} PSFastNumOp;
+
+typedef struct {
+    PSFastNumOp *items;
+    size_t count;
+    size_t cap;
+} PSFastNumOpList;
+
+#define PS_FAST_NUM_OP_CONST 1
+#define PS_FAST_NUM_OP_PARAM 2
+#define PS_FAST_NUM_OP_LOCAL 3
+#define PS_FAST_NUM_OP_ENV 4
+#define PS_FAST_NUM_OP_STORE_LOCAL 5
+#define PS_FAST_NUM_OP_MEMBER 6
+#define PS_FAST_NUM_OP_NEG 7
+#define PS_FAST_NUM_OP_ADD 8
+#define PS_FAST_NUM_OP_SUB 9
+#define PS_FAST_NUM_OP_MUL 10
+#define PS_FAST_NUM_OP_DIV 11
+#define PS_FAST_NUM_OP_MOD 12
+#define PS_FAST_NUM_OP_MATH_SQRT 13
+#define PS_FAST_NUM_OP_MATH_ABS 14
+#define PS_FAST_NUM_OP_MATH_POW 15
+#define PS_FAST_NUM_OP_MATH_FLOOR 16
+#define PS_FAST_NUM_OP_MATH_CEIL 17
+#define PS_FAST_NUM_OP_MATH_ROUND 18
+#define PS_FAST_NUM_OP_MATH_MIN 19
+#define PS_FAST_NUM_OP_MATH_MAX 20
+#define PS_FAST_NUM_OP_RETURN 21
+
+#define PS_FAST_NUM_KIND_NONE 0
+#define PS_FAST_NUM_KIND_PARAM 1
+#define PS_FAST_NUM_KIND_LOCAL 2
+#define PS_FAST_NUM_KIND_ENV 3
+
+#define PS_FAST_NUM_MATH_NONE 0
+#define PS_FAST_NUM_MATH_SQRT 1
+#define PS_FAST_NUM_MATH_ABS 2
+#define PS_FAST_NUM_MATH_MIN 3
+#define PS_FAST_NUM_MATH_MAX 4
+#define PS_FAST_NUM_MATH_POW 5
+#define PS_FAST_NUM_MATH_FLOOR 6
+#define PS_FAST_NUM_MATH_CEIL 7
+#define PS_FAST_NUM_MATH_ROUND 8
+
+static uint8_t ps_fast_num_math_id(PSAstNode *expr) {
+    if (!expr || expr->kind != AST_CALL) return PS_FAST_NUM_MATH_NONE;
+    PSAstNode *callee = expr->as.call.callee;
+    if (!callee || callee->kind != AST_MEMBER) return PS_FAST_NUM_MATH_NONE;
+    PSAstNode *member = callee;
+    if (member->as.member.computed) return PS_FAST_NUM_MATH_NONE;
+    PSAstNode *obj = member->as.member.object;
+    PSAstNode *prop = member->as.member.property;
+    if (!obj || obj->kind != AST_IDENTIFIER) return PS_FAST_NUM_MATH_NONE;
+    if (!prop || prop->kind != AST_IDENTIFIER) return PS_FAST_NUM_MATH_NONE;
+    PSString *obj_name = ps_identifier_string(obj);
+    if (!ps_string_equals_cstr(obj_name, "Math")) return PS_FAST_NUM_MATH_NONE;
+    PSString *fn = ps_identifier_string(prop);
+    if (!fn) return PS_FAST_NUM_MATH_NONE;
+    if (ps_string_equals_cstr(fn, "sqrt")) return PS_FAST_NUM_MATH_SQRT;
+    if (ps_string_equals_cstr(fn, "abs")) return PS_FAST_NUM_MATH_ABS;
+    if (ps_string_equals_cstr(fn, "min")) return PS_FAST_NUM_MATH_MIN;
+    if (ps_string_equals_cstr(fn, "max")) return PS_FAST_NUM_MATH_MAX;
+    if (ps_string_equals_cstr(fn, "pow")) return PS_FAST_NUM_MATH_POW;
+    if (ps_string_equals_cstr(fn, "floor")) return PS_FAST_NUM_MATH_FLOOR;
+    if (ps_string_equals_cstr(fn, "ceil")) return PS_FAST_NUM_MATH_CEIL;
+    if (ps_string_equals_cstr(fn, "round")) return PS_FAST_NUM_MATH_ROUND;
+    return PS_FAST_NUM_MATH_NONE;
+}
+
+static int ps_fast_num_op_push(PSFastNumOpList *list, PSFastNumOp op) {
+    if (!list) return 0;
+    if (list->count >= list->cap) {
+        size_t new_cap = list->cap ? list->cap * 2 : 32;
+        PSFastNumOp *items = (PSFastNumOp *)realloc(list->items, new_cap * sizeof(PSFastNumOp));
+        if (!items) return 0;
+        list->items = items;
+        list->cap = new_cap;
+    }
+    list->items[list->count++] = op;
+    return 1;
+}
+
+static int ps_fast_num_emit_expr(PSFunction *func, PSAstNode *expr, PSFastNumOpList *out) {
+    if (!func || !expr || !out) return 0;
+    switch (expr->kind) {
+        case AST_LITERAL: {
+            if (expr->as.literal.value.type != PS_T_NUMBER) return 0;
+            PSFastNumOp op = {0};
+            op.op = PS_FAST_NUM_OP_CONST;
+            op.imm = expr->as.literal.value.as.number;
+            return ps_fast_num_op_push(out, op);
+        }
+        case AST_IDENTIFIER: {
+            uint8_t kind = expr->as.identifier.fast_num_kind;
+            uint32_t idx = expr->as.identifier.fast_num_index;
+            PSFastNumOp op = {0};
+            if (kind == PS_FAST_NUM_KIND_PARAM) {
+                op.op = PS_FAST_NUM_OP_PARAM;
+                op.index = idx;
+                return ps_fast_num_op_push(out, op);
+            }
+            if (kind == PS_FAST_NUM_KIND_LOCAL) {
+                op.op = PS_FAST_NUM_OP_LOCAL;
+                op.index = idx;
+                return ps_fast_num_op_push(out, op);
+            }
+            if (kind == PS_FAST_NUM_KIND_ENV) {
+                op.op = PS_FAST_NUM_OP_ENV;
+                op.node = expr;
+                return ps_fast_num_op_push(out, op);
+            }
+            return 0;
+        }
+        case AST_UNARY: {
+            if (!ps_fast_num_emit_expr(func, expr->as.unary.expr, out)) return 0;
+            if (expr->as.unary.op == TOK_MINUS) {
+                PSFastNumOp op = {0};
+                op.op = PS_FAST_NUM_OP_NEG;
+                return ps_fast_num_op_push(out, op);
+            }
+            return 1;
+        }
+        case AST_BINARY: {
+            int op = expr->as.binary.op;
+            if (!ps_fast_num_emit_expr(func, expr->as.binary.left, out)) return 0;
+            if (!ps_fast_num_emit_expr(func, expr->as.binary.right, out)) return 0;
+            PSFastNumOp inst = {0};
+            switch (op) {
+                case TOK_PLUS: inst.op = PS_FAST_NUM_OP_ADD; break;
+                case TOK_MINUS: inst.op = PS_FAST_NUM_OP_SUB; break;
+                case TOK_STAR: inst.op = PS_FAST_NUM_OP_MUL; break;
+                case TOK_SLASH: inst.op = PS_FAST_NUM_OP_DIV; break;
+                case TOK_PERCENT: inst.op = PS_FAST_NUM_OP_MOD; break;
+                default: return 0;
+            }
+            return ps_fast_num_op_push(out, inst);
+        }
+        case AST_MEMBER: {
+            PSAstNode *obj_node = expr->as.member.object;
+            PSAstNode *prop = expr->as.member.property;
+            if (!expr->as.member.computed) return 0;
+            if (!obj_node || obj_node->kind != AST_IDENTIFIER) return 0;
+            if (!prop || prop->kind != AST_LITERAL || prop->as.literal.value.type != PS_T_NUMBER) return 0;
+            double num = prop->as.literal.value.as.number;
+            if (num < 0.0 || num > (double)UINT32_MAX) return 0;
+            uint32_t index = (uint32_t)num;
+            if ((double)index != num) return 0;
+            PSFastNumOp op = {0};
+            op.op = PS_FAST_NUM_OP_MEMBER;
+            op.index = index;
+            op.node = obj_node;
+            return ps_fast_num_op_push(out, op);
+        }
+        case AST_CALL: {
+            uint8_t math_id = expr->as.call.fast_num_math_id;
+            if (math_id == PS_FAST_NUM_MATH_NONE) {
+                math_id = ps_fast_num_math_id(expr);
+            }
+            size_t argc = expr->as.call.argc;
+            PSAstNode **args = expr->as.call.args;
+            if (math_id == PS_FAST_NUM_MATH_MIN || math_id == PS_FAST_NUM_MATH_MAX) {
+                for (size_t i = 0; i < argc; i++) {
+                    if (!ps_fast_num_emit_expr(func, args[i], out)) return 0;
+                }
+                PSFastNumOp op = {0};
+                op.op = (math_id == PS_FAST_NUM_MATH_MIN) ? PS_FAST_NUM_OP_MATH_MIN
+                                                          : PS_FAST_NUM_OP_MATH_MAX;
+                op.index = (uint32_t)argc;
+                return ps_fast_num_op_push(out, op);
+            }
+            if (math_id == PS_FAST_NUM_MATH_POW) {
+                if (argc > 0) {
+                    if (!ps_fast_num_emit_expr(func, args[0], out)) return 0;
+                } else {
+                    PSFastNumOp zero = {0};
+                    zero.op = PS_FAST_NUM_OP_CONST;
+                    zero.imm = 0.0;
+                    if (!ps_fast_num_op_push(out, zero)) return 0;
+                }
+                if (argc > 1) {
+                    if (!ps_fast_num_emit_expr(func, args[1], out)) return 0;
+                } else {
+                    PSFastNumOp zero = {0};
+                    zero.op = PS_FAST_NUM_OP_CONST;
+                    zero.imm = 0.0;
+                    if (!ps_fast_num_op_push(out, zero)) return 0;
+                }
+                PSFastNumOp op = {0};
+                op.op = PS_FAST_NUM_OP_MATH_POW;
+                return ps_fast_num_op_push(out, op);
+            }
+            if (math_id == PS_FAST_NUM_MATH_SQRT || math_id == PS_FAST_NUM_MATH_ABS ||
+                math_id == PS_FAST_NUM_MATH_FLOOR || math_id == PS_FAST_NUM_MATH_CEIL ||
+                math_id == PS_FAST_NUM_MATH_ROUND) {
+                if (argc > 0) {
+                    if (!ps_fast_num_emit_expr(func, args[0], out)) return 0;
+                } else {
+                    PSFastNumOp zero = {0};
+                    zero.op = PS_FAST_NUM_OP_CONST;
+                    zero.imm = 0.0;
+                    if (!ps_fast_num_op_push(out, zero)) return 0;
+                }
+                PSFastNumOp op = {0};
+                if (math_id == PS_FAST_NUM_MATH_SQRT) op.op = PS_FAST_NUM_OP_MATH_SQRT;
+                else if (math_id == PS_FAST_NUM_MATH_ABS) op.op = PS_FAST_NUM_OP_MATH_ABS;
+                else if (math_id == PS_FAST_NUM_MATH_FLOOR) op.op = PS_FAST_NUM_OP_MATH_FLOOR;
+                else if (math_id == PS_FAST_NUM_MATH_CEIL) op.op = PS_FAST_NUM_OP_MATH_CEIL;
+                else op.op = PS_FAST_NUM_OP_MATH_ROUND;
+                return ps_fast_num_op_push(out, op);
+            }
+            return 0;
+        }
+        default:
+            return 0;
+    }
+}
+
+static int ps_fast_num_compile_ops(PSFunction *func,
+                                   PSAstNode **inits,
+                                   size_t init_count,
+                                   PSAstNode *ret_expr) {
+    if (!func || !ret_expr) return 0;
+    PSFastNumOpList list = {0};
+    for (size_t i = 0; i < init_count; i++) {
+        if (!ps_fast_num_emit_expr(func, inits[i], &list)) {
+            free(list.items);
+            return 0;
+        }
+        PSFastNumOp store = {0};
+        store.op = PS_FAST_NUM_OP_STORE_LOCAL;
+        store.index = (uint32_t)i;
+        if (!ps_fast_num_op_push(&list, store)) {
+            free(list.items);
+            return 0;
+        }
+    }
+    if (!ps_fast_num_emit_expr(func, ret_expr, &list)) {
+        free(list.items);
+        return 0;
+    }
+    PSFastNumOp ret = {0};
+    ret.op = PS_FAST_NUM_OP_RETURN;
+    if (!ps_fast_num_op_push(&list, ret)) {
+        free(list.items);
+        return 0;
+    }
+    func->fast_num_ops = list.items;
+    func->fast_num_ops_count = list.count;
+    return 1;
+}
+
+static void ps_fast_num_bind_identifier(PSFunction *func, PSAstNode *expr) {
+    if (!func || !expr || expr->kind != AST_IDENTIFIER) return;
+    if (expr->as.identifier.fast_num_kind != PS_FAST_NUM_KIND_NONE) return;
+    PSString *name = ps_identifier_string(expr);
+    if (!name) return;
+    if (func->param_names) {
+        for (size_t i = 0; i < func->param_count; i++) {
+            if (func->param_names[i] &&
+                ps_string_equals(func->param_names[i], name)) {
+                expr->as.identifier.fast_num_kind = PS_FAST_NUM_KIND_PARAM;
+                expr->as.identifier.fast_num_index = (uint32_t)i;
+                return;
+            }
+        }
+    }
+    if (func->fast_num_names) {
+        for (size_t i = 0; i < func->fast_num_count; i++) {
+            if (func->fast_num_names[i] &&
+                ps_string_equals(func->fast_num_names[i], name)) {
+                expr->as.identifier.fast_num_kind = PS_FAST_NUM_KIND_LOCAL;
+                expr->as.identifier.fast_num_index = (uint32_t)i;
+                return;
+            }
+        }
+    }
+    expr->as.identifier.fast_num_kind = PS_FAST_NUM_KIND_ENV;
+    expr->as.identifier.fast_num_index = 0;
+}
+
+static void ps_fast_num_bind_expr(PSFunction *func, PSAstNode *expr) {
+    if (!func || !expr) return;
+    switch (expr->kind) {
+        case AST_IDENTIFIER:
+            ps_fast_num_bind_identifier(func, expr);
+            return;
+        case AST_UNARY:
+            ps_fast_num_bind_expr(func, expr->as.unary.expr);
+            return;
+        case AST_BINARY:
+            ps_fast_num_bind_expr(func, expr->as.binary.left);
+            ps_fast_num_bind_expr(func, expr->as.binary.right);
+            return;
+        case AST_CONDITIONAL:
+            ps_fast_num_bind_expr(func, expr->as.conditional.cond);
+            ps_fast_num_bind_expr(func, expr->as.conditional.then_expr);
+            ps_fast_num_bind_expr(func, expr->as.conditional.else_expr);
+            return;
+        case AST_MEMBER:
+            ps_fast_num_bind_expr(func, expr->as.member.object);
+            if (expr->as.member.computed) {
+                ps_fast_num_bind_expr(func, expr->as.member.property);
+            }
+            return;
+        case AST_CALL:
+            ps_fast_num_bind_expr(func, expr->as.call.callee);
+            for (size_t i = 0; i < expr->as.call.argc; i++) {
+                ps_fast_num_bind_expr(func, expr->as.call.args[i]);
+            }
+            if (expr->as.call.fast_num_math_id == PS_FAST_NUM_MATH_NONE) {
+                expr->as.call.fast_num_math_id = ps_fast_num_math_id(expr);
+            }
+            return;
+        case AST_LITERAL:
+        default:
+            return;
+    }
+}
+
+static int ps_fast_num_cond_ok(PSFunction *func, PSAstNode *expr);
+
+static int ps_fast_num_expr_ok(PSFunction *func, PSAstNode *expr) {
+    if (!expr || !func) return 0;
+    switch (expr->kind) {
+        case AST_LITERAL:
+            return expr->as.literal.value.type == PS_T_NUMBER;
+        case AST_IDENTIFIER:
+            return 1;
+        case AST_UNARY:
+            if (expr->as.unary.op != TOK_PLUS && expr->as.unary.op != TOK_MINUS) return 0;
+            return ps_fast_num_expr_ok(func, expr->as.unary.expr);
+        case AST_BINARY: {
+            int op = expr->as.binary.op;
+            if (op != TOK_PLUS && op != TOK_MINUS && op != TOK_STAR &&
+                op != TOK_SLASH && op != TOK_PERCENT) {
+                return 0;
+            }
+            return ps_fast_num_expr_ok(func, expr->as.binary.left) &&
+                ps_fast_num_expr_ok(func, expr->as.binary.right);
+        }
+        case AST_CONDITIONAL:
+            if (!ps_fast_num_cond_ok(func, expr->as.conditional.cond)) return 0;
+            return ps_fast_num_expr_ok(func, expr->as.conditional.then_expr) &&
+                ps_fast_num_expr_ok(func, expr->as.conditional.else_expr);
+        case AST_MEMBER: {
+            if (!expr->as.member.computed) return 0;
+            PSAstNode *obj = expr->as.member.object;
+            PSAstNode *prop = expr->as.member.property;
+            if (!obj || obj->kind != AST_IDENTIFIER) return 0;
+            if (!prop) return 0;
+            if (prop->kind == AST_LITERAL) {
+                return prop->as.literal.value.type == PS_T_NUMBER ||
+                    prop->as.literal.value.type == PS_T_STRING;
+            }
+            if (prop->kind == AST_IDENTIFIER) return 1;
+            return 0;
+        }
+        case AST_CALL: {
+            PSAstNode *callee = expr->as.call.callee;
+            if (!callee || callee->kind != AST_MEMBER) return 0;
+            PSAstNode *member = callee;
+            if (member->as.member.computed) return 0;
+            PSAstNode *obj = member->as.member.object;
+            PSAstNode *prop = member->as.member.property;
+            if (!obj || obj->kind != AST_IDENTIFIER) return 0;
+            PSString *obj_name = ps_identifier_string(obj);
+            if (!ps_string_equals_cstr(obj_name, "Math")) return 0;
+            if (!prop || prop->kind != AST_IDENTIFIER) return 0;
+            PSString *fn = ps_identifier_string(prop);
+            if (!fn) return 0;
+            if (!ps_string_equals_cstr(fn, "sqrt") &&
+                !ps_string_equals_cstr(fn, "abs") &&
+                !ps_string_equals_cstr(fn, "min") &&
+                !ps_string_equals_cstr(fn, "max") &&
+                !ps_string_equals_cstr(fn, "pow") &&
+                !ps_string_equals_cstr(fn, "floor") &&
+                !ps_string_equals_cstr(fn, "ceil") &&
+                !ps_string_equals_cstr(fn, "round")) {
+                return 0;
+            }
+            for (size_t i = 0; i < expr->as.call.argc; i++) {
+                if (!ps_fast_num_expr_ok(func, expr->as.call.args[i])) return 0;
+            }
+            return 1;
+        }
+        default:
+            return 0;
+    }
+}
+
+static int ps_fast_num_cond_ok(PSFunction *func, PSAstNode *expr) {
+    if (!expr || !func) return 0;
+    if (expr->kind == AST_CONDITIONAL) return 0;
+    if (ps_fast_num_expr_ok(func, expr)) return 1;
+    if (expr->kind == AST_LITERAL) {
+        return expr->as.literal.value.type == PS_T_BOOLEAN;
+    }
+    if (expr->kind == AST_UNARY && expr->as.unary.op == TOK_NOT) {
+        return ps_fast_num_cond_ok(func, expr->as.unary.expr);
+    }
+    if (expr->kind == AST_BINARY) {
+        int op = expr->as.binary.op;
+        if (op == TOK_AND_AND || op == TOK_OR_OR) {
+            return ps_fast_num_cond_ok(func, expr->as.binary.left) &&
+                ps_fast_num_cond_ok(func, expr->as.binary.right);
+        }
+        if (op == TOK_LT || op == TOK_LTE || op == TOK_GT || op == TOK_GTE ||
+            op == TOK_EQ || op == TOK_NEQ || op == TOK_STRICT_EQ || op == TOK_STRICT_NEQ) {
+            return ps_fast_num_expr_ok(func, expr->as.binary.left) &&
+                ps_fast_num_expr_ok(func, expr->as.binary.right);
+        }
+    }
+    return 0;
+}
+
+static int ps_fast_num_lookup(PSFastNumCtx *ctx, PSString *name, double *out) {
+    if (!ctx || !name || !out) return 0;
+    if (ctx->func && ctx->func->param_names) {
+        for (size_t i = 0; i < ctx->func->param_count; i++) {
+            if (ctx->func->param_names[i] &&
+                ps_string_equals(ctx->func->param_names[i], name)) {
+                if (i >= (size_t)ctx->argc) return 0;
+                if (!ctx->argv || ctx->argv[i].type != PS_T_NUMBER) return 0;
+                *out = ctx->argv[i].as.number;
+                return 1;
+            }
+        }
+    }
+    for (size_t i = 0; i < ctx->local_count; i++) {
+        if (ctx->local_names[i] &&
+            ps_string_equals(ctx->local_names[i], name)) {
+            *out = ctx->local_vals[i];
+            return 1;
+        }
+    }
+    if (ctx->func && ctx->func->env) {
+        int found = 0;
+        PSValue v = ps_env_get(ctx->func->env, name, &found);
+        if (found && v.type == PS_T_NUMBER) {
+            *out = v.as.number;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int ps_fast_num_identifier_value(PSFastNumCtx *ctx, PSAstNode *node, PSValue *out) {
+    if (!ctx || !node || node->kind != AST_IDENTIFIER || !out) return 0;
+    uint8_t kind = node->as.identifier.fast_num_kind;
+    if (kind == PS_FAST_NUM_KIND_PARAM) {
+        size_t idx = (size_t)node->as.identifier.fast_num_index;
+        if (idx >= (size_t)ctx->argc) return 0;
+        if (!ctx->argv) return 0;
+        *out = ctx->argv[idx];
+        return 1;
+    }
+    if (kind == PS_FAST_NUM_KIND_LOCAL) {
+        size_t idx = (size_t)node->as.identifier.fast_num_index;
+        if (idx >= ctx->local_count) return 0;
+        *out = ps_value_number(ctx->local_vals[idx]);
+        return 1;
+    }
+    if (kind == PS_FAST_NUM_KIND_ENV) {
+        if (ctx->func && ctx->func->env) {
+            int found = 0;
+            PSValue v = ps_value_undefined();
+            if (!ps_identifier_cached_get(ctx->func->env, node, &v, &found)) {
+                PSString *name = ps_identifier_string(node);
+                if (!name) return 0;
+                v = ps_env_get(ctx->func->env, name, &found);
+            }
+            if (found) {
+                *out = v;
+                return 1;
+            }
+        }
+        return 0;
+    }
+    PSString *name = ps_identifier_string(node);
+    if (!name) return 0;
+    if (ctx->func && ctx->func->param_names) {
+        for (size_t i = 0; i < ctx->func->param_count; i++) {
+            if (ctx->func->param_names[i] &&
+                ps_string_equals(ctx->func->param_names[i], name)) {
+                if (i >= (size_t)ctx->argc) return 0;
+                if (!ctx->argv) return 0;
+                *out = ctx->argv[i];
+                return 1;
+            }
+        }
+    }
+    if (ctx->func && ctx->func->env) {
+        int found = 0;
+        PSValue v = ps_env_get(ctx->func->env, name, &found);
+        if (found) {
+            *out = v;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int ps_fast_num_eval_expr(PSFastNumCtx *ctx, PSAstNode *expr, double *out);
+static int ps_fast_num_eval_cond(PSFastNumCtx *ctx, PSAstNode *expr, int *out);
+
+static int ps_fast_num_eval_member(PSFastNumCtx *ctx, PSAstNode *expr, double *out) {
+    if (!ctx || !expr || expr->kind != AST_MEMBER || !out) return 0;
+    if (!expr->as.member.computed) return 0;
+    PSAstNode *obj_node = expr->as.member.object;
+    PSAstNode *prop = expr->as.member.property;
+    if (!obj_node || obj_node->kind != AST_IDENTIFIER || !prop) return 0;
+
+    PSValue obj_val = ps_value_undefined();
+    if (!ps_fast_num_identifier_value(ctx, obj_node, &obj_val)) return 0;
+    if (obj_val.type != PS_T_OBJECT || !obj_val.as.object) return 0;
+    PSObject *obj = obj_val.as.object;
+
+    PSValue key_val = ps_value_undefined();
+    if (prop->kind == AST_LITERAL) {
+        key_val = prop->as.literal.value;
+    } else if (prop->kind == AST_IDENTIFIER) {
+        if (!ps_fast_num_identifier_value(ctx, prop, &key_val)) return 0;
+    } else {
+        return 0;
+    }
+
+    if (obj->kind == PS_OBJ_KIND_ARRAY || obj->kind == PS_OBJ_KIND_BUFFER) {
+        size_t index = 0;
+        if (key_val.type == PS_T_NUMBER) {
+            double num = key_val.as.number;
+            if (num < 0.0 || num > (double)SIZE_MAX) return 0;
+            index = (size_t)num;
+            if ((double)index != num) return 0;
+        } else if (key_val.type == PS_T_STRING) {
+            if (!ps_array_string_to_index(key_val.as.string, &index)) return 0;
+        } else {
+            return 0;
+        }
+        if (obj->kind == PS_OBJ_KIND_ARRAY) {
+            PSValue elem = ps_value_undefined();
+            if (!ps_array_get_index(obj, index, &elem)) return 0;
+            if (elem.type != PS_T_NUMBER) return 0;
+            *out = elem.as.number;
+            return 1;
+        }
+        PSBuffer *buf = ps_buffer_from_object(obj);
+        if (!buf || index >= buf->size) return 0;
+        *out = (double)buf->data[index];
+        return 1;
+    }
+
+    if (obj->kind == PS_OBJ_KIND_PLAIN) {
+        if (key_val.type == PS_T_STRING) {
+            if (obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                size_t index = 0;
+                if (ps_string_to_index_size(key_val.as.string, &index)) {
+                    PSValue mapped = ps_value_undefined();
+                    if (ps_num_map_get(obj, index, &mapped)) {
+                        if (mapped.type != PS_T_NUMBER) return 0;
+                        *out = mapped.as.number;
+                        return 1;
+                    }
+                }
+            }
+            int found = 0;
+            PSValue val = ps_object_get(obj, key_val.as.string, &found);
+            if (!found || val.type != PS_T_NUMBER) return 0;
+            *out = val.as.number;
+            return 1;
+        }
+        if (key_val.type == PS_T_NUMBER) {
+            double num = key_val.as.number;
+            if (num >= 0.0 && num <= (double)SIZE_MAX) {
+                size_t index = (size_t)num;
+                if ((double)index == num && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                    PSValue mapped = ps_value_undefined();
+                    if (ps_num_map_get(obj, index, &mapped)) {
+                        if (mapped.type != PS_T_NUMBER) return 0;
+                        *out = mapped.as.number;
+                        return 1;
+                    }
+                }
+            }
+            PSString *name = ps_value_to_string(&key_val);
+            int found = 0;
+            PSValue val = ps_object_get(obj, name, &found);
+            if (!found || val.type != PS_T_NUMBER) return 0;
+            *out = val.as.number;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int ps_fast_num_eval_call(PSFastNumCtx *ctx, PSAstNode *expr, double *out) {
+    if (!ctx || !expr || expr->kind != AST_CALL || !out) return 0;
+    uint8_t math_id = expr->as.call.fast_num_math_id;
+    if (math_id == PS_FAST_NUM_MATH_NONE) {
+        math_id = ps_fast_num_math_id(expr);
+        expr->as.call.fast_num_math_id = math_id;
+    }
+    if (math_id == PS_FAST_NUM_MATH_NONE) return 0;
+
+    size_t argc = expr->as.call.argc;
+    double arg0 = 0.0;
+    double arg1 = 0.0;
+    if (argc > 0) {
+        if (!ps_fast_num_eval_expr(ctx, expr->as.call.args[0], &arg0)) return 0;
+    }
+    if (argc > 1) {
+        if (!ps_fast_num_eval_expr(ctx, expr->as.call.args[1], &arg1)) return 0;
+    }
+
+    if (math_id == PS_FAST_NUM_MATH_SQRT) {
+        *out = sqrt(arg0);
+        return 1;
+    }
+    if (math_id == PS_FAST_NUM_MATH_ABS) {
+        *out = fabs(arg0);
+        return 1;
+    }
+    if (math_id == PS_FAST_NUM_MATH_POW) {
+        *out = pow(arg0, arg1);
+        return 1;
+    }
+    if (math_id == PS_FAST_NUM_MATH_FLOOR) {
+        *out = floor(arg0);
+        return 1;
+    }
+    if (math_id == PS_FAST_NUM_MATH_CEIL) {
+        *out = ceil(arg0);
+        return 1;
+    }
+    if (math_id == PS_FAST_NUM_MATH_ROUND) {
+        if (ps_value_is_nan(arg0) || isinf(arg0)) {
+            *out = arg0;
+            return 1;
+        }
+        double r = floor(arg0 + 0.5);
+        if (r == 0.0 && arg0 < 0.0) r = -0.0;
+        *out = r;
+        return 1;
+    }
+    if (math_id == PS_FAST_NUM_MATH_MIN) {
+        if (argc == 0) {
+            *out = INFINITY;
+            return 1;
+        }
+        double minv = INFINITY;
+        for (size_t i = 0; i < argc; i++) {
+            double v = 0.0;
+            if (!ps_fast_num_eval_expr(ctx, expr->as.call.args[i], &v)) return 0;
+            if (ps_value_is_nan(v)) {
+                *out = 0.0 / 0.0;
+                return 1;
+            }
+            if (v < minv) minv = v;
+        }
+        *out = minv;
+        return 1;
+    }
+    if (math_id == PS_FAST_NUM_MATH_MAX) {
+        if (argc == 0) {
+            *out = -INFINITY;
+            return 1;
+        }
+        double maxv = -INFINITY;
+        for (size_t i = 0; i < argc; i++) {
+            double v = 0.0;
+            if (!ps_fast_num_eval_expr(ctx, expr->as.call.args[i], &v)) return 0;
+            if (ps_value_is_nan(v)) {
+                *out = 0.0 / 0.0;
+                return 1;
+            }
+            if (v > maxv) maxv = v;
+        }
+        *out = maxv;
+        return 1;
+    }
+    return 0;
+}
+
+static int ps_fast_num_eval_cond(PSFastNumCtx *ctx, PSAstNode *expr, int *out) {
+    if (!ctx || !expr || !out) return 0;
+    if (expr->kind == AST_LITERAL) {
+        if (expr->as.literal.value.type == PS_T_BOOLEAN) {
+            *out = expr->as.literal.value.as.boolean ? 1 : 0;
+            return 1;
+        }
+        if (expr->as.literal.value.type == PS_T_NUMBER) {
+            double v = expr->as.literal.value.as.number;
+            *out = (!ps_value_is_nan(v) && v != 0.0) ? 1 : 0;
+            return 1;
+        }
+        return 0;
+    }
+    if (expr->kind == AST_IDENTIFIER) {
+        PSValue v = ps_value_undefined();
+        if (!ps_fast_num_identifier_value(ctx, expr, &v)) return 0;
+        if (v.type == PS_T_BOOLEAN) {
+            *out = v.as.boolean ? 1 : 0;
+            return 1;
+        }
+        if (v.type == PS_T_NUMBER) {
+            *out = (!ps_value_is_nan(v.as.number) && v.as.number != 0.0) ? 1 : 0;
+            return 1;
+        }
+        return 0;
+    }
+    if (expr->kind == AST_UNARY && expr->as.unary.op == TOK_NOT) {
+        int inner = 0;
+        if (!ps_fast_num_eval_cond(ctx, expr->as.unary.expr, &inner)) return 0;
+        *out = inner ? 0 : 1;
+        return 1;
+    }
+    if (expr->kind == AST_BINARY) {
+        int op = expr->as.binary.op;
+        if (op == TOK_AND_AND) {
+            int left = 0;
+            if (!ps_fast_num_eval_cond(ctx, expr->as.binary.left, &left)) return 0;
+            if (!left) {
+                *out = 0;
+                return 1;
+            }
+            return ps_fast_num_eval_cond(ctx, expr->as.binary.right, out);
+        }
+        if (op == TOK_OR_OR) {
+            int left = 0;
+            if (!ps_fast_num_eval_cond(ctx, expr->as.binary.left, &left)) return 0;
+            if (left) {
+                *out = 1;
+                return 1;
+            }
+            return ps_fast_num_eval_cond(ctx, expr->as.binary.right, out);
+        }
+        if (op == TOK_LT || op == TOK_LTE || op == TOK_GT || op == TOK_GTE ||
+            op == TOK_EQ || op == TOK_NEQ || op == TOK_STRICT_EQ || op == TOK_STRICT_NEQ) {
+            double l = 0.0;
+            double r = 0.0;
+            if (!ps_fast_num_eval_expr(ctx, expr->as.binary.left, &l)) return 0;
+            if (!ps_fast_num_eval_expr(ctx, expr->as.binary.right, &r)) return 0;
+            int ln = ps_value_is_nan(l);
+            int rn = ps_value_is_nan(r);
+            if (op == TOK_EQ || op == TOK_STRICT_EQ) {
+                if (ln || rn) {
+                    *out = 0;
+                } else {
+                    *out = (l == r) ? 1 : 0;
+                }
+                return 1;
+            }
+            if (op == TOK_NEQ || op == TOK_STRICT_NEQ) {
+                if (ln || rn) {
+                    *out = 1;
+                } else {
+                    *out = (l != r) ? 1 : 0;
+                }
+                return 1;
+            }
+            if (ln || rn) {
+                *out = 0;
+                return 1;
+            }
+            if (op == TOK_LT) *out = (l < r) ? 1 : 0;
+            else if (op == TOK_LTE) *out = (l <= r) ? 1 : 0;
+            else if (op == TOK_GT) *out = (l > r) ? 1 : 0;
+            else *out = (l >= r) ? 1 : 0;
+            return 1;
+        }
+    }
+    {
+        double v = 0.0;
+        if (!ps_fast_num_eval_expr(ctx, expr, &v)) return 0;
+        *out = (!ps_value_is_nan(v) && v != 0.0) ? 1 : 0;
+        return 1;
+    }
+}
+
+static int ps_fast_num_eval_expr(PSFastNumCtx *ctx, PSAstNode *expr, double *out) {
+    if (!ctx || !expr || !out) return 0;
+    switch (expr->kind) {
+        case AST_LITERAL:
+            if (expr->as.literal.value.type != PS_T_NUMBER) return 0;
+            *out = expr->as.literal.value.as.number;
+            return 1;
+        case AST_IDENTIFIER: {
+            uint8_t kind = expr->as.identifier.fast_num_kind;
+            if (kind == PS_FAST_NUM_KIND_PARAM) {
+                size_t idx = (size_t)expr->as.identifier.fast_num_index;
+                if (idx >= (size_t)ctx->argc) return 0;
+                if (!ctx->argv || ctx->argv[idx].type != PS_T_NUMBER) return 0;
+                *out = ctx->argv[idx].as.number;
+                return 1;
+            }
+            if (kind == PS_FAST_NUM_KIND_LOCAL) {
+                size_t idx = (size_t)expr->as.identifier.fast_num_index;
+                if (idx >= ctx->local_count) return 0;
+                *out = ctx->local_vals[idx];
+                return 1;
+            }
+            if (kind == PS_FAST_NUM_KIND_ENV) {
+                if (ctx->func && ctx->func->env) {
+                    int found = 0;
+                    PSValue v = ps_value_undefined();
+                    if (!ps_identifier_cached_get(ctx->func->env, expr, &v, &found)) {
+                        PSString *name = ps_identifier_string(expr);
+                        if (!name) return 0;
+                        v = ps_env_get(ctx->func->env, name, &found);
+                    }
+                    if (found && v.type == PS_T_NUMBER) {
+                        *out = v.as.number;
+                        return 1;
+                    }
+                }
+                return 0;
+            }
+            PSString *name = ps_identifier_string(expr);
+            return ps_fast_num_lookup(ctx, name, out);
+        }
+        case AST_UNARY: {
+            double v = 0.0;
+            if (!ps_fast_num_eval_expr(ctx, expr->as.unary.expr, &v)) return 0;
+            if (expr->as.unary.op == TOK_MINUS) v = -v;
+            *out = v;
+            return 1;
+        }
+        case AST_CONDITIONAL: {
+            int cond = 0;
+            if (!ps_fast_num_eval_cond(ctx, expr->as.conditional.cond, &cond)) return 0;
+            if (cond) {
+                return ps_fast_num_eval_expr(ctx, expr->as.conditional.then_expr, out);
+            }
+            return ps_fast_num_eval_expr(ctx, expr->as.conditional.else_expr, out);
+        }
+        case AST_BINARY: {
+            double l = 0.0;
+            double r = 0.0;
+            if (!ps_fast_num_eval_expr(ctx, expr->as.binary.left, &l)) return 0;
+            if (!ps_fast_num_eval_expr(ctx, expr->as.binary.right, &r)) return 0;
+            switch (expr->as.binary.op) {
+                case TOK_PLUS: *out = l + r; return 1;
+                case TOK_MINUS: *out = l - r; return 1;
+                case TOK_STAR: *out = l * r; return 1;
+                case TOK_SLASH: *out = l / r; return 1;
+                case TOK_PERCENT: *out = fmod(l, r); return 1;
+                default: return 0;
+            }
+        }
+        case AST_MEMBER:
+            return ps_fast_num_eval_member(ctx, expr, out);
+        case AST_CALL:
+            return ps_fast_num_eval_call(ctx, expr, out);
+        default:
+            return 0;
+    }
+}
+
+static void ps_fast_num_prepare(PSFunction *func) {
+    if (!func || func->is_native) return;
+    if (func->fast_checked & PS_FAST_CHECKED_NUM) return;
+    func->fast_checked |= PS_FAST_CHECKED_NUM;
+    if (!func->body || func->body->kind != AST_BLOCK) return;
+
+    PSAstNode **items = func->body->as.list.items;
+    size_t count = func->body->as.list.count;
+    if (!items || count == 0) return;
+
+    size_t local_count = 0;
+    PSAstNode *ret_expr = NULL;
+    PSAstNode *if_cond = NULL;
+    PSAstNode *if_ret_expr = NULL;
+    int saw_if = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        PSAstNode *stmt = items[i];
+        if (!stmt) return;
+        if (stmt->kind == AST_VAR_DECL) {
+            PSAstNode *id = stmt->as.var_decl.id;
+            PSAstNode *init = stmt->as.var_decl.init;
+            if (!id || id->kind != AST_IDENTIFIER || !init) return;
+            if (!ps_fast_num_expr_ok(func, init)) return;
+            local_count++;
+            continue;
+        }
+        if (stmt->kind == AST_IF) {
+            if (saw_if) return;
+            PSAstNode *cond = stmt->as.if_stmt.cond;
+            PSAstNode *then_branch = stmt->as.if_stmt.then_branch;
+            PSAstNode *else_branch = stmt->as.if_stmt.else_branch;
+            if (!cond || !then_branch || else_branch) return;
+            if (then_branch->kind != AST_RETURN || !then_branch->as.ret.expr) return;
+            if (!ps_fast_num_cond_ok(func, cond)) return;
+            if (!ps_fast_num_expr_ok(func, then_branch->as.ret.expr)) return;
+            if_cond = cond;
+            if_ret_expr = then_branch->as.ret.expr;
+            saw_if = 1;
+            continue;
+        }
+        if (stmt->kind == AST_RETURN) {
+            if (!stmt->as.ret.expr) return;
+            if (!ps_fast_num_expr_ok(func, stmt->as.ret.expr)) return;
+            ret_expr = stmt->as.ret.expr;
+            if (i + 1 != count) return;
+            break;
+        }
+        return;
+    }
+
+    if (!ret_expr) return;
+    if (local_count == 0) return;
+
+    PSAstNode **inits = (PSAstNode **)calloc(local_count, sizeof(PSAstNode *));
+    PSString **names = (PSString **)calloc(local_count, sizeof(PSString *));
+    if (!inits || !names) {
+        free(inits);
+        free(names);
+        return;
+    }
+
+    size_t idx = 0;
+    for (size_t i = 0; i < count; i++) {
+        PSAstNode *stmt = items[i];
+        if (stmt && stmt->kind == AST_VAR_DECL) {
+            PSAstNode *id = stmt->as.var_decl.id;
+            PSAstNode *init = stmt->as.var_decl.init;
+            if (!id || id->kind != AST_IDENTIFIER || !init) {
+                free(inits);
+                free(names);
+                return;
+            }
+            PSString *name = ps_identifier_string(id);
+            for (size_t j = 0; j < idx; j++) {
+                if (names[j] && ps_string_equals(names[j], name)) {
+                    free(inits);
+                    free(names);
+                    return;
+                }
+            }
+            inits[idx] = init;
+            names[idx] = name;
+            idx++;
+        }
+    }
+    if (idx != local_count) {
+        free(inits);
+        free(names);
+        return;
+    }
+
+    func->fast_num_inits = inits;
+    func->fast_num_names = names;
+    func->fast_num_count = local_count;
+    func->fast_num_return = ret_expr;
+    func->fast_num_if_cond = if_cond;
+    func->fast_num_if_return = if_ret_expr;
+    func->fast_flags |= PS_FAST_FLAG_NUM;
+    for (size_t i = 0; i < local_count; i++) {
+        ps_fast_num_bind_expr(func, inits[i]);
+    }
+    if (if_cond) {
+        ps_fast_num_bind_expr(func, if_cond);
+    }
+    if (if_ret_expr) {
+        ps_fast_num_bind_expr(func, if_ret_expr);
+    }
+    ps_fast_num_bind_expr(func, ret_expr);
+    if (!func->fast_num_if_cond) {
+        (void)ps_fast_num_compile_ops(func, inits, local_count, ret_expr);
+    }
+}
+
+static int ps_fast_num_eval_ops(PSFastNumCtx *ctx,
+                                PSFastNumOp *ops,
+                                size_t op_count,
+                                double *out) {
+    if (!ctx || !ops || !out || op_count == 0) return 0;
+    double stack_buf[64];
+    double *stack = stack_buf;
+    size_t sp = 0;
+    if (op_count > 64) {
+        stack = (double *)calloc(op_count, sizeof(double));
+        if (!stack) return 0;
+    }
+    for (size_t ip = 0; ip < op_count; ip++) {
+        PSFastNumOp *op = &ops[ip];
+        switch (op->op) {
+            case PS_FAST_NUM_OP_CONST:
+                stack[sp++] = op->imm;
+                break;
+            case PS_FAST_NUM_OP_PARAM: {
+                size_t idx = (size_t)op->index;
+                if (idx >= (size_t)ctx->argc) goto fail;
+                if (!ctx->argv || ctx->argv[idx].type != PS_T_NUMBER) goto fail;
+                stack[sp++] = ctx->argv[idx].as.number;
+                break;
+            }
+            case PS_FAST_NUM_OP_LOCAL: {
+                size_t idx = (size_t)op->index;
+                if (idx >= ctx->local_count) goto fail;
+                stack[sp++] = ctx->local_vals[idx];
+                break;
+            }
+            case PS_FAST_NUM_OP_ENV: {
+                PSAstNode *node = op->node;
+                if (!ctx->func || !ctx->func->env || !node) goto fail;
+                int found = 0;
+                PSValue v = ps_value_undefined();
+                if (!ps_identifier_cached_get(ctx->func->env, node, &v, &found)) {
+                    PSString *name = ps_identifier_string(node);
+                    if (!name) goto fail;
+                    v = ps_env_get(ctx->func->env, name, &found);
+                }
+                if (!found || v.type != PS_T_NUMBER) goto fail;
+                stack[sp++] = v.as.number;
+                break;
+            }
+            case PS_FAST_NUM_OP_STORE_LOCAL: {
+                size_t idx = (size_t)op->index;
+                if (idx >= ctx->local_count || sp == 0) goto fail;
+                ctx->local_vals[idx] = stack[--sp];
+                break;
+            }
+            case PS_FAST_NUM_OP_MEMBER: {
+                PSAstNode *node = op->node;
+                PSValue obj_val = ps_value_undefined();
+                if (!ps_fast_num_identifier_value(ctx, node, &obj_val)) goto fail;
+                if (obj_val.type != PS_T_OBJECT || !obj_val.as.object) goto fail;
+                PSObject *obj = obj_val.as.object;
+                size_t index = (size_t)op->index;
+                if (obj->kind == PS_OBJ_KIND_ARRAY) {
+                    PSValue elem = ps_value_undefined();
+                    if (!ps_array_get_index(obj, index, &elem)) goto fail;
+                    if (elem.type != PS_T_NUMBER) goto fail;
+                    stack[sp++] = elem.as.number;
+                    break;
+                }
+                if (obj->kind == PS_OBJ_KIND_BUFFER) {
+                    PSBuffer *buf = ps_buffer_from_object(obj);
+                    if (!buf || index >= buf->size) goto fail;
+                    stack[sp++] = (double)buf->data[index];
+                    break;
+                }
+                goto fail;
+            }
+            case PS_FAST_NUM_OP_NEG:
+                if (sp == 0) goto fail;
+                stack[sp - 1] = -stack[sp - 1];
+                break;
+            case PS_FAST_NUM_OP_ADD:
+                if (sp < 2) goto fail;
+                stack[sp - 2] = stack[sp - 2] + stack[sp - 1];
+                sp--;
+                break;
+            case PS_FAST_NUM_OP_SUB:
+                if (sp < 2) goto fail;
+                stack[sp - 2] = stack[sp - 2] - stack[sp - 1];
+                sp--;
+                break;
+            case PS_FAST_NUM_OP_MUL:
+                if (sp < 2) goto fail;
+                stack[sp - 2] = stack[sp - 2] * stack[sp - 1];
+                sp--;
+                break;
+            case PS_FAST_NUM_OP_DIV:
+                if (sp < 2) goto fail;
+                stack[sp - 2] = stack[sp - 2] / stack[sp - 1];
+                sp--;
+                break;
+            case PS_FAST_NUM_OP_MOD:
+                if (sp < 2) goto fail;
+                stack[sp - 2] = fmod(stack[sp - 2], stack[sp - 1]);
+                sp--;
+                break;
+            case PS_FAST_NUM_OP_MATH_SQRT:
+                if (sp == 0) goto fail;
+                stack[sp - 1] = sqrt(stack[sp - 1]);
+                break;
+            case PS_FAST_NUM_OP_MATH_ABS:
+                if (sp == 0) goto fail;
+                stack[sp - 1] = fabs(stack[sp - 1]);
+                break;
+            case PS_FAST_NUM_OP_MATH_POW:
+                if (sp < 2) goto fail;
+                stack[sp - 2] = pow(stack[sp - 2], stack[sp - 1]);
+                sp--;
+                break;
+            case PS_FAST_NUM_OP_MATH_FLOOR:
+                if (sp == 0) goto fail;
+                stack[sp - 1] = floor(stack[sp - 1]);
+                break;
+            case PS_FAST_NUM_OP_MATH_CEIL:
+                if (sp == 0) goto fail;
+                stack[sp - 1] = ceil(stack[sp - 1]);
+                break;
+            case PS_FAST_NUM_OP_MATH_ROUND:
+                if (sp == 0) goto fail;
+                if (!ps_value_is_nan(stack[sp - 1]) && !isinf(stack[sp - 1])) {
+                    double r = floor(stack[sp - 1] + 0.5);
+                    if (r == 0.0 && stack[sp - 1] < 0.0) r = -0.0;
+                    stack[sp - 1] = r;
+                }
+                break;
+            case PS_FAST_NUM_OP_MATH_MIN: {
+                uint32_t argc = op->index;
+                if (argc == 0) {
+                    stack[sp++] = INFINITY;
+                    break;
+                }
+                if (sp < argc) goto fail;
+                double minv = INFINITY;
+                for (uint32_t i = 0; i < argc; i++) {
+                    double v = stack[sp - 1 - i];
+                    if (ps_value_is_nan(v)) {
+                        stack[sp - argc] = 0.0 / 0.0;
+                        sp = sp - argc + 1;
+                        goto next_op;
+                    }
+                    if (v < minv) minv = v;
+                }
+                stack[sp - argc] = minv;
+                sp = sp - argc + 1;
+                break;
+            }
+            case PS_FAST_NUM_OP_MATH_MAX: {
+                uint32_t argc = op->index;
+                if (argc == 0) {
+                    stack[sp++] = -INFINITY;
+                    break;
+                }
+                if (sp < argc) goto fail;
+                double maxv = -INFINITY;
+                for (uint32_t i = 0; i < argc; i++) {
+                    double v = stack[sp - 1 - i];
+                    if (ps_value_is_nan(v)) {
+                        stack[sp - argc] = 0.0 / 0.0;
+                        sp = sp - argc + 1;
+                        goto next_op;
+                    }
+                    if (v > maxv) maxv = v;
+                }
+                stack[sp - argc] = maxv;
+                sp = sp - argc + 1;
+                break;
+            }
+            case PS_FAST_NUM_OP_RETURN:
+                if (sp == 0) goto fail;
+                *out = stack[--sp];
+                if (stack != stack_buf) free(stack);
+                return 1;
+            default:
+                goto fail;
+        }
+next_op:
+        ;
+    }
+fail:
+    if (stack != stack_buf) free(stack);
+    return 0;
+}
+
+static int ps_fast_num_eval(PSVM *vm,
+                            PSFunction *func,
+                            int argc,
+                            PSValue *argv,
+                            double *out) {
+    if (!vm || !func || !out) return 0;
+    if (!(func->fast_flags & PS_FAST_FLAG_NUM)) return 0;
+    if (!func->fast_num_inits || !func->fast_num_names || !func->fast_num_return) return 0;
+
+    double stack_vals[8];
+    double *locals = stack_vals;
+    if (func->fast_num_count > 8) {
+        locals = (double *)calloc(func->fast_num_count, sizeof(double));
+        if (!locals) return 0;
+    }
+
+    PSFastNumCtx ctx = {
+        .vm = vm,
+        .func = func,
+        .argc = argc,
+        .argv = argv,
+        .local_names = func->fast_num_names,
+        .local_vals = locals,
+        .local_count = func->fast_num_count
+    };
+
+    if (!func->fast_num_if_cond && func->fast_num_ops && func->fast_num_ops_count > 0) {
+        if (ps_fast_num_eval_ops(&ctx, func->fast_num_ops, func->fast_num_ops_count, out)) {
+            if (locals != stack_vals) free(locals);
+            return 1;
+        }
+    }
+
+    for (size_t i = 0; i < func->fast_num_count; i++) {
+        double v = 0.0;
+        if (!ps_fast_num_eval_expr(&ctx, func->fast_num_inits[i], &v)) {
+            if (locals != stack_vals) free(locals);
+            return 0;
+        }
+        locals[i] = v;
+    }
+
+    if (func->fast_num_if_cond && func->fast_num_if_return) {
+        int cond = 0;
+        if (!ps_fast_num_eval_cond(&ctx, func->fast_num_if_cond, &cond)) {
+            if (locals != stack_vals) free(locals);
+            return 0;
+        }
+        if (cond) {
+            double result = 0.0;
+            if (!ps_fast_num_eval_expr(&ctx, func->fast_num_if_return, &result)) {
+                if (locals != stack_vals) free(locals);
+                return 0;
+            }
+            if (locals != stack_vals) free(locals);
+            *out = result;
+            return 1;
+        }
+    }
+
+    double result = 0.0;
+    int ok = ps_fast_num_eval_expr(&ctx, func->fast_num_return, &result);
+    if (locals != stack_vals) free(locals);
+    if (!ok) return 0;
+    *out = result;
+    return 1;
+}
+
+static void ps_fast_clamp_prepare(PSFunction *func) {
+    if (!func || func->is_native) return;
+    if (func->fast_checked & PS_FAST_CHECKED_CLAMP) return;
+    func->fast_checked |= PS_FAST_CHECKED_CLAMP;
+    if (func->param_count != 1 || !func->params || !func->params[0]) return;
+    if (func->param_defaults && func->param_defaults[0]) return;
+    if (!func->body || func->body->kind != AST_BLOCK) return;
+    if (func->body->as.list.count != 3) return;
+
+    PSAstNode *param = func->params[0];
+    if (!param || param->kind != AST_IDENTIFIER) return;
+    PSString *param_name = ps_identifier_string(param);
+    if (!param_name) return;
+
+    PSAstNode *stmt0 = func->body->as.list.items[0];
+    PSAstNode *stmt1 = func->body->as.list.items[1];
+    PSAstNode *stmt2 = func->body->as.list.items[2];
+    if (!stmt0 || !stmt1 || !stmt2) return;
+    if (stmt0->kind != AST_IF || stmt1->kind != AST_IF || stmt2->kind != AST_RETURN) return;
+
+    PSAstNode *cond0 = stmt0->as.if_stmt.cond;
+    PSAstNode *then0 = stmt0->as.if_stmt.then_branch;
+    if (!cond0 || !then0 || stmt0->as.if_stmt.else_branch) return;
+    if (cond0->kind != AST_BINARY || cond0->as.binary.op != TOK_LT) return;
+    if (!ps_match_identifier_node(cond0->as.binary.left, param_name)) return;
+    if (!cond0->as.binary.right ||
+        cond0->as.binary.right->kind != AST_LITERAL ||
+        cond0->as.binary.right->as.literal.value.type != PS_T_NUMBER) {
+        return;
+    }
+    double min_val = cond0->as.binary.right->as.literal.value.as.number;
+    if (then0->kind != AST_RETURN || !then0->as.ret.expr) return;
+    if (then0->as.ret.expr->kind != AST_LITERAL ||
+        then0->as.ret.expr->as.literal.value.type != PS_T_NUMBER) return;
+    if (then0->as.ret.expr->as.literal.value.as.number != min_val) return;
+
+    PSAstNode *cond1 = stmt1->as.if_stmt.cond;
+    PSAstNode *then1 = stmt1->as.if_stmt.then_branch;
+    if (!cond1 || !then1 || stmt1->as.if_stmt.else_branch) return;
+    if (cond1->kind != AST_BINARY || cond1->as.binary.op != TOK_GT) return;
+    if (!ps_match_identifier_node(cond1->as.binary.left, param_name)) return;
+    if (cond1->as.binary.right->kind != AST_LITERAL ||
+        cond1->as.binary.right->as.literal.value.type != PS_T_NUMBER) return;
+    double max_val = cond1->as.binary.right->as.literal.value.as.number;
+    if (then1->kind != AST_RETURN || !then1->as.ret.expr) return;
+    if (then1->as.ret.expr->kind != AST_LITERAL ||
+        then1->as.ret.expr->as.literal.value.type != PS_T_NUMBER) return;
+    double ret_max = then1->as.ret.expr->as.literal.value.as.number;
+    if (ret_max != max_val) return;
+
+    PSAstNode *ret_expr = stmt2->as.ret.expr;
+    int use_floor = 0;
+    if (ps_match_identifier_node(ret_expr, param_name)) {
+        use_floor = 0;
+    } else if (ps_match_math_floor_call(ret_expr, param_name)) {
+        use_floor = 1;
+    } else {
+        return;
+    }
+
+    func->fast_clamp_min = min_val;
+    func->fast_clamp_max = max_val;
+    func->fast_clamp_use_floor = (uint8_t)use_floor;
+    func->fast_flags |= PS_FAST_FLAG_CLAMP;
+}
+
 static int ps_string_is_length(const PSString *s) {
     static const char *length_str = "length";
     if (!s || s->byte_len != 6) return 0;
     return memcmp(s->utf8, length_str, 6) == 0;
+}
+
+static int ps_string_to_k_index(const PSString *name, uint32_t *out_index) {
+    if (!name || name->byte_len < 2 || !name->utf8) return 0;
+    if (name->utf8[0] != 'k') return 0;
+    const unsigned char *p = (const unsigned char *)name->utf8 + 1;
+    size_t len = name->byte_len - 1;
+    if (len > 1 && p[0] == '0') return 0;
+    unsigned long long value = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (p[i] < '0' || p[i] > '9') return 0;
+        value = value * 10ULL + (unsigned long long)(p[i] - '0');
+        if (value > UINT32_MAX) return 0;
+    }
+    if (out_index) *out_index = (uint32_t)value;
+    return 1;
 }
 
 typedef struct {
@@ -1309,28 +2829,81 @@ static int ps_buffer32_index_from_prop(PSObject *obj, PSString *prop, size_t *ou
     return ps_array_string_to_index(prop, out_index);
 }
 
+static int ps_string_to_index_size(PSString *name, size_t *out_index) {
+    if (!name || !name->utf8) return 0;
+    if (name->index_state == 1) {
+        if (out_index) *out_index = name->index_value;
+        return 1;
+    }
+    if (name->index_state == 2) return 0;
+    if (name->byte_len == 0) {
+        name->index_state = 1;
+        name->index_value = 0;
+        if (out_index) *out_index = 0;
+        return 1;
+    }
+    size_t value = 0;
+    for (size_t i = 0; i < name->byte_len; i++) {
+        unsigned char c = (unsigned char)name->utf8[i];
+        if (c < '0' || c > '9') {
+            name->index_state = 2;
+            return 0;
+        }
+        size_t digit = (size_t)(c - '0');
+        if (value > (SIZE_MAX - digit) / 10) {
+            name->index_state = 2;
+            return 0;
+        }
+        value = (value * 10) + digit;
+    }
+    name->index_state = 1;
+    name->index_value = value;
+    if (out_index) *out_index = value;
+    return 1;
+}
+
 static int ps_value_to_index(PSVM *vm, PSValue value, size_t *out_index, PSEvalControl *ctl) {
     if (value.type == PS_T_NUMBER) {
         double num = value.as.number;
-        if (isnan(num) || isinf(num) || num < 0.0 || floor(num) != num) return 0;
-        if (num > (double)SIZE_MAX) return 0;
-        if (out_index) *out_index = (size_t)num;
-        return 1;
+        if (num >= 0.0 && num <= (double)SIZE_MAX) {
+            size_t idx = (size_t)num;
+            if ((double)idx == num) {
+                if (out_index) *out_index = idx;
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (value.type == PS_T_STRING) {
+        if (ps_string_to_index_size(value.as.string, out_index)) return 1;
     }
     double num = ps_to_number(vm, value);
     if (ps_check_pending_throw(vm, ctl)) return -1;
-    if (isnan(num) || isinf(num) || num < 0.0 || floor(num) != num) return 0;
-    if (num > (double)SIZE_MAX) return 0;
-    if (out_index) *out_index = (size_t)num;
-    return 1;
+    if (num >= 0.0 && num <= (double)SIZE_MAX) {
+        size_t idx = (size_t)num;
+        if ((double)idx == num) {
+            if (out_index) *out_index = idx;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int ps_value_to_array_index(PSVM *vm, PSValue value, size_t *out_index, PSEvalControl *ctl) {
     if (value.type == PS_T_NUMBER) {
         double num = value.as.number;
-        if (isnan(num) || isinf(num) || num < 0.0 || floor(num) != num || num >= 4294967295.0) return 0;
-        if (out_index) *out_index = (size_t)num;
-        return 1;
+        if (num >= 0.0 && num < 4294967295.0) {
+            size_t idx = (size_t)num;
+            if ((double)idx == num) {
+                if (out_index) *out_index = idx;
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (value.type == PS_T_STRING) {
+        if (ps_array_string_to_index(value.as.string, out_index)) return 1;
+        return 0;
     }
     PSString *key = ps_to_string(vm, value);
     if (ps_check_pending_throw(vm, ctl)) return -1;
@@ -1391,7 +2964,13 @@ static int ps_member_cached_get(PSObject *obj,
                                 PSAstNode *member,
                                 PSString *prop,
                                 PSValue *out) {
-    if (!obj || !member || member->kind != AST_MEMBER || member->as.member.computed) return 0;
+    if (!obj || !member || member->kind != AST_MEMBER) return 0;
+    if (member->as.member.computed) {
+        PSAstNode *lit = member->as.member.property;
+        if (!lit || lit->kind != AST_LITERAL || lit->as.literal.value.type != PS_T_STRING) {
+            return 0;
+        }
+    }
     if (member->as.member.cache_obj == obj &&
         member->as.member.cache_shape == obj->shape_id &&
         member->as.member.cache_prop &&
@@ -1465,6 +3044,54 @@ static int ps_identifier_cached_get(PSEnv *env,
         return 1;
     }
     return 1;
+}
+
+#if PS_ENABLE_ARGUMENTS_ALIASING
+static void ps_env_update_arguments_for_name(PSEnv *env, PSString *name, PSValue value) {
+    if (!env || !env->arguments_obj || !env->param_names || !name) return;
+    for (size_t i = 0; i < env->param_count; i++) {
+        if (env->param_names[i] && ps_string_equals(env->param_names[i], name)) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%zu", i);
+            ps_object_put(env->arguments_obj, ps_string_from_cstr(buf), value);
+            break;
+        }
+    }
+}
+#endif
+
+static int ps_identifier_cached_set(PSEnv *env,
+                                    PSAstNode *id,
+                                    PSValue value) {
+    if (!env || !id || id->kind != AST_IDENTIFIER) return 0;
+    PSString *name = ps_identifier_string(id);
+    if (!name) return 0;
+    if (ps_string_equals_cstr(name, "arguments")) return 0;
+    if (id->as.identifier.cache_fast_env == env) {
+        size_t idx = id->as.identifier.cache_fast_index;
+        if (env->fast_values && idx < env->fast_count) {
+            env->fast_values[idx] = value;
+            if (env->record) {
+                (void)ps_object_put(env->record, name, value);
+            }
+#if PS_ENABLE_ARGUMENTS_ALIASING
+            ps_env_update_arguments_for_name(env, name, value);
+#endif
+            return 1;
+        }
+    }
+    if (id->as.identifier.cache_env == env &&
+        id->as.identifier.cache_record == env->record &&
+        id->as.identifier.cache_prop &&
+        env->record &&
+        id->as.identifier.cache_shape == env->record->shape_id) {
+        id->as.identifier.cache_prop->value = value;
+#if PS_ENABLE_ARGUMENTS_ALIASING
+        ps_env_update_arguments_for_name(env, name, value);
+#endif
+        return 1;
+    }
+    return 0;
 }
 
 static int ps_buffer_write_index_value(PSVM *vm,
@@ -1673,6 +3300,10 @@ static void ps_array_update_length(PSObject *obj, PSString *prop) {
     PSArray *arr = ps_array_from_object(obj);
     size_t len = arr ? arr->length : 0;
     if (new_len > len) {
+        if (arr) {
+            arr->length = new_len;
+            return;
+        }
         (void)ps_array_set_length_internal(obj, new_len);
     }
 }
@@ -1696,12 +3327,64 @@ static int ps_eval_args(PSVM *vm,
     if (stack_buf && argc <= stack_cap) {
         vals = stack_buf;
     } else {
-        vals = (PSValue *)calloc(argc, sizeof(PSValue));
+        vals = (PSValue *)malloc(argc * sizeof(PSValue));
         if (out_heap) *out_heap = 1;
     }
     if (!vals) return 0;
     for (size_t i = 0; i < argc; i++) {
-        vals[i] = eval_expression(vm, env, args[i], ctl);
+        PSAstNode *arg = args[i];
+        if (arg && arg->kind == AST_LITERAL) {
+            if (vm) {
+                vm->current_node = arg;
+#if PS_ENABLE_PERF
+                vm->perf.eval_expr_count++;
+                vm->perf.ast_counts[AST_LITERAL]++;
+#endif
+            }
+            vals[i] = arg->as.literal.value;
+            continue;
+        }
+        if (arg && arg->kind == AST_IDENTIFIER) {
+            if (vm) {
+                vm->current_node = arg;
+#if PS_ENABLE_PERF
+                vm->perf.eval_expr_count++;
+                vm->perf.ast_counts[AST_IDENTIFIER]++;
+#endif
+            }
+            PSString *name = ps_identifier_string(arg);
+            int found = 0;
+            PSValue v = ps_value_undefined();
+            if (!ps_identifier_cached_get(env, arg, &v, &found)) {
+                v = ps_env_get(env, name, &found);
+            }
+            if (!found) {
+                ctl->did_throw = 1;
+                const char *prefix = "Identifier not defined: ";
+                size_t prefix_len = strlen(prefix);
+                size_t name_len = name ? name->byte_len : 0;
+                char *msg = NULL;
+                if (name && name->utf8 && name_len > 0) {
+                    msg = (char *)malloc(prefix_len + name_len + 1);
+                }
+                if (msg) {
+                    memcpy(msg, prefix, prefix_len);
+                    memcpy(msg + prefix_len, name->utf8, name_len);
+                    msg[prefix_len + name_len] = '\0';
+                    ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", msg);
+                    free(msg);
+                } else {
+                    ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", "Identifier not defined");
+                }
+                if (out_heap && *out_heap) {
+                    free(vals);
+                }
+                return 0;
+            }
+            vals[i] = v;
+            continue;
+        }
+        vals[i] = eval_expression(vm, env, arg, ctl);
         if (ctl->did_throw) {
             if (out_heap && *out_heap) {
                 free(vals);
@@ -1711,6 +3394,160 @@ static int ps_eval_args(PSVM *vm,
     }
     *out_args = vals;
     return 1;
+}
+
+static int ps_eval_math_intrinsic(PSVM *vm,
+                                  PSEnv *env,
+                                  PSAstNode *call,
+                                  PSEvalControl *ctl,
+                                  PSValue *out_value) {
+    if (!vm || !env || !call || call->kind != AST_CALL) return 0;
+    if (!vm->math_obj || !vm->math_intrinsics_valid) return 0;
+    PSAstNode *callee = call->as.call.callee;
+    if (!callee || callee->kind != AST_MEMBER) return 0;
+    PSAstNode *member = callee;
+    if (member->as.member.computed) return 0;
+    PSAstNode *obj_node = member->as.member.object;
+    if (!obj_node || obj_node->kind != AST_IDENTIFIER) return 0;
+    PSString *obj_name = ps_identifier_string(obj_node);
+    if (!ps_string_equals_cstr(obj_name, "Math")) return 0;
+
+    int found = 0;
+    PSValue math_val = ps_value_undefined();
+    if (!ps_identifier_cached_get(env, obj_node, &math_val, &found)) {
+        math_val = ps_env_get(env, obj_name, &found);
+    }
+    if (!found || math_val.type != PS_T_OBJECT || math_val.as.object != vm->math_obj) return 0;
+
+    PSAstNode *prop_node = member->as.member.property;
+    if (!prop_node || prop_node->kind != AST_IDENTIFIER) return 0;
+    PSString *prop = ps_identifier_string(prop_node);
+    if (!prop) return 0;
+
+    size_t argc = call->as.call.argc;
+    PSAstNode **args = call->as.call.args;
+
+    if (ps_string_equals_cstr(prop, "sqrt")) {
+        PSValue arg0 = ps_value_undefined();
+        if (argc > 0) {
+            arg0 = eval_expression(vm, env, args[0], ctl);
+            if (ctl->did_throw) return -1;
+        }
+        double x = ps_to_number_fast(vm, arg0);
+        if (ps_check_pending_throw(vm, ctl)) return -1;
+        if (out_value) *out_value = ps_value_number(sqrt(x));
+        return 1;
+    }
+    if (ps_string_equals_cstr(prop, "abs")) {
+        PSValue arg0 = ps_value_undefined();
+        if (argc > 0) {
+            arg0 = eval_expression(vm, env, args[0], ctl);
+            if (ctl->did_throw) return -1;
+        }
+        double x = ps_to_number_fast(vm, arg0);
+        if (ps_check_pending_throw(vm, ctl)) return -1;
+        if (out_value) *out_value = ps_value_number(fabs(x));
+        return 1;
+    }
+    if (ps_string_equals_cstr(prop, "min")) {
+        if (argc == 0) {
+            if (out_value) *out_value = ps_value_number(INFINITY);
+            return 1;
+        }
+        double minv = INFINITY;
+        for (size_t i = 0; i < argc; i++) {
+            PSValue v = eval_expression(vm, env, args[i], ctl);
+            if (ctl->did_throw) return -1;
+            double num = ps_to_number_fast(vm, v);
+            if (ps_check_pending_throw(vm, ctl)) return -1;
+            if (ps_value_is_nan(num)) {
+                if (out_value) *out_value = ps_value_number(0.0 / 0.0);
+                return 1;
+            }
+            if (num < minv) minv = num;
+        }
+        if (out_value) *out_value = ps_value_number(minv);
+        return 1;
+    }
+    if (ps_string_equals_cstr(prop, "max")) {
+        if (argc == 0) {
+            if (out_value) *out_value = ps_value_number(-INFINITY);
+            return 1;
+        }
+        double maxv = -INFINITY;
+        for (size_t i = 0; i < argc; i++) {
+            PSValue v = eval_expression(vm, env, args[i], ctl);
+            if (ctl->did_throw) return -1;
+            double num = ps_to_number_fast(vm, v);
+            if (ps_check_pending_throw(vm, ctl)) return -1;
+            if (ps_value_is_nan(num)) {
+                if (out_value) *out_value = ps_value_number(0.0 / 0.0);
+                return 1;
+            }
+            if (num > maxv) maxv = num;
+        }
+        if (out_value) *out_value = ps_value_number(maxv);
+        return 1;
+    }
+    if (ps_string_equals_cstr(prop, "pow")) {
+        PSValue arg0 = ps_value_undefined();
+        PSValue arg1 = ps_value_undefined();
+        if (argc > 0) {
+            arg0 = eval_expression(vm, env, args[0], ctl);
+            if (ctl->did_throw) return -1;
+        }
+        if (argc > 1) {
+            arg1 = eval_expression(vm, env, args[1], ctl);
+            if (ctl->did_throw) return -1;
+        }
+        double x = ps_to_number_fast(vm, arg0);
+        if (ps_check_pending_throw(vm, ctl)) return -1;
+        double y = ps_to_number_fast(vm, arg1);
+        if (ps_check_pending_throw(vm, ctl)) return -1;
+        if (out_value) *out_value = ps_value_number(pow(x, y));
+        return 1;
+    }
+    if (ps_string_equals_cstr(prop, "floor")) {
+        PSValue arg0 = ps_value_undefined();
+        if (argc > 0) {
+            arg0 = eval_expression(vm, env, args[0], ctl);
+            if (ctl->did_throw) return -1;
+        }
+        double x = ps_to_number_fast(vm, arg0);
+        if (ps_check_pending_throw(vm, ctl)) return -1;
+        if (out_value) *out_value = ps_value_number(floor(x));
+        return 1;
+    }
+    if (ps_string_equals_cstr(prop, "ceil")) {
+        PSValue arg0 = ps_value_undefined();
+        if (argc > 0) {
+            arg0 = eval_expression(vm, env, args[0], ctl);
+            if (ctl->did_throw) return -1;
+        }
+        double x = ps_to_number_fast(vm, arg0);
+        if (ps_check_pending_throw(vm, ctl)) return -1;
+        if (out_value) *out_value = ps_value_number(ceil(x));
+        return 1;
+    }
+    if (ps_string_equals_cstr(prop, "round")) {
+        PSValue arg0 = ps_value_undefined();
+        if (argc > 0) {
+            arg0 = eval_expression(vm, env, args[0], ctl);
+            if (ctl->did_throw) return -1;
+        }
+        double x = ps_to_number_fast(vm, arg0);
+        if (ps_check_pending_throw(vm, ctl)) return -1;
+        if (ps_value_is_nan(x) || isinf(x)) {
+            if (out_value) *out_value = ps_value_number(x);
+            return 1;
+        }
+        double r = floor(x + 0.5);
+        if (r == 0.0 && x < 0.0) r = -0.0;
+        if (out_value) *out_value = ps_value_number(r);
+        return 1;
+    }
+
+    return 0;
 }
 
 static int ps_collect_bound_args(PSObject *obj, PSValue **out_args, size_t *out_len) {
@@ -1753,9 +3590,7 @@ static int ps_env_prepare_fast(PSEnv *env, PSString **names, size_t count) {
         if (!vals) return 0;
         env->fast_values = vals;
     }
-    for (size_t i = 0; i < count; i++) {
-        env->fast_values[i] = ps_value_undefined();
-    }
+    memset(env->fast_values, 0, sizeof(PSValue) * count);
     return 1;
 }
 PSValue ps_eval_call_function(PSVM *vm,
@@ -1857,6 +3692,38 @@ PSValue ps_eval_call_function(PSVM *vm,
         }
     }
 #endif
+
+    ps_fast_math_prepare(func);
+    if ((func->fast_flags & PS_FAST_FLAG_MATH) && func->fast_math_expr) {
+        double out = 0.0;
+        if (ps_fast_math_eval(func, func->fast_math_expr, argc, argv, &out)) {
+            return ps_value_number(out);
+        }
+    }
+
+    ps_fast_clamp_prepare(func);
+    if (func->fast_flags & PS_FAST_FLAG_CLAMP) {
+        if (argc >= 1 && argv && argv[0].type == PS_T_NUMBER) {
+            double num = argv[0].as.number;
+            if (ps_value_is_nan(num)) {
+                return ps_value_number(0.0 / 0.0);
+            }
+            if (num < func->fast_clamp_min) return ps_value_number(func->fast_clamp_min);
+            if (num > func->fast_clamp_max) return ps_value_number(func->fast_clamp_max);
+            if (func->fast_clamp_use_floor) {
+                num = floor(num);
+            }
+            return ps_value_number(num);
+        }
+    }
+
+    ps_fast_num_prepare(func);
+    if (func->fast_flags & PS_FAST_FLAG_NUM) {
+        double out = 0.0;
+        if (ps_fast_num_eval(vm, func, argc, argv, &out)) {
+            return ps_value_number(out);
+        }
+    }
 
     ps_fast_env_prepare(func);
     int use_fast_env = (func->fast_flags & PS_FAST_FLAG_ENV) != 0;
@@ -2198,12 +4065,16 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
     if (vm) {
         vm->env = env;
         vm->current_node = node;
+#if PS_ENABLE_PERF
         vm->perf.eval_node_count++;
         if (node && node->kind < PS_AST_KIND_COUNT) {
             vm->perf.ast_counts[node->kind]++;
         }
+#endif
         ps_gc_safe_point(vm);
-        ps_eval_trace_poll(vm, node);
+        if (ps_eval_trace_enabled != 0) {
+            ps_eval_trace_poll(vm, node);
+        }
     }
     switch (node->kind) {
         case AST_BLOCK:
@@ -2250,7 +4121,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
             }
             PSValue last = ps_value_undefined();
             while (1) {
-                ps_vm_perf_poll(vm);
+                PS_PERF_POLL(vm);
                 PSValue cond = eval_expression(vm, env, node->as.while_stmt.cond, ctl);
                 if (!ps_to_boolean(vm, cond)) break;
                 last = eval_node(vm, env, node->as.while_stmt.body, ctl);
@@ -2288,7 +4159,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
             }
             PSValue last = ps_value_undefined();
             do {
-                ps_vm_perf_poll(vm);
+                PS_PERF_POLL(vm);
                 last = eval_node(vm, env, node->as.do_while.body, ctl);
                 if (ctl->did_throw || ctl->did_return) return last;
                 if (ctl->did_break) {
@@ -2327,7 +4198,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
                 if (ctl->did_throw || ctl->did_return) return last;
             }
             while (1) {
-                ps_vm_perf_poll(vm);
+                PS_PERF_POLL(vm);
                 if (node->as.for_stmt.test) {
                     PSValue cond = eval_expression(vm, env, node->as.for_stmt.test, ctl);
                     if (!ps_to_boolean(vm, cond)) break;
@@ -2416,7 +4287,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
             }
 
             for (size_t i = 0; i < ordered_count; i++) {
-                ps_vm_perf_poll(vm);
+                PS_PERF_POLL(vm);
                 PSValue name_val = ps_value_string(ordered[i]);
                 if (node->as.for_in.is_var) {
                     if (node->as.for_in.target->kind == AST_IDENTIFIER) {
@@ -2491,7 +4362,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
             if (string_iter) {
                 size_t len = ps_string_length(string_iter);
                 for (size_t i = 0; i < len; i++) {
-                    ps_vm_perf_poll(vm);
+                    PS_PERF_POLL(vm);
                     PSString *ch = ps_string_char_at(string_iter, i);
                     (void)ps_assign_for_target(vm, env, node->as.for_of.target,
                                                node->as.for_of.is_var,
@@ -2536,7 +4407,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
                     }
                 }
                 for (size_t i = 0; i < len; i++) {
-                    ps_vm_perf_poll(vm);
+                    PS_PERF_POLL(vm);
                     char buf[32];
                     snprintf(buf, sizeof(buf), "%zu", i);
                     PSValue val = ps_object_get(obj, ps_string_from_cstr(buf), NULL);
@@ -2574,7 +4445,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
                 (void)ps_object_enum_own(obj, ps_collect_enum_name, &list);
             }
             for (size_t i = 0; i < list.count; i++) {
-                ps_vm_perf_poll(vm);
+                PS_PERF_POLL(vm);
                 int found = 0;
                 PSValue val = ps_object_get_own(obj, list.items[i], &found);
                 if (!found) continue;
@@ -2765,10 +4636,12 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
 static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *ctl) {
     if (vm) {
         vm->current_node = node;
+#if PS_ENABLE_PERF
         vm->perf.eval_expr_count++;
         if (node && node->kind < PS_AST_KIND_COUNT) {
             vm->perf.ast_counts[node->kind]++;
         }
+#endif
     }
     switch (node->kind) {
 
@@ -2800,6 +4673,13 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             if (!arr) return ps_value_undefined();
             arr->kind = PS_OBJ_KIND_ARRAY;
             (void)ps_array_init(arr);
+            for (size_t i = 0; i < node->as.array_literal.count; i++) {
+                if (!node->as.array_literal.items[i]) {
+                    PSArray *inner = ps_array_from_object(arr);
+                    if (inner) inner->dense = 0;
+                    break;
+                }
+            }
             for (size_t i = 0; i < node->as.array_literal.count; i++) {
                 if (node->as.array_literal.items[i]) {
                     PSValue v = eval_expression(vm, env, node->as.array_literal.items[i], ctl);
@@ -2924,6 +4804,39 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                                 current = ps_object_get(obj, prop, &found);
                             }
                         }
+                    } else if (obj && obj->kind == PS_OBJ_KIND_PLAIN && node->as.assign.target->as.member.computed) {
+                        PSValue key_val = eval_expression(vm, env, node->as.assign.target->as.member.property, ctl);
+                        if (ctl->did_throw) return ctl->throw_value;
+                        size_t index = 0;
+                        int idx = ps_value_to_index(vm, key_val, &index, ctl);
+                        if (idx < 0) return ctl->throw_value;
+                        if (idx > 0 && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                            PSValue out = ps_value_undefined();
+                            if (ps_num_map_get(obj, index, &out)) {
+                                current = out;
+                            } else {
+                                current = ps_value_undefined();
+                            }
+                        } else {
+                            int got_k = 0;
+                            if (key_val.type == PS_T_STRING && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                                uint32_t kindex = 0;
+                                if (ps_string_to_k_index(key_val.as.string, &kindex)) {
+                                    PSValue out = ps_value_undefined();
+                                    if (ps_num_map_k_get(obj, kindex, &out)) {
+                                        current = out;
+                                        got_k = 1;
+                                    }
+                                }
+                            }
+                            if (!got_k) {
+                                PSString *prop = (key_val.type == PS_T_STRING) ? key_val.as.string
+                                                                             : ps_to_string(vm, key_val);
+                                if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                                int found;
+                                current = ps_object_get(obj, prop, &found);
+                            }
+                        }
                     } else {
                         PSString *prop = ps_member_key(vm, env, node->as.assign.target, ctl);
                         if (ctl->did_throw) return ctl->throw_value;
@@ -2941,6 +4854,10 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                 switch (node->as.assign.op) {
                     case TOK_PLUS_ASSIGN:
                     {
+                        if (current.type == PS_T_NUMBER && rhs.type == PS_T_NUMBER) {
+                            new_value = ps_value_number(current.as.number + rhs.as.number);
+                            break;
+                        }
                         PSValue lprim = ps_to_primitive(vm, current, PS_HINT_NONE);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         PSValue rprim = ps_to_primitive(vm, rhs, PS_HINT_NONE);
@@ -2962,90 +4879,106 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                     }
                     case TOK_MINUS_ASSIGN:
                     {
-                        double ln = ps_to_number(vm, current);
+                        if (current.type == PS_T_NUMBER && rhs.type == PS_T_NUMBER) {
+                            new_value = ps_value_number(current.as.number - rhs.as.number);
+                            break;
+                        }
+                        double ln = ps_to_number_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        double rn = ps_to_number(vm, rhs);
+                        double rn = ps_to_number_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number(ln - rn);
                         break;
                     }
                     case TOK_STAR_ASSIGN:
                     {
-                        double ln = ps_to_number(vm, current);
+                        if (current.type == PS_T_NUMBER && rhs.type == PS_T_NUMBER) {
+                            new_value = ps_value_number(current.as.number * rhs.as.number);
+                            break;
+                        }
+                        double ln = ps_to_number_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        double rn = ps_to_number(vm, rhs);
+                        double rn = ps_to_number_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number(ln * rn);
                         break;
                     }
                     case TOK_SLASH_ASSIGN:
                     {
-                        double ln = ps_to_number(vm, current);
+                        if (current.type == PS_T_NUMBER && rhs.type == PS_T_NUMBER) {
+                            new_value = ps_value_number(current.as.number / rhs.as.number);
+                            break;
+                        }
+                        double ln = ps_to_number_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        double rn = ps_to_number(vm, rhs);
+                        double rn = ps_to_number_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number(ln / rn);
                         break;
                     }
                     case TOK_PERCENT_ASSIGN:
                     {
-                        double ln = ps_to_number(vm, current);
+                        if (current.type == PS_T_NUMBER && rhs.type == PS_T_NUMBER) {
+                            new_value = ps_value_number(fmod(current.as.number, rhs.as.number));
+                            break;
+                        }
+                        double ln = ps_to_number_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        double rn = ps_to_number(vm, rhs);
+                        double rn = ps_to_number_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number(fmod(ln, rn));
                         break;
                     }
                     case TOK_SHL_ASSIGN:
                     {
-                        int32_t ln = ps_to_int32(vm, &current);
+                        int32_t ln = ps_to_int32_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        uint32_t rn = ps_to_uint32(vm, &rhs);
+                        uint32_t rn = ps_to_uint32_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number((double)(ln << (rn & 31)));
                         break;
                     }
                     case TOK_SHR_ASSIGN:
                     {
-                        int32_t ln = ps_to_int32(vm, &current);
+                        int32_t ln = ps_to_int32_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        uint32_t rn = ps_to_uint32(vm, &rhs);
+                        uint32_t rn = ps_to_uint32_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number((double)(ln >> (rn & 31)));
                         break;
                     }
                     case TOK_USHR_ASSIGN:
                     {
-                        uint32_t ln = ps_to_uint32(vm, &current);
+                        uint32_t ln = ps_to_uint32_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        uint32_t rn = ps_to_uint32(vm, &rhs);
+                        uint32_t rn = ps_to_uint32_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number((double)(ln >> (rn & 31)));
                         break;
                     }
                     case TOK_AND_ASSIGN:
                     {
-                        int32_t ln = ps_to_int32(vm, &current);
+                        int32_t ln = ps_to_int32_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        int32_t rn = ps_to_int32(vm, &rhs);
+                        int32_t rn = ps_to_int32_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number((double)(ln & rn));
                         break;
                     }
                     case TOK_OR_ASSIGN:
                     {
-                        int32_t ln = ps_to_int32(vm, &current);
+                        int32_t ln = ps_to_int32_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        int32_t rn = ps_to_int32(vm, &rhs);
+                        int32_t rn = ps_to_int32_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number((double)(ln | rn));
                         break;
                     }
                     case TOK_XOR_ASSIGN:
                     {
-                        int32_t ln = ps_to_int32(vm, &current);
+                        int32_t ln = ps_to_int32_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        int32_t rn = ps_to_int32(vm, &rhs);
+                        int32_t rn = ps_to_int32_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number((double)(ln ^ rn));
                         break;
@@ -3057,7 +4990,9 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
 
             if (node->as.assign.target->kind == AST_IDENTIFIER) {
                 PSString *name = ps_identifier_string(node->as.assign.target);
-                ps_env_set(env, name, new_value);
+                if (!ps_identifier_cached_set(env, node->as.assign.target, new_value)) {
+                    ps_env_set(env, name, new_value);
+                }
                 return new_value;
             }
             if (node->as.assign.target->kind == AST_MEMBER) {
@@ -3105,6 +5040,51 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                     ps_object_put(obj, prop, new_value);
                     ps_array_update_length(obj, prop);
                     (void)ps_env_update_arguments(env, obj, prop, new_value);
+                    return new_value;
+                } else if (obj && obj->kind == PS_OBJ_KIND_PLAIN && node->as.assign.target->as.member.computed) {
+                    PSValue key_val = eval_expression(vm, env, node->as.assign.target->as.member.property, ctl);
+                    if (ctl->did_throw) return ctl->throw_value;
+                    size_t index = 0;
+                    int idx = ps_value_to_index(vm, key_val, &index, ctl);
+                    if (idx < 0) return ctl->throw_value;
+                    if (idx > 0 && (obj->internal_kind == PS_INTERNAL_NUMMAP || obj->internal == NULL)) {
+                        if (obj->props) {
+                            PSString *prop = ps_array_index_string(vm, index);
+                            PSProperty *p = ps_object_get_own_prop(obj, prop);
+                            if (p) {
+                                p->value = new_value;
+                                obj->cache_name = p->name;
+                                obj->cache_prop = p;
+                                return new_value;
+                            }
+                        }
+                        int is_new = 0;
+                        if (!ps_num_map_set(obj, index, new_value, &is_new)) return new_value;
+                        if (is_new) obj->shape_id++;
+                        return new_value;
+                    }
+                    if (key_val.type == PS_T_STRING &&
+                        (obj->internal_kind == PS_INTERNAL_NUMMAP || obj->internal == NULL)) {
+                        uint32_t kindex = 0;
+                        if (ps_string_to_k_index(key_val.as.string, &kindex)) {
+                            if (obj->props) {
+                                PSProperty *p = ps_object_get_own_prop(obj, key_val.as.string);
+                                if (p) {
+                                    p->value = new_value;
+                                    obj->cache_name = p->name;
+                                    obj->cache_prop = p;
+                                    return new_value;
+                                }
+                            }
+                            int is_new = 0;
+                            if (!ps_num_map_k_set(obj, kindex, new_value, &is_new)) return new_value;
+                            if (is_new) obj->shape_id++;
+                            return new_value;
+                        }
+                    }
+                    PSString *prop = (key_val.type == PS_T_STRING) ? key_val.as.string : ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                    ps_object_put(obj, prop, new_value);
                     return new_value;
                 }
                 PSString *prop = ps_member_key(vm, env, node->as.assign.target, ctl);
@@ -3175,6 +5155,9 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             switch (node->as.binary.op) {
                 case TOK_PLUS:
                 {
+                    if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                        return ps_value_number(left.as.number + right.as.number);
+                    }
                     PSValue lprim = ps_to_primitive(vm, left, PS_HINT_NONE);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                     PSValue rprim = ps_to_primitive(vm, right, PS_HINT_NONE);
@@ -3198,33 +5181,45 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                 }
                 case TOK_MINUS:
                 {
-                    double ln = ps_to_number(vm, left);
+                    if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                        return ps_value_number(left.as.number - right.as.number);
+                    }
+                    double ln = ps_to_number_fast(vm, left);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    double rn = ps_to_number(vm, right);
+                    double rn = ps_to_number_fast(vm, right);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                     return ps_value_number(ln - rn);
                 }
                 case TOK_STAR:
                 {
-                    double ln = ps_to_number(vm, left);
+                    if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                        return ps_value_number(left.as.number * right.as.number);
+                    }
+                    double ln = ps_to_number_fast(vm, left);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    double rn = ps_to_number(vm, right);
+                    double rn = ps_to_number_fast(vm, right);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                     return ps_value_number(ln * rn);
                 }
                 case TOK_SLASH:
                 {
-                    double ln = ps_to_number(vm, left);
+                    if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                        return ps_value_number(left.as.number / right.as.number);
+                    }
+                    double ln = ps_to_number_fast(vm, left);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    double rn = ps_to_number(vm, right);
+                    double rn = ps_to_number_fast(vm, right);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                     return ps_value_number(ln / rn);
                 }
                 case TOK_PERCENT:
                 {
-                    double ln = ps_to_number(vm, left);
+                    if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                        return ps_value_number(fmod(left.as.number, right.as.number));
+                    }
+                    double ln = ps_to_number_fast(vm, left);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    double rn = ps_to_number(vm, right);
+                    double rn = ps_to_number_fast(vm, right);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                     return ps_value_number(fmod(ln, rn));
                 }
@@ -3232,6 +5227,15 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                 case TOK_LTE:
                 case TOK_GT:
                 case TOK_GTE: {
+                    if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                        double ln = left.as.number;
+                        double rn = right.as.number;
+                        if (ps_value_is_nan(ln) || ps_value_is_nan(rn)) return ps_value_boolean(0);
+                        if (node->as.binary.op == TOK_LT) return ps_value_boolean(ln < rn);
+                        if (node->as.binary.op == TOK_LTE) return ps_value_boolean(ln <= rn);
+                        if (node->as.binary.op == TOK_GT) return ps_value_boolean(ln > rn);
+                        return ps_value_boolean(ln >= rn);
+                    }
                     PSValue lprim = ps_to_primitive(vm, left, PS_HINT_NUMBER);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                     PSValue rprim = ps_to_primitive(vm, right, PS_HINT_NUMBER);
@@ -3310,49 +5314,49 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                     return ps_value_boolean(!ps_strict_equals(&left, &right));
                 case TOK_AND:
                 {
-                    int32_t ln = ps_to_int32(vm, &left);
+                    int32_t ln = ps_to_int32_fast(vm, left);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    int32_t rn = ps_to_int32(vm, &right);
+                    int32_t rn = ps_to_int32_fast(vm, right);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                     return ps_value_number((double)(ln & rn));
                 }
                 case TOK_OR:
                 {
-                    int32_t ln = ps_to_int32(vm, &left);
+                    int32_t ln = ps_to_int32_fast(vm, left);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    int32_t rn = ps_to_int32(vm, &right);
+                    int32_t rn = ps_to_int32_fast(vm, right);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                     return ps_value_number((double)(ln | rn));
                 }
                 case TOK_XOR:
                 {
-                    int32_t ln = ps_to_int32(vm, &left);
+                    int32_t ln = ps_to_int32_fast(vm, left);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    int32_t rn = ps_to_int32(vm, &right);
+                    int32_t rn = ps_to_int32_fast(vm, right);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                     return ps_value_number((double)(ln ^ rn));
                 }
                 case TOK_SHL:
                 {
-                    int32_t ln = ps_to_int32(vm, &left);
+                    int32_t ln = ps_to_int32_fast(vm, left);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    uint32_t rn = ps_to_uint32(vm, &right);
+                    uint32_t rn = ps_to_uint32_fast(vm, right);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                     return ps_value_number((double)(ln << (rn & 31)));
                 }
                 case TOK_SHR:
                 {
-                    int32_t ln = ps_to_int32(vm, &left);
+                    int32_t ln = ps_to_int32_fast(vm, left);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    uint32_t rn = ps_to_uint32(vm, &right);
+                    uint32_t rn = ps_to_uint32_fast(vm, right);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                     return ps_value_number((double)(ln >> (rn & 31)));
                 }
                 case TOK_USHR:
                 {
-                    uint32_t ln = ps_to_uint32(vm, &left);
+                    uint32_t ln = ps_to_uint32_fast(vm, left);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    uint32_t rn = ps_to_uint32(vm, &right);
+                    uint32_t rn = ps_to_uint32_fast(vm, right);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                     return ps_value_number((double)(ln >> (rn & 31)));
                 }
@@ -3383,16 +5387,16 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                 case TOK_NOT:
                     return ps_value_boolean(!ps_to_boolean(vm, v));
                 case TOK_BIT_NOT:
-                    return ps_value_number((double)(~ps_to_int32(vm, &v)));
+                    return ps_value_number((double)(~ps_to_int32_fast(vm, v)));
                 case TOK_PLUS:
                 {
-                    double num = ps_to_number(vm, v);
+                    double num = ps_to_number_fast(vm, v);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                     return ps_value_number(num);
                 }
                 case TOK_MINUS:
                 {
-                    double num = ps_to_number(vm, v);
+                    double num = ps_to_number_fast(vm, v);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                     return ps_value_number(-num);
                 }
@@ -3457,7 +5461,9 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                 if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                 double new_num = (node->as.update.op == TOK_PLUS_PLUS) ? num + 1 : num - 1;
                 PSValue new_val = ps_value_number(new_num);
-                ps_env_set(env, name, new_val);
+                if (!ps_identifier_cached_set(env, target, new_val)) {
+                    ps_env_set(env, name, new_val);
+                }
                 return node->as.update.is_prefix ? new_val : current;
             }
             if (target->kind == AST_MEMBER) {
@@ -3570,6 +5576,58 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                     ps_array_update_length(obj, prop);
                     (void)ps_env_update_arguments(env, obj, prop, new_val);
                     return node->as.update.is_prefix ? new_val : current;
+                } else if (obj && obj->kind == PS_OBJ_KIND_PLAIN && target->as.member.computed) {
+                    PSValue key_val = eval_expression(vm, env, target->as.member.property, ctl);
+                    if (ctl->did_throw) return ctl->throw_value;
+                    size_t index = 0;
+                    int idx = ps_value_to_index(vm, key_val, &index, ctl);
+                    if (idx < 0) return ctl->throw_value;
+                    if (idx > 0 && (obj->internal_kind == PS_INTERNAL_NUMMAP || obj->internal == NULL)) {
+                        PSProperty *p = NULL;
+                        if (obj->props) {
+                            PSString *prop = ps_array_index_string(vm, index);
+                            p = ps_object_get_own_prop(obj, prop);
+                        }
+                        if (p) {
+                            current = p->value;
+                        } else {
+                            PSValue out = ps_value_undefined();
+                            if (obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                                if (ps_num_map_get(obj, index, &out)) current = out;
+                                else current = ps_value_undefined();
+                            } else {
+                                current = ps_value_undefined();
+                            }
+                        }
+                        double num = ps_to_number(vm, current);
+                        if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                        double new_num = (node->as.update.op == TOK_PLUS_PLUS) ? num + 1 : num - 1;
+                        PSValue new_val = ps_value_number(new_num);
+                        if (p) {
+                            p->value = new_val;
+                            obj->cache_name = p->name;
+                            obj->cache_prop = p;
+                        } else {
+                            int is_new = 0;
+                            if (ps_num_map_set(obj, index, new_val, &is_new) && is_new) {
+                                obj->shape_id++;
+                            }
+                        }
+                        return node->as.update.is_prefix ? new_val : current;
+                    }
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                    if (!ps_member_cached_get(obj, target, prop, &current)) {
+                        int found;
+                        current = ps_object_get(obj, prop, &found);
+                    }
+                    double num = ps_to_number(vm, current);
+                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                    double new_num = (node->as.update.op == TOK_PLUS_PLUS) ? num + 1 : num - 1;
+                    PSValue new_val = ps_value_number(new_num);
+                    ps_object_put(obj, prop, new_val);
+                    (void)ps_env_update_arguments(env, obj, prop, new_val);
+                    return node->as.update.is_prefix ? new_val : current;
                 }
                 PSString *prop = ps_member_key(vm, env, target, ctl);
                 if (ctl->did_throw) return ctl->throw_value;
@@ -3664,7 +5722,14 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                     if (ps_num_map_get(obj, index, &out)) return out;
                     return ps_value_undefined();
                 }
-                PSString *prop = ps_to_string(vm, key_val);
+                if (key_val.type == PS_T_STRING && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                    uint32_t kindex = 0;
+                    if (ps_string_to_k_index(key_val.as.string, &kindex)) {
+                        PSValue out = ps_value_undefined();
+                        if (ps_num_map_k_get(obj, kindex, &out)) return out;
+                    }
+                }
+                PSString *prop = (key_val.type == PS_T_STRING) ? key_val.as.string : ps_to_string(vm, key_val);
                 if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                 int found;
                 return ps_object_get(obj, prop, &found);
@@ -3683,6 +5748,7 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
         }
 
         case AST_CALL: {
+#if PS_ENABLE_PERF
             if (vm && node->as.call.callee) {
                 if (node->as.call.callee->kind == AST_IDENTIFIER) {
                     vm->perf.call_ident_count++;
@@ -3691,6 +5757,13 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                 } else {
                     vm->perf.call_other_count++;
                 }
+            }
+#endif
+            if (vm) {
+                PSValue fast_out = ps_value_undefined();
+                int fast_handled = ps_eval_math_intrinsic(vm, env, node, ctl, &fast_out);
+                if (fast_handled < 0) return ctl->throw_value;
+                if (fast_handled > 0) return fast_out;
             }
             if (node->as.call.callee->kind == AST_IDENTIFIER) {
                 PSAstNode *id = node->as.call.callee;
@@ -3702,10 +5775,10 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                         return ctl->throw_value;
                     }
                     PSValue *args = NULL;
-                    PSValue stack_args[4];
+                    PSValue stack_args[8];
                     int args_heap = 0;
                     if (!ps_eval_args(vm, env, node->as.call.args, node->as.call.argc,
-                                      stack_args, 4, &args, &args_heap, ctl)) {
+                                      stack_args, 8, &args, &args_heap, ctl)) {
                         return ctl->did_throw ? ctl->throw_value : ps_value_undefined();
                     }
                     PSValue result = ps_value_undefined();
@@ -3797,10 +5870,10 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             }
 
             PSValue *args = NULL;
-            PSValue stack_args[4];
+            PSValue stack_args[8];
             int args_heap = 0;
             if (!ps_eval_args(vm, env, node->as.call.args, node->as.call.argc,
-                              stack_args, 4, &args, &args_heap, ctl)) {
+                              stack_args, 8, &args, &args_heap, ctl)) {
                 return ctl->did_throw ? ctl->throw_value : ps_value_undefined();
             }
 #if PS_ENABLE_FAST_CALLS
@@ -3817,9 +5890,18 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
 #endif
             int did_throw = 0;
             PSValue throw_value = ps_value_undefined();
+            uint64_t prof_start = 0;
+            int prof_enabled = (vm && vm->profile.enabled);
+            if (prof_enabled) {
+                prof_start = ps_eval_now_ms();
+            }
             PSValue result = ps_eval_call_function(vm, env, callee.as.object, this_val,
                                                    (int)node->as.call.argc, args,
                                                    &did_throw, &throw_value);
+            if (prof_enabled) {
+                uint64_t elapsed = ps_eval_now_ms() - prof_start;
+                ps_vm_profile_add(vm, func, elapsed);
+            }
             if (args_heap) {
                 free(args);
             }
@@ -3874,10 +5956,10 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             if (proto == vm->regexp_proto) instance->kind = PS_OBJ_KIND_REGEXP;
 
             PSValue *args = NULL;
-            PSValue stack_args[4];
+            PSValue stack_args[8];
             int args_heap = 0;
             if (!ps_eval_args(vm, env, node->as.new_expr.args, node->as.new_expr.argc,
-                              stack_args, 4, &args, &args_heap, ctl)) {
+                              stack_args, 8, &args, &args_heap, ctl)) {
                 return ctl->did_throw ? ctl->throw_value : ps_value_undefined();
             }
 

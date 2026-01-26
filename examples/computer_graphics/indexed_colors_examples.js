@@ -1,5 +1,4 @@
-include "cpu_filters.js";
-
+ProtoScript.include("cpu_filters.js");
 CG.DEBUG_QUANT = true;
 RgbQuant.DEBUG = true;
 RgbQuant.DEBUG_FILTER = ["buildPal", "reduce image", "ditherImage", "perf"];

@@ -1,5 +1,4 @@
-include "RedBlackTree.js";
-
+ProtoScript.include("RedBlackTree.js");
 var rbt = new RedBlackTree();
 rbt.insert(10);
 rbt.insert(20);

@@ -1,5 +1,4 @@
-include "Trie.js";
-
+ProtoScript.include("Trie.js");
 var t = new Trie();
 t.insert("cat");
 t.insert("car");

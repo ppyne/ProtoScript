@@ -41,7 +41,6 @@ typedef enum {
     TOK_TYPEOF,
     TOK_VOID,
     TOK_DELETE,
-    TOK_INCLUDE,
 
     /* operators / punctuation */
     TOK_LPAREN, TOK_RPAREN,

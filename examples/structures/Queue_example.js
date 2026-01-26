@@ -1,5 +1,4 @@
-include "Queue.js";
-
+ProtoScript.include("Queue.js");
 var q = new Queue();
 Io.print(q.isEmpty() ? "empty\n" : "not empty\n");
 

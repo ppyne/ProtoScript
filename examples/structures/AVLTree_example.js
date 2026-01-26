@@ -1,5 +1,4 @@
-include "AVLTree.js";
-
+ProtoScript.include("AVLTree.js");
 var avl = new AVLTree();
 avl.insert(10);
 avl.insert(20);

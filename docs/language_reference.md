@@ -27,7 +27,7 @@ does not describe every ES1 rule in detail.
 ```
 var if else while do for in of switch case default function return
 break continue with try catch finally throw new true false null typeof
-this instanceof void delete include
+this instanceof void delete
 ```
 
 ---
@@ -67,14 +67,14 @@ this instanceof void delete include
 - `try / catch / finally`, `throw`
 - `return`
 - `with` (compile-time gated)
-- `include "path/to/file.js"` (top-level only, before statements)
+- `ProtoScript.include("path/to/file.js")` (top-level only, before statements)
 
-### 4.1 `include`
+### 4.1 `ProtoScript.include`
 
 ProtoScript supports a static source inclusion directive:
 
 ```js
-include "relative/or/absolute/path.js";
+ProtoScript.include("relative/or/absolute/path.js");
 ```
 
 Rules:
@@ -83,6 +83,7 @@ Rules:
 - argument must be a string literal ending in `.js`
 - relative paths resolve from the including file
 - cycles are detected and reported as errors
+- this is a parse-time directive, not a runtime function
 
 ---
 
@@ -246,6 +247,7 @@ Object: `ProtoScript`
 - `ProtoScript.sleep(seconds)`
 - `ProtoScript.usleep(microseconds)`
 - `ProtoScript.perfStats()`
+- `ProtoScript.include(path)` (parse-time only)
 
 ### 7.1 Io
 Object: `Io`

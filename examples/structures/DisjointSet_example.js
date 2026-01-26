@@ -1,5 +1,4 @@
-include "DisjointSet.js";
-
+ProtoScript.include("DisjointSet.js");
 var ds = new DisjointSet();
 ds.union("a", "b");
 ds.union("b", "c");

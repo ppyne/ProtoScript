@@ -1,28 +1,28 @@
-# ProtoScript — Source Inclusion (`include`)
+# ProtoScript — Source Inclusion (`ProtoScript.include`)
 
 **Specification v1.1**
 
-This document defines the `include` directive for ProtoScript. The purpose of `include` is to allow **explicit, static reuse of source code across multiple projects**, without introducing a full module system or dynamic code loading.
+This document defines the `ProtoScript.include` directive for ProtoScript. The purpose of `ProtoScript.include` is to allow **explicit, static reuse of source code across multiple projects**, without introducing a full module system or dynamic code loading.
 
 ---
 
 ## 1. Scope and Intent
 
-The `include` directive exists to:
+The `ProtoScript.include` directive exists to:
 
 - Reuse ProtoScript source files across projects
 - Avoid code duplication
 - Keep execution deterministic
 - Preserve ProtoScript’s single-entry-point execution model
 
-`include` is **not** a module system and does not introduce encapsulation, namespaces, or exports.
+`ProtoScript.include` is **not** a module system and does not introduce encapsulation, namespaces, or exports.
 
 ---
 
 ## 2. Syntax
 
 ```js
-include "relative/or/absolute/path.js"
+ProtoScript.include("relative/or/absolute/path.js");
 ```
 
 Rules:
@@ -30,6 +30,9 @@ Rules:
 - The argument must be a string literal
 - No expressions or variables are allowed
 - The file extension must be `.js`
+- The call must be written exactly as `ProtoScript.include(...)`
+- The statement must end with a semicolon
+- This is a parse-time directive, not a runtime function
 
 ---
 
@@ -37,9 +40,9 @@ Rules:
 
 ### 3.0 Placement Rules
 
-- `include` statements may appear **only at top level** of a source file
-- `include` is **not allowed** inside functions, loops, conditionals, or any other block
-- `include` must appear **before any executable statements** in the file
+- `ProtoScript.include` statements may appear **only at top level** of a source file
+- `ProtoScript.include` is **not allowed** inside functions, loops, conditionals, or any other block
+- `ProtoScript.include` must appear **before any executable statements** in the file
 
 This rule guarantees:
 - a fully static source tree
@@ -54,15 +57,15 @@ Any violation of these rules results in a **syntax error**.
 
 ### 3.1 Inclusion Model
 
-- `include` performs a **static textual inclusion**
+- `ProtoScript.include` performs a **static textual inclusion**
 - Included files are parsed and executed **as if their contents were written inline**
 - All included code executes in the **same global scope** as the including file
 
 Conceptually:
 
 ```js
-include "a.js"
-include "b.js"
+ProtoScript.include("a.js");
+ProtoScript.include("b.js");
 ```
 
 is equivalent to:
@@ -79,7 +82,7 @@ followed by the rest of the source file.
 ### 3.2 Execution Order
 
 - Files are included **in source order**, top to bottom
-- Each file is included and executed **exactly once per **``** statement**
+- Each file is included and executed **exactly once per `ProtoScript.include` statement**
 - There is no implicit caching or deduplication
 
 ---
@@ -88,13 +91,13 @@ followed by the rest of the source file.
 
 ### 4.1 Relative Paths
 
-- Relative paths are resolved **relative to the file that contains the **``** statement**, not the process working directory
+- Relative paths are resolved **relative to the file that contains the `ProtoScript.include` statement**, not the process working directory
 
 Example:
 
 ```js
 // main.js
-include "ui/system7/draw.js"
+ProtoScript.include("ui/system7/draw.js");
 ```
 
 If `main.js` is located in `/project/`, the resolved path is:
@@ -132,10 +135,10 @@ Example (invalid):
 
 ```js
 // a.js
-include "b.js"
+ProtoScript.include("b.js");
 
 // b.js
-include "a.js"
+ProtoScript.include("a.js");
 ```
 
 Behavior:
@@ -176,7 +179,7 @@ Errors abort program execution before entering the main execution phase.
 
 ## 7. Security and Determinism
 
-- `include` does not execute arbitrary strings
+- `ProtoScript.include` does not execute arbitrary strings
 - No runtime code generation occurs
 - Included code is subject to the same parsing and validation as the main file
 - Behavior is fully deterministic
@@ -185,15 +188,15 @@ Errors abort program execution before entering the main execution phase.
 
 ## 8. Relationship to `eval`
 
-- `include` is **not** `eval`
-- `include` is resolved **before execution**, not at runtime
-- `eval` remains disabled by default and is orthogonal to `include`
+- `ProtoScript.include` is **not** `eval`
+- `ProtoScript.include` is resolved **before execution**, not at runtime
+- `eval` remains disabled by default and is orthogonal to `ProtoScript.include`
 
 ---
 
 ## 9. Explicit Non-Goals
 
-The `include` directive does **not** provide:
+The `ProtoScript.include` directive does **not** provide:
 
 - dynamic loading
 - conditional inclusion
@@ -207,9 +210,8 @@ These may be considered in future, separate specifications.
 
 ## 10. Philosophy
 
-The `include` directive answers one question:
+The `ProtoScript.include` directive answers one question:
 
 > “How can I reuse code explicitly, safely, and predictably?”
 
 Nothing more.
-

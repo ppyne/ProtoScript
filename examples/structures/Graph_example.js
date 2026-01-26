@@ -1,5 +1,4 @@
-include "Graph.js";
-
+ProtoScript.include("Graph.js");
 var undirected = new Graph(false);
 undirected.addEdge("A", "B");
 undirected.addEdge("A", "C");

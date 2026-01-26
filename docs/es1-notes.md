@@ -30,11 +30,11 @@ set in `include/ps_config.h`.
 `PS_ENABLE_EVAL=0` and `PS_ENABLE_WITH=0`, set in `include/ps_config.h`. When
 disabled, attempting to use them is rejected.
 
-## 5. `include` directive
+## 5. `ProtoScript.include` directive
 
-ProtoScript supports a static `include "path.js"` directive. It is not part of
-ES1 and is resolved before execution. `include` is only allowed at top level
-and must appear before any executable statements.
+ProtoScript supports a static `ProtoScript.include("path.js")` directive. It is
+not part of ES1 and is resolved before execution. `ProtoScript.include` is only
+allowed at top level and must appear before any executable statements.
 
 ## 6. Host extensions
 

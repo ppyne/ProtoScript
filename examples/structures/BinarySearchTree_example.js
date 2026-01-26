@@ -1,5 +1,4 @@
-include "BinarySearchTree.js";
-
+ProtoScript.include("BinarySearchTree.js");
 var bst = new BinarySearchTree();
 bst.insert(5);
 bst.insert(3);

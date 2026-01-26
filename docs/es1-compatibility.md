@@ -19,7 +19,7 @@ current build.
 - Known deviations: UTF-8 glyph string model, limited RegExp ignoreCase, optional
   eval/with, optional arguments aliasing.
 - ES1 globals and global functions are implemented (see Section 4).
-- Extra non-ES1 features are present (include directive, for...of, default
+- Extra non-ES1 features are present (ProtoScript.include directive, for...of, default
   parameters, JSON, Object prototype APIs, host modules).
 
 ---
@@ -41,7 +41,7 @@ Keywords (from the lexer):
 ```
 var if else while do for in of switch case default function return
 break continue with try catch finally throw new true false null typeof
-instanceof void delete include
+instanceof void delete
 ```
 
 Statements:
@@ -52,7 +52,7 @@ Statements:
 - `try / catch / finally`, `throw`
 - `return`
 - `with` (compile-time gated)
-- `include "path.js"` (non-ES1, top-level only)
+- `ProtoScript.include("path.js")` (non-ES1, top-level only)
 
 ### 2.3 Operators
 
@@ -89,7 +89,8 @@ From `docs/es1-notes.md` plus current implementation checks:
    (`PS_ENABLE_ARGUMENTS_ALIASING=1`).
 4. `eval` and `with` are compile-time gated (`PS_ENABLE_EVAL`,
    `PS_ENABLE_WITH`).
-5. Static `include "path.js"` directive is non-ES1.
+5. Static `ProtoScript.include("path.js")` directive is non-ES1 (parse-time,
+   top-level only).
 6. Host extensions: `Io`, `Fs`, `Buffer`, `Event`, `Display`, `Image`, `Gc`,
    `ProtoScript`, and `console`.
 7. `Gc` module is non-standard.
@@ -229,7 +230,8 @@ Errors:
 ## 5. Host extensions (non-ES1)
 
 Global objects beyond ES1:
-- `ProtoScript` (`args`, `version`, `exit`, `sleep`, `usleep`, `perfStats`)
+- `ProtoScript` (`args`, `version`, `exit`, `sleep`, `usleep`, `perfStats`,
+  `include` (parse-time only))
 - `Io` (`print`, `sprintf`, file I/O, streams)
 - `Fs` (POSIX filesystem helpers)
 - `Buffer` (byte buffers)

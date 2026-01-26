@@ -1,5 +1,4 @@
-include "BloomFilter.js";
-
+ProtoScript.include("BloomFilter.js");
 var bf = new BloomFilter(64);
 bf.add("apple");
 bf.add("banana");

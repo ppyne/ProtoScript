@@ -278,7 +278,7 @@ Instead of designing a rigid architecture up front, you start with something con
 Rather than subclassing, you clone and adjust:
 
 ```
-include "examples/utils/clone.js";
+ProtoScript.include("examples/utils/clone.js");
 
 baseOsc = {
   freq: 440,
@@ -300,7 +300,7 @@ Each object tells its own story.
 You can add behavior *after* objects already exist:
 
 ```
-include "examples/utils/clone.js";
+ProtoScript.include("examples/utils/clone.js");
 
 filter = { cutoff: 1000 };
 

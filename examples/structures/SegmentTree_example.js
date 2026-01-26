@@ -1,5 +1,4 @@
-include "SegmentTree.js";
-
+ProtoScript.include("SegmentTree.js");
 var values = [1, 3, 5, 7, 9, 11];
 var seg = new SegmentTree(values);
 

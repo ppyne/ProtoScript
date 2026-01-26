@@ -1,5 +1,4 @@
-include "DoublyLinkedList.js";
-
+ProtoScript.include("DoublyLinkedList.js");
 var list = new DoublyLinkedList();
 list.push("b");
 list.push("c");

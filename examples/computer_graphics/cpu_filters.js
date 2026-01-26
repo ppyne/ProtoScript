@@ -1,5 +1,4 @@
-include "rgbquant.js";
-
+ProtoScript.include("rgbquant.js");
 var CG = {};
 CG.DEBUG_QUANT = false;
 CG._debugLog = function (msg) {

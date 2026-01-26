@@ -1,5 +1,4 @@
-include "FenwickTree.js";
-
+ProtoScript.include("FenwickTree.js");
 var ft = new FenwickTree(6);
 var values = [1, 3, 5, 7, 9, 11];
 var i = 0;

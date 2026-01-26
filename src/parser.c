@@ -182,7 +182,6 @@ static const char *token_repr(PSToken tok, char *buf, size_t buf_len) {
         case TOK_TYPEOF: return "'typeof'";
         case TOK_VOID: return "'void'";
         case TOK_DELETE: return "'delete'";
-        case TOK_INCLUDE: return "'include'";
         case TOK_LPAREN: return "'('";
         case TOK_RPAREN: return "')'";
         case TOK_LBRACE: return "'{'";
@@ -689,22 +688,54 @@ static PSAstNode *parse_var_decl_list(PSParser *p) {
     return set_pos_from_node(block, count > 0 ? decls[0] : NULL);
 }
 
+static int token_is_identifier(PSToken tok, const char *name) {
+    size_t len = strlen(name);
+    return tok.type == TOK_IDENTIFIER &&
+        tok.length == len &&
+        strncmp(tok.start, name, len) == 0;
+}
+
+static PSAstNode *parse_protoscript_include(PSParser *p, int is_top_level) {
+    PSParser saved = *p;
+    PSToken start_tok = p->current;
+    if (!token_is_identifier(p->current, "ProtoScript")) {
+        return NULL;
+    }
+    advance(p);
+    if (!match(p, TOK_DOT)) {
+        *p = saved;
+        return NULL;
+    }
+    if (!token_is_identifier(p->current, "include")) {
+        *p = saved;
+        return NULL;
+    }
+    advance(p);
+    if (!match(p, TOK_LPAREN)) {
+        *p = saved;
+        return NULL;
+    }
+    if (!is_top_level) {
+        parse_error_at(start_tok.line, start_tok.column,
+            "Parse error: ProtoScript.include is only allowed at top level");
+    }
+    if (p->saw_non_include) {
+        parse_error_at(start_tok.line, start_tok.column,
+            "Parse error: ProtoScript.include must appear before any statements");
+    }
+    PSAstNode *node = parse_include_statement(p, start_tok);
+    expect(p, TOK_RPAREN, "')'");
+    expect(p, TOK_SEMI, "';'");
+    return node;
+}
+
 static PSAstNode *parse_statement(PSParser *p) {
     int is_top_level = (p->context_level == 0);
 
-    /* include directive */
-    if (p->current.type == TOK_INCLUDE) {
-        PSToken tok = p->current;
-        if (!is_top_level) {
-            parse_error_at(tok.line, tok.column, "Parse error: include is only allowed at top level");
-        }
-        if (p->saw_non_include) {
-            parse_error_at(tok.line, tok.column, "Parse error: include must appear before any statements");
-        }
-        advance(p);
-        PSAstNode *node = parse_include_statement(p, tok);
-        expect(p, TOK_SEMI, "';'");
-        return node;
+    /* ProtoScript.include(...) */
+    PSAstNode *include_node = parse_protoscript_include(p, is_top_level);
+    if (include_node) {
+        return include_node;
     }
 
     if (is_top_level) {
@@ -759,15 +790,6 @@ static PSAstNode *parse_statement(PSParser *p) {
         PSAstNode *decls = parse_var_decl_list(p);
         expect(p, TOK_SEMI, "';'");
         return set_pos(decls, tok);
-    }
-
-    /* include directive */
-    if (p->current.type == TOK_INCLUDE) {
-        PSToken tok = p->current;
-        advance(p);
-        PSAstNode *node = parse_include_statement(p, tok);
-        expect(p, TOK_SEMI, "';'");
-        return node;
     }
 
     /* function declaration */

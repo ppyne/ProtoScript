@@ -1,5 +1,4 @@
-include "LeastRecentlyUsedCache.js";
-
+ProtoScript.include("LeastRecentlyUsedCache.js");
 var cache = new LeastRecentlyUsedCache(2);
 cache.set("a", 1);
 cache.set("b", 2);

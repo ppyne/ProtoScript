@@ -258,22 +258,23 @@ Availability: compile-time gated by `PS_ENABLE_WITH` (default `0` in
 
 ---
 
-### `include`
+### `ProtoScript.include`
 
 Statically includes another ProtoScript source file.
 
 ```js
-include "relative/path/to/file.js";
+ProtoScript.include("relative/path/to/file.js");
 ```
 
 Rules:
 - The path must be a string literal ending in `.js`.
-- `include` is only allowed at top level (not inside blocks).
-- `include` must appear before any executable statements in the file.
+- `ProtoScript.include` is only allowed at top level (not inside blocks).
+- `ProtoScript.include` must appear before any executable statements in the file.
 - Relative paths resolve from the including file's directory.
 - Cycles are detected and reported as errors.
+- It is a parse-time directive, not a runtime function.
 
-Each `include` executes the included file contents in the same global scope,
+Each `ProtoScript.include` executes the included file contents in the same global scope,
 in source order. Including the same file more than once is allowed.
 
 ---

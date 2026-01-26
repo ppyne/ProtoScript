@@ -1,5 +1,4 @@
-include "../../examples/utils/clone.js";
-
+ProtoScript.include("../../examples/utils/clone.js");
 var src = { a: 1, nested: { x: 1 }, list: [1, 2] };
 var copy = clone(src);
 Io.print(copy.nested.x + "\n");

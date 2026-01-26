@@ -23,6 +23,13 @@ typedef struct PSFunction {
     PSString         *name;
     size_t           param_count;
     struct PSEnv    *env;
+    PSString        **fast_names;
+    size_t           fast_count;
+    size_t          *fast_param_index;
+    size_t           fast_local_count;
+    size_t           fast_this_index;
+    struct PSEnv    *fast_env;
+    uint8_t          fast_env_in_use;
     uint8_t          fast_flags;
     uint8_t          fast_checked;
 } PSFunction;

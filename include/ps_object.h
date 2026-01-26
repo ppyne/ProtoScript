@@ -33,6 +33,8 @@ typedef struct PSObject {
     size_t           prop_count;
     int              kind;      /* internal type tag */
     void            *internal;  /* internal data */
+    uint32_t         shape_id;  /* own property shape version */
+    uint8_t          internal_kind; /* PSInternalKind for PLAIN objects */
 } PSObject;
 
 typedef enum {
@@ -45,8 +47,14 @@ typedef enum {
     PS_OBJ_KIND_DATE = 6,
     PS_OBJ_KIND_REGEXP = 7,
     PS_OBJ_KIND_BUFFER = 8,
-    PS_OBJ_KIND_IMAGE = 9
+    PS_OBJ_KIND_IMAGE = 9,
+    PS_OBJ_KIND_BUFFER32 = 10
 } PSObjectKind;
+
+typedef enum {
+    PS_INTERNAL_NONE = 0,
+    PS_INTERNAL_NUMMAP = 1
+} PSInternalKind;
 
 /* Object lifecycle */
 PSObject *ps_object_new(PSObject *prototype);
@@ -55,6 +63,7 @@ void      ps_object_free(PSObject *obj);
 /* Property lookup */
 int       ps_object_has_own(const PSObject *obj, const PSString *name);
 PSValue   ps_object_get_own(const PSObject *obj, const PSString *name, int *found);
+PSProperty *ps_object_get_own_prop(PSObject *obj, const PSString *name);
 
 /* Prototype chain lookup */
 int       ps_object_has(const PSObject *obj, const PSString *name);

@@ -2,6 +2,7 @@
 #define PS_AST_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include "ps_value.h"
 #include "ps_string.h"
 
@@ -51,11 +52,16 @@ typedef enum {
     AST_OBJECT_LITERAL
 } PSAstKind;
 
+#define PS_AST_KIND_COUNT (AST_OBJECT_LITERAL + 1)
+
 /* --------------------------------------------------------- */
 /* Forward declarations                                      */
 /* --------------------------------------------------------- */
 
 typedef struct PSAstNode PSAstNode;
+struct PSObject;
+struct PSProperty;
+struct PSEnv;
 
 /* --------------------------------------------------------- */
 /* AST node definition                                       */
@@ -206,6 +212,12 @@ struct PSAstNode {
             const char *name;
             size_t      length;
             PSString   *str;
+            struct PSEnv *cache_fast_env;
+            size_t        cache_fast_index;
+            struct PSEnv *cache_env;
+            struct PSObject *cache_record;
+            struct PSProperty *cache_prop;
+            uint32_t      cache_shape;
         } identifier;
 
         /* literal (number, string, boolean, null, undefined) */
@@ -259,6 +271,9 @@ struct PSAstNode {
             PSAstNode *object;
             PSAstNode *property;
             int        computed;
+            struct PSObject *cache_obj;
+            struct PSProperty *cache_prop;
+            uint32_t   cache_shape;
         } member;
 
         /* new callee(args) */

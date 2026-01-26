@@ -30,6 +30,13 @@ PSObject *ps_function_new_native(PSNativeFunc fn) {
     func->param_names = NULL;
     func->name = NULL;
     func->param_count = 0;
+    func->fast_names = NULL;
+    func->fast_count = 0;
+    func->fast_param_index = NULL;
+    func->fast_local_count = 0;
+    func->fast_this_index = 0;
+    func->fast_env = NULL;
+    func->fast_env_in_use = 0;
     func->fast_flags = 0;
     func->fast_checked = 0;
 
@@ -70,6 +77,13 @@ PSObject *ps_function_new_script(PSAstNode **params,
     func->name = NULL;
     func->fast_flags = 0;
     func->fast_checked = 0;
+    func->fast_names = NULL;
+    func->fast_count = 0;
+    func->fast_param_index = NULL;
+    func->fast_local_count = 0;
+    func->fast_this_index = 0;
+    func->fast_env = NULL;
+    func->fast_env_in_use = 0;
     if (param_count > 0 && params) {
         func->param_names = (PSString **)calloc(param_count, sizeof(PSString *));
         if (func->param_names) {

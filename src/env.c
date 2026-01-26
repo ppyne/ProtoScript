@@ -80,7 +80,20 @@ PSEnv *ps_env_root(PSEnv *env) {
 }
 
 int ps_env_define(PSEnv *env, PSString *name, PSValue value) {
-    if (!env || !env->record) return 0;
+    if (!env || !name) return 0;
+    int fast_found = 0;
+    if (env->fast_names && env->fast_values) {
+        for (size_t i = 0; i < env->fast_count; i++) {
+            if (env->fast_names[i] && ps_string_equals(env->fast_names[i], name)) {
+                env->fast_values[i] = value;
+                fast_found = 1;
+                break;
+            }
+        }
+    }
+    if (!env->record) {
+        return fast_found;
+    }
     return ps_object_define(env->record, name, value, PS_ATTR_NONE);
 }
 

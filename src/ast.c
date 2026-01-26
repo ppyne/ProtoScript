@@ -206,6 +206,12 @@ PSAstNode *ps_ast_identifier(const char *name, size_t length) {
     n->as.identifier.name = copy;
     n->as.identifier.length = length;
     n->as.identifier.str = ps_string_from_utf8(copy, length);
+    n->as.identifier.cache_fast_env = NULL;
+    n->as.identifier.cache_fast_index = 0;
+    n->as.identifier.cache_env = NULL;
+    n->as.identifier.cache_record = NULL;
+    n->as.identifier.cache_prop = NULL;
+    n->as.identifier.cache_shape = 0;
     return n;
 }
 

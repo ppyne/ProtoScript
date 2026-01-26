@@ -47,6 +47,11 @@ This index lists core **ProtoScript language concepts**, operators, statements, 
   - `Buffer.alloc`
   - `Buffer.size`
   - `Buffer.slice`
+- `Buffer32` module (see [Working with Objects](working_with_objects.md#buffer32-module))
+  - `Buffer32.alloc`
+  - `Buffer32.size`
+  - `Buffer32.byteLength`
+  - `Buffer32.view`
 
 ---
 

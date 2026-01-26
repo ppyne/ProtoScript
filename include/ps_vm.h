@@ -6,6 +6,7 @@
 #include "ps_value.h"
 #include "ps_env.h"
 #include "ps_gc.h"
+#include "ps_ast.h"
 
 #include <stdint.h>
 
@@ -27,6 +28,28 @@ typedef struct PSPerfStats {
     uint64_t env_new;
     uint64_t call_count;
     uint64_t native_call_count;
+    uint64_t object_get;
+    uint64_t object_put;
+    uint64_t object_define;
+    uint64_t object_delete;
+    uint64_t array_get;
+    uint64_t array_set;
+    uint64_t array_delete;
+    uint64_t string_from_cstr;
+    uint64_t buffer_read_index;
+    uint64_t buffer_write_index;
+    uint64_t buffer_read_index_fast;
+    uint64_t buffer_write_index_fast;
+    uint64_t buffer32_read_index;
+    uint64_t buffer32_write_index;
+    uint64_t buffer32_read_index_fast;
+    uint64_t buffer32_write_index_fast;
+    uint64_t eval_node_count;
+    uint64_t eval_expr_count;
+    uint64_t call_ident_count;
+    uint64_t call_member_count;
+    uint64_t call_other_count;
+    uint64_t ast_counts[PS_AST_KIND_COUNT];
 } PSPerfStats;
 
 typedef struct PSStackFrame {
@@ -74,9 +97,13 @@ typedef struct PSVM {
     struct PSAstNode *current_node;
     PSString **index_cache;
     size_t index_cache_size;
+    PSString **intern_cache;
+    size_t intern_cache_size;
     PSStackFrame *stack_frames;
     size_t stack_depth;
     size_t stack_capacity;
+    uint64_t perf_dump_interval_ms;
+    uint64_t perf_dump_next_ms;
     PSPerfStats perf;
     PSGC gc;
 } PSVM;
@@ -100,6 +127,9 @@ void ps_vm_init_fs(PSVM *vm);
 #if PS_ENABLE_MODULE_IMG
 void ps_vm_init_img(PSVM *vm);
 #endif
+void ps_vm_set_perf_interval(PSVM *vm, uint64_t interval_ms);
+void ps_vm_perf_poll(PSVM *vm);
+void ps_vm_perf_dump(PSVM *vm);
 
 /* Primitive wrappers */
 PSObject *ps_vm_wrap_primitive(PSVM *vm, const PSValue *v);

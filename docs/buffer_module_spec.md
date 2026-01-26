@@ -98,7 +98,11 @@ buf[i] = value
 
 - `i` must be an integer
 - valid range: `0 <= i < Buffer.size(buf)`
-- values are clamped to `0–255`
+- assigned values are converted with `ToNumber` semantics
+- `NaN`/`Infinity`/`-Infinity` become `0`
+- values `<= 0` become `0`, values `>= 255` become `255`
+- values in `(0, 1)` become `0`
+- remaining values are rounded to nearest integer (`floor(x + 0.5)`)
 - out-of-range access throws an error
 
 ---
@@ -118,12 +122,96 @@ This is a copy, not a view.
 
 ---
 
+### 4.5 `Buffer32.alloc(length)`
+
+Allocates a new 32-bit buffer view backed by a byte buffer.
+
+**Parameters:**
+- `length` (number): number of 32-bit elements
+
+**Returns:**
+- a new Buffer32 instance
+
+**Behavior:**
+- memory is zero-initialized
+
+**Errors:**
+- throws if length is negative or exceeds implementation limits
+
+---
+
+### 4.6 `Buffer32.size(buf32)`
+
+Returns the number of 32-bit elements.
+
+**Parameters:**
+- `buf32` (Buffer32)
+
+**Returns:**
+- `number`
+
+---
+
+### 4.7 `Buffer32.byteLength(buf32)`
+
+Returns the size in bytes.
+
+**Parameters:**
+- `buf32` (Buffer32)
+
+**Returns:**
+- `number`
+
+---
+
+### 4.8 `Buffer32.view(buffer, offset?, length?)`
+
+Creates a 32-bit view over an existing byte buffer.
+
+**Parameters:**
+- `buffer` (Buffer)
+- `offset` (number, optional): element offset (uint32 index)
+- `length` (number, optional): number of elements
+
+**Returns:**
+- a Buffer32 view (no copy)
+
+**Errors:**
+- throws if the view would exceed the buffer bounds
+
+---
+
+### 4.9 Buffer32 Access
+
+Buffer32 supports indexed access using numeric indices:
+
+```
+value = buf32[i]
+buf32[i] = value
+```
+
+**Rules:**
+
+- `i` must be an integer
+- valid range: `0 <= i < Buffer32.size(buf32)`
+- elements are 32-bit unsigned integers (little-endian)
+- assigned values are converted with `ToNumber` semantics
+- `NaN`/`Infinity`/`-Infinity` become `0`
+- values `<= 0` become `0`, values `>= 4294967295` become `4294967295`
+- values in `(0, 1)` become `0`
+- remaining values are rounded to nearest integer (`floor(x + 0.5)`)
+- out-of-range access throws an error
+
+---
+
 ## 5. Semantics
 
 - Buffers are mutable
 - Buffers have no prototype methods
 - Buffers are opaque to user code
 - Buffers are GC-managed objects
+
+Buffer32 is a view that keeps its underlying Buffer alive.
 
 No assumptions are made about internal representation.
 
@@ -161,7 +249,7 @@ The Buffer module is designed to interoperate with:
 
 The Buffer module will not:
 
-- Provide multi-byte integer views
+- Provide arbitrary typed array views beyond Buffer32
 - Support floating-point storage
 - Implement slicing views
 - Expose pointers or addresses

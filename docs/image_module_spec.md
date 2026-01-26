@@ -2,10 +2,11 @@
 
 ## Overview
 
-The `Image` module provides **image decoding and resampling facilities** for ProtoScript.
+The `Image` module provides **image decoding, encoding, and resampling facilities** for ProtoScript.
 
 Its responsibility is strictly limited to:
 - decoding image formats into an **in-memory RGBA8 representation**
+- encoding RGBA images into PNG or JPEG buffers
 - resampling RGBA images using well-defined interpolation modes
 
 The module operates exclusively on `Buffer` objects and plain ProtoScript objects.
@@ -166,6 +167,42 @@ Decodes a JPEG image from a binary buffer.
 #### Errors
 - invalid JPEG data → `DecodeError`
 - unsupported JPEG features → `DecodeError`
+- Image module disabled → `ModuleDisabledError`
+
+---
+
+### Image.encodePNG
+
+```text
+Image.encodePNG(image: Image) -> Buffer
+```
+
+Encodes an RGBA image into a PNG buffer (8-bit RGBA with alpha).
+
+#### Errors
+- invalid image object → `ArgumentError`
+- image data length mismatch → `ArgumentError`
+- encoding failure → `EncodeError`
+- Image module disabled → `ModuleDisabledError`
+
+---
+
+### Image.encodeJPEG
+
+```text
+Image.encodeJPEG(image: Image, quality?: number) -> Buffer
+```
+
+Encodes an RGBA image into a JPEG buffer (alpha is discarded).
+
+#### Parameters
+- `quality` (number, optional): 0–100, higher is better quality/larger size. Default is implementation-defined (recommended 75).
+
+#### Errors
+- invalid image object → `ArgumentError`
+- image data length mismatch → `ArgumentError`
+- invalid quality → `ArgumentError`
+- encoding failure → `EncodeError`
 - Image module disabled → `ModuleDisabledError`
 
 ---

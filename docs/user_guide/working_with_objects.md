@@ -580,18 +580,42 @@ Buffer operations:
 - `Buffer.alloc(size)` allocates a zeroed buffer.
 - `Buffer.size(buf)` returns the size in bytes.
 - `Buffer.slice(buf, offset, length)` copies a sub-range.
-- `buf[i]` reads a byte; `buf[i] = value` writes a byte (clamped to 0–255).
+- `buf[i]` reads a byte; `buf[i] = value` writes a byte after `ToNumber` conversion, rounding, and clamping.
+- `NaN`/`Infinity`/`-Infinity` become `0`; values in `(0, 1)` become `0`; other values round via `floor(x + 0.5)` and clamp to `0–255`.
 - Out-of-range access throws an error.
 
 Buffers are also used for binary I/O and the Display framebuffer.
 
 ---
 
+## Buffer32 module
+
+Buffer32 provides a native 32-bit view over byte buffers for faster pixel work.
+
+```js
+var buf = Buffer.alloc(8);
+var view = Buffer32.view(buf);
+view[0] = 0x04030201;
+Io.print(view[0] + "\n");
+```
+
+Buffer32 operations:
+- `Buffer32.alloc(length)` allocates a zeroed 32-bit buffer view.
+- `Buffer32.size(buf32)` returns element count (uint32).
+- `Buffer32.byteLength(buf32)` returns byte size.
+- `Buffer32.view(buffer, offset?, length?)` creates a view (no copy).
+- `buf32[i]` reads a uint32; `buf32[i] = value` writes after `ToNumber` conversion, rounding, and clamping to `0–4294967295`.
+- Out-of-range access throws an error.
+
+The view is live; writes update the underlying `Buffer`.
+
+---
+
 ## Image module
 
-ProtoScript exposes a host `Image` module for decoding PNG/JPEG buffers and
-resampling RGBA images. It is available when `PS_ENABLE_MODULE_IMG` is set to
-`1` at build time.
+ProtoScript exposes a host `Image` module for decoding PNG/JPEG buffers,
+encoding RGBA images to PNG/JPEG, and resampling RGBA images. It is available
+when `PS_ENABLE_MODULE_IMG` is set to `1` at build time.
 
 Image objects are plain objects:
 
@@ -625,6 +649,20 @@ Io.print(half.width + "x" + half.height + "\n");
 ```
 
 Resample modes: `none`, `linear`, `cubic`, `nohalo`, `lohalo`.
+
+To encode images:
+
+```js
+var png = Image.encodePNG(img);
+var out = Io.open("out.png", "wb");
+out.write(png);
+out.close();
+
+var jpeg = Image.encodeJPEG(img, 85);
+var outJ = Io.open("out.jpg", "wb");
+outJ.write(jpeg);
+outJ.close();
+```
 
 ---
 

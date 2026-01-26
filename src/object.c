@@ -1,8 +1,11 @@
 #include "ps_object.h"
+#include "ps_array.h"
+#include "ps_numeric_map.h"
 #include "ps_gc.h"
 #include "ps_config.h"
 #include "ps_vm.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -115,6 +118,8 @@ PSObject *ps_object_new(PSObject *prototype) {
     o->prop_count = 0;
     o->kind = PS_OBJ_KIND_PLAIN;
     o->internal = NULL;
+    o->shape_id = 1;
+    o->internal_kind = PS_INTERNAL_NONE;
     return o;
 }
 
@@ -142,10 +147,52 @@ void ps_object_free(PSObject *obj) {
 /* --------------------------------------------------------- */
 
 int ps_object_has_own(const PSObject *obj, const PSString *name) {
+#if PS_ENABLE_PERF
+    PSVM *vm = ps_gc_active_vm();
+    if (vm) vm->perf.object_get++;
+#endif
+    if (obj && obj->kind == PS_OBJ_KIND_PLAIN && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+        size_t index = 0;
+        if (ps_array_string_to_index(name, &index)) {
+            PSValue out = ps_value_undefined();
+            if (ps_num_map_get((PSObject *)obj, index, &out)) return 1;
+        }
+    }
+    if (obj && obj->kind == PS_OBJ_KIND_ARRAY) {
+        size_t index = 0;
+        if (ps_array_string_to_index(name, &index)) {
+            PSValue out = ps_value_undefined();
+            if (ps_array_get_index(obj, index, &out)) return 1;
+        }
+    }
     return find_prop_const(obj, name) != NULL;
 }
 
 PSValue ps_object_get_own(const PSObject *obj, const PSString *name, int *found) {
+#if PS_ENABLE_PERF
+    PSVM *vm = ps_gc_active_vm();
+    if (vm) vm->perf.object_get++;
+#endif
+    if (obj && obj->kind == PS_OBJ_KIND_PLAIN && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+        size_t index = 0;
+        if (ps_array_string_to_index(name, &index)) {
+            PSValue out = ps_value_undefined();
+            if (ps_num_map_get((PSObject *)obj, index, &out)) {
+                if (found) *found = 1;
+                return out;
+            }
+        }
+    }
+    if (obj && obj->kind == PS_OBJ_KIND_ARRAY) {
+        size_t index = 0;
+        if (ps_array_string_to_index(name, &index)) {
+            PSValue out = ps_value_undefined();
+            if (ps_array_get_index(obj, index, &out)) {
+                if (found) *found = 1;
+                return out;
+            }
+        }
+    }
     const PSProperty *p = find_prop_const(obj, name);
     if (p) {
         if (found) *found = 1;
@@ -153,6 +200,10 @@ PSValue ps_object_get_own(const PSObject *obj, const PSString *name, int *found)
     }
     if (found) *found = 0;
     return ps_value_undefined();
+}
+
+PSProperty *ps_object_get_own_prop(PSObject *obj, const PSString *name) {
+    return find_prop(obj, name);
 }
 
 /* --------------------------------------------------------- */
@@ -166,8 +217,32 @@ int ps_object_has(const PSObject *obj, const PSString *name) {
 }
 
 PSValue ps_object_get(const PSObject *obj, const PSString *name, int *found) {
+#if PS_ENABLE_PERF
+    PSVM *vm = ps_gc_active_vm();
+    if (vm) vm->perf.object_get++;
+#endif
     const PSObject *cur = obj;
     while (cur) {
+        if (cur->kind == PS_OBJ_KIND_PLAIN && cur->internal_kind == PS_INTERNAL_NUMMAP) {
+            size_t index = 0;
+            if (ps_array_string_to_index(name, &index)) {
+                PSValue out = ps_value_undefined();
+                if (ps_num_map_get((PSObject *)cur, index, &out)) {
+                    if (found) *found = 1;
+                    return out;
+                }
+            }
+        }
+        if (cur->kind == PS_OBJ_KIND_ARRAY) {
+            size_t index = 0;
+            if (ps_array_string_to_index(name, &index)) {
+                PSValue out = ps_value_undefined();
+                if (ps_array_get_index(cur, index, &out)) {
+                    if (found) *found = 1;
+                    return out;
+                }
+            }
+        }
         const PSProperty *p = find_prop_const(cur, name);
         if (p) {
             if (found) *found = 1;
@@ -186,6 +261,11 @@ PSValue ps_object_get(const PSObject *obj, const PSString *name, int *found) {
 int ps_object_define(PSObject *obj, PSString *name, PSValue value, uint8_t attrs) {
     if (!obj || !name) return 0;
 
+#if PS_ENABLE_PERF
+    PSVM *vm = ps_gc_active_vm();
+    if (vm) vm->perf.object_define++;
+#endif
+
     PSProperty *p = find_prop(obj, name);
     if (p) {
         /* Re-define semantics:
@@ -201,6 +281,26 @@ int ps_object_define(PSObject *obj, PSString *name, PSValue value, uint8_t attrs
         return 1;
     }
 
+    if (obj->kind == PS_OBJ_KIND_PLAIN &&
+        attrs == PS_ATTR_NONE &&
+        (obj->internal == NULL || obj->internal_kind == PS_INTERNAL_NUMMAP)) {
+        size_t index = 0;
+        if (ps_array_string_to_index(name, &index)) {
+            int is_new = 0;
+            if (!ps_num_map_set(obj, index, value, &is_new)) return 0;
+            if (is_new) obj->shape_id++;
+            return 1;
+        }
+    }
+
+    if (obj->kind == PS_OBJ_KIND_ARRAY && attrs == PS_ATTR_NONE) {
+        size_t index = 0;
+        if (ps_array_string_to_index(name, &index)) {
+            if (!ps_array_set_index(obj, index, value)) return 0;
+            return 1;
+        }
+    }
+
     p = (PSProperty *)calloc(1, sizeof(PSProperty));
     if (!p) return 0;
 
@@ -213,6 +313,7 @@ int ps_object_define(PSObject *obj, PSString *name, PSValue value, uint8_t attrs
     p->next = obj->props;
     obj->props = p;
     obj->prop_count++;
+    obj->shape_id++;
 
     if (!obj->buckets && obj->prop_count > 8) {
         ps_object_ensure_buckets(obj);
@@ -234,6 +335,11 @@ int ps_object_define(PSObject *obj, PSString *name, PSValue value, uint8_t attrs
 int ps_object_put(PSObject *obj, PSString *name, PSValue value) {
     if (!obj || !name) return 0;
 
+#if PS_ENABLE_PERF
+    PSVM *vm = ps_gc_active_vm();
+    if (vm) vm->perf.object_put++;
+#endif
+
     PSProperty *p = find_prop(obj, name);
     if (p) {
         if (p->attrs & PS_ATTR_READONLY) {
@@ -243,6 +349,24 @@ int ps_object_put(PSObject *obj, PSString *name, PSValue value) {
         obj->cache_name = p->name;
         obj->cache_prop = p;
         return 1;
+    }
+
+    if (obj->kind == PS_OBJ_KIND_PLAIN &&
+        (obj->internal == NULL || obj->internal_kind == PS_INTERNAL_NUMMAP)) {
+        size_t index = 0;
+        if (ps_array_string_to_index(name, &index)) {
+            int is_new = 0;
+            if (!ps_num_map_set(obj, index, value, &is_new)) return 0;
+            if (is_new) obj->shape_id++;
+            return 1;
+        }
+    }
+
+    if (obj->kind == PS_OBJ_KIND_ARRAY) {
+        size_t index = 0;
+        if (ps_array_string_to_index(name, &index)) {
+            return ps_array_set_index(obj, index, value);
+        }
     }
 
     /* Default attributes: enumerable, writable, deletable */
@@ -256,6 +380,36 @@ int ps_object_put(PSObject *obj, PSString *name, PSValue value) {
 int ps_object_delete(PSObject *obj, const PSString *name, int *deleted) {
     if (deleted) *deleted = 0;
     if (!obj || !name) return 0;
+
+#if PS_ENABLE_PERF
+    PSVM *vm = ps_gc_active_vm();
+    if (vm) vm->perf.object_delete++;
+#endif
+
+    if (obj->kind == PS_OBJ_KIND_PLAIN && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+        size_t index = 0;
+        if (ps_array_string_to_index(name, &index)) {
+            if (!find_prop(obj, name)) {
+                int did_delete = 0;
+                if (ps_num_map_delete(obj, index, &did_delete) && did_delete) {
+                    obj->shape_id++;
+                }
+                if (deleted) *deleted = did_delete ? 1 : 0;
+                return 1;
+            }
+        }
+    }
+
+    if (obj->kind == PS_OBJ_KIND_ARRAY) {
+        size_t index = 0;
+        if (ps_array_string_to_index(name, &index)) {
+            if (!find_prop(obj, name)) {
+                int did_delete = ps_array_delete_index(obj, index);
+                if (deleted) *deleted = did_delete ? 1 : 0;
+                return 1;
+            }
+        }
+    }
 
     PSProperty *prev = NULL;
     PSProperty *p = obj->props;
@@ -286,6 +440,7 @@ int ps_object_delete(PSObject *obj, const PSString *name, int *deleted) {
             if (obj->prop_count > 0) {
                 obj->prop_count--;
             }
+            obj->shape_id++;
 
             if (obj->cache_prop == p) {
                 obj->cache_prop = NULL;
@@ -310,8 +465,59 @@ int ps_object_delete(PSObject *obj, const PSString *name, int *deleted) {
 int ps_object_enum_own(const PSObject *obj, PSPropEnumCallback cb, void *user) {
     if (!obj || !cb) return 0;
 
+    if (obj->kind == PS_OBJ_KIND_PLAIN && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+        const PSNumMap *map = (const PSNumMap *)obj->internal;
+        PSVM *vm = ps_gc_active_vm();
+        if (map && map->capacity > 0) {
+            for (size_t i = 0; i < map->capacity; i++) {
+                if (!map->present[i]) continue;
+                PSString *name = ps_array_index_string(vm, i);
+                int rc = cb(name, map->items[i], PS_ATTR_NONE, user);
+                if (rc != 0) return rc;
+            }
+        }
+        if (map && map->hash_state && map->hash_cap > 0) {
+            char buf[32];
+            for (size_t i = 0; i < map->hash_cap; i++) {
+                if (map->hash_state[i] != 1) continue;
+                uint32_t key = map->hash_keys[i];
+                if (key <= PS_NUM_MAP_MAX_INDEX) {
+                    PSString *name = ps_array_index_string(vm, key);
+                    int rc = cb(name, map->hash_values[i], PS_ATTR_NONE, user);
+                    if (rc != 0) return rc;
+                    continue;
+                }
+                snprintf(buf, sizeof(buf), "%u", key);
+                PSString *name = ps_string_from_cstr(buf);
+                int rc = cb(name, map->hash_values[i], PS_ATTR_NONE, user);
+                if (rc != 0) return rc;
+            }
+        }
+    }
+
+    if (obj->kind == PS_OBJ_KIND_ARRAY && obj->internal) {
+        const PSArray *arr = (const PSArray *)obj->internal;
+        PSVM *vm = ps_gc_active_vm();
+        size_t limit = arr->capacity < arr->length ? arr->capacity : arr->length;
+        for (size_t i = 0; i < limit; i++) {
+            if (!arr->present[i]) continue;
+            PSString *name = ps_array_index_string(vm, i);
+            int rc = cb(name, arr->items[i], PS_ATTR_NONE, user);
+            if (rc != 0) return rc;
+        }
+    }
+
     for (const PSProperty *p = obj->props; p; p = p->next) {
         if (p->attrs & PS_ATTR_DONTENUM) continue;
+        if (obj->kind == PS_OBJ_KIND_ARRAY && obj->internal) {
+            size_t index = 0;
+            if (ps_array_string_to_index(p->name, &index)) {
+                PSValue out = ps_value_undefined();
+                if (ps_array_get_index(obj, index, &out)) {
+                    continue;
+                }
+            }
+        }
 
         int rc = cb(p->name, p->value, p->attrs, user);
         if (rc != 0) return rc; /* abort requested by callback */

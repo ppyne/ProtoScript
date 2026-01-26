@@ -297,19 +297,29 @@ Object: `Buffer`
 - `Buffer.size(buffer)`
 - `Buffer.slice(buffer, offset, length)`
 - `buffer.length` (bytes)
+- Indexed writes (`buffer[i] = value`) convert via `ToNumber`, round (`floor(x + 0.5)`), then clamp to `0–255` (NaN/Infinity -> 0, values in `(0, 1)` -> 0).
 
-### 7.5 Event
+### 7.5 Buffer32
+Object: `Buffer32`
+- `Buffer32.alloc(length)`
+- `Buffer32.size(buffer32)`
+- `Buffer32.byteLength(buffer32)`
+- `Buffer32.view(buffer, offset?, length?)`
+- `buffer32.length` (uint32 elements)
+- Indexed writes (`buffer32[i] = value`) convert via `ToNumber`, round (`floor(x + 0.5)`), then clamp to `0–4294967295` (NaN/Infinity -> 0, values in `(0, 1)` -> 0).
+
+### 7.6 Event
 Object: `Event`
 - `Event.next()`
 
-### 7.6 Image (optional)
+### 7.7 Image (optional)
 Object: `Image` (requires `PS_ENABLE_MODULE_IMG=1`)
 - `Image.detectFormat(buffer)`
 - `Image.decodePNG(buffer)`
 - `Image.decodeJPEG(buffer)`
 - `Image.resample(image, newWidth, newHeight, mode)`
 
-### 7.7 Display (optional)
+### 7.8 Display (optional)
 Object: `Display` (requires `PS_ENABLE_MODULE_DISPLAY=1`)
 - `Display.open(width, height, title, options)`
 - `Display.close()`

@@ -2,6 +2,7 @@
 #define PS_AST_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include "ps_value.h"
 #include "ps_string.h"
 
@@ -51,11 +52,17 @@ typedef enum {
     AST_OBJECT_LITERAL
 } PSAstKind;
 
+#define PS_AST_KIND_COUNT (AST_OBJECT_LITERAL + 1)
+
 /* --------------------------------------------------------- */
 /* Forward declarations                                      */
 /* --------------------------------------------------------- */
 
 typedef struct PSAstNode PSAstNode;
+struct PSObject;
+struct PSProperty;
+struct PSEnv;
+struct PSExprBC;
 
 /* --------------------------------------------------------- */
 /* AST node definition                                       */
@@ -66,6 +73,8 @@ struct PSAstNode {
     size_t line;
     size_t column;
     const char *source_path;
+    struct PSExprBC *expr_bc;
+    uint8_t expr_bc_state;
 
     union {
         /* Program / Block */
@@ -206,6 +215,14 @@ struct PSAstNode {
             const char *name;
             size_t      length;
             PSString   *str;
+            struct PSEnv *cache_fast_env;
+            size_t        cache_fast_index;
+            struct PSEnv *cache_env;
+            struct PSObject *cache_record;
+            struct PSProperty *cache_prop;
+            uint32_t      cache_shape;
+            uint8_t       fast_num_kind;
+            uint32_t      fast_num_index;
         } identifier;
 
         /* literal (number, string, boolean, null, undefined) */
@@ -252,6 +269,17 @@ struct PSAstNode {
             PSAstNode  *callee;
             PSAstNode **args;
             size_t      argc;
+            uint8_t     fast_num_math_id;
+            uint8_t     cache_kind;
+            struct PSEnv *cache_env;
+            struct PSEnv *cache_fast_env;
+            size_t      cache_fast_index;
+            struct PSObject *cache_record;
+            struct PSProperty *cache_prop;
+            uint32_t    cache_shape;
+            struct PSObject *cache_obj;
+            struct PSProperty *cache_member_prop;
+            uint32_t    cache_member_shape;
         } call;
 
         /* member access: obj.prop */
@@ -259,6 +287,9 @@ struct PSAstNode {
             PSAstNode *object;
             PSAstNode *property;
             int        computed;
+            struct PSObject *cache_obj;
+            struct PSProperty *cache_prop;
+            uint32_t   cache_shape;
         } member;
 
         /* new callee(args) */

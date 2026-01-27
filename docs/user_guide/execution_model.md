@@ -67,7 +67,8 @@ Top-level `var` and function declarations are hoisted, so they are visible
 throughout the script even before the declaration is reached (with the usual
 JavaScript 1.x initialization rules).
 
-ProtoScript also exposes a global `ProtoScript` object with runtime metadata:
+ProtoScript also exposes a global `ProtoScript` object with runtime metadata and
+compile-time helpers:
 
 - `ProtoScript.args`: readonly array of command-line arguments (`argv`)
 - `ProtoScript.version`: `"v1.0.0 ECMAScript 262 (ES1)"`
@@ -75,6 +76,7 @@ ProtoScript also exposes a global `ProtoScript` object with runtime metadata:
 - `ProtoScript.sleep(seconds)`: sleep in seconds (integer)
 - `ProtoScript.usleep(microseconds)`: sleep in microseconds (integer)
 - `ProtoScript.perfStats()`: returns a snapshot of runtime counters
+- `ProtoScript.include(path)`: static source inclusion (parse-time, top-level only)
 
 Example:
 
@@ -85,6 +87,7 @@ Io.print(ProtoScript.args.length + "\n");
 // ProtoScript.sleep(1);
 // ProtoScript.usleep(500000);
 // ProtoScript.perfStats();
+// ProtoScript.include("path/to/file.js");
 ```
 
 ---

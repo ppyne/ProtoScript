@@ -33,6 +33,7 @@ PSEnv *ps_env_new(PSEnv *parent, PSObject *record, int owns_record) {
     env->param_names = NULL;
     env->param_count = 0;
     env->param_names_owned = 0;
+    env->is_with = 0;
     return env;
 }
 
@@ -80,7 +81,20 @@ PSEnv *ps_env_root(PSEnv *env) {
 }
 
 int ps_env_define(PSEnv *env, PSString *name, PSValue value) {
-    if (!env || !env->record) return 0;
+    if (!env || !name) return 0;
+    int fast_found = 0;
+    if (env->fast_names && env->fast_values) {
+        for (size_t i = 0; i < env->fast_count; i++) {
+            if (env->fast_names[i] && ps_string_equals(env->fast_names[i], name)) {
+                env->fast_values[i] = value;
+                fast_found = 1;
+                break;
+            }
+        }
+    }
+    if (!env->record) {
+        return fast_found;
+    }
     return ps_object_define(env->record, name, value, PS_ATTR_NONE);
 }
 
@@ -95,6 +109,18 @@ int ps_env_set(PSEnv *env, PSString *name, PSValue value) {
                     if (cur->record) {
                         (void)ps_object_put(cur->record, name, value);
                     }
+#if PS_ENABLE_ARGUMENTS_ALIASING
+                    if (cur->arguments_obj && cur->param_names) {
+                        for (size_t j = 0; j < cur->param_count; j++) {
+                            if (ps_string_equals(cur->param_names[j], name)) {
+                                char buf[32];
+                                snprintf(buf, sizeof(buf), "%zu", j);
+                                ps_object_put(cur->arguments_obj, ps_string_from_cstr(buf), value);
+                                break;
+                            }
+                        }
+                    }
+#endif
                     return 1;
                 }
             }
@@ -211,8 +237,17 @@ int ps_env_update_arguments(PSEnv *env, PSObject *args_obj, PSString *prop, PSVa
         PSString *name = cur->param_names[index];
         if (!name) return 0;
         (void)ps_object_put(cur->record, name, value);
-        if (cur->fast_values && index < cur->fast_count) {
-            cur->fast_values[index] = value;
+        if (cur->fast_values) {
+            if (cur->fast_names) {
+                for (size_t i = 0; i < cur->fast_count; i++) {
+                    if (cur->fast_names[i] && ps_string_equals(cur->fast_names[i], name)) {
+                        cur->fast_values[i] = value;
+                        break;
+                    }
+                }
+            } else if (index < cur->fast_count) {
+                cur->fast_values[index] = value;
+            }
         }
         return 1;
     }

@@ -9,6 +9,13 @@ else
 endif
 LDLIBS ?=
 PS_ENABLE_MODULE_DISPLAY ?= 1
+PS_ENABLE_PERF ?= 0
+PS_DISABLE_PEEPHOLE ?= 0
+PS_DISABLE_CF_FUSIONS ?= 0
+PS_DISABLE_PROP_IC ?= 1
+PS_DISABLE_SPECIALIZATION ?= 1
+PS_DISABLE_UNBOXED_SPEC ?= 1
+PS_HOT_THRESHOLD ?= 200
 export PATH := /opt/local/bin:$(PATH)
 PS_ENABLE_MODULE_IMG ?= $(strip $(shell awk '$$2=="PS_ENABLE_MODULE_IMG" {print $$3; found=1} END{if(!found) print 0}' include/ps_config.h))
 
@@ -31,6 +38,13 @@ endif
 
 CFLAGS += -DPS_ENABLE_MODULE_DISPLAY=$(PS_ENABLE_MODULE_DISPLAY)
 CFLAGS += -DPS_ENABLE_MODULE_IMG=$(PS_ENABLE_MODULE_IMG)
+CFLAGS += -DPS_ENABLE_PERF=$(PS_ENABLE_PERF)
+CFLAGS += -DPS_DISABLE_PEEPHOLE=$(PS_DISABLE_PEEPHOLE)
+CFLAGS += -DPS_DISABLE_CF_FUSIONS=$(PS_DISABLE_CF_FUSIONS)
+CFLAGS += -DPS_DISABLE_PROP_IC=$(PS_DISABLE_PROP_IC)
+CFLAGS += -DPS_DISABLE_SPECIALIZATION=$(PS_DISABLE_SPECIALIZATION)
+CFLAGS += -DPS_DISABLE_UNBOXED_SPEC=$(PS_DISABLE_UNBOXED_SPEC)
+CFLAGS += -DPS_HOT_THRESHOLD=$(PS_HOT_THRESHOLD)
 ifeq ($(PS_ENABLE_MODULE_DISPLAY),1)
   ifeq ($(strip $(SDL_CFLAGS)),)
     $(error SDL2 not found. Build submodule: \
@@ -88,6 +102,9 @@ $(BIN): $(OBJ)
 test: $(BIN)
 	./tests/run-tests.sh
 
+test262: $(BIN)
+	./test262/test262.sh
+
 web: $(WEB_OUT)
 
 $(WEB_OUT): $(WEB_SRCS)
@@ -108,4 +125,4 @@ image-deps:
 clean:
 	rm -f $(OBJ) $(BIN)
 
-.PHONY: all test clean web web-clean image-deps
+.PHONY: all test test262 clean web web-clean image-deps

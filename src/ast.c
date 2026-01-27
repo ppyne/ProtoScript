@@ -1,4 +1,5 @@
 #include "ps_ast.h"
+#include "ps_expr_bc.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -11,6 +12,8 @@ static PSAstNode *alloc_node(PSAstKind kind) {
     PSAstNode *n = (PSAstNode *)calloc(1, sizeof(PSAstNode));
     if (!n) return NULL;
     n->kind = kind;
+    n->expr_bc = NULL;
+    n->expr_bc_state = 0;
     return n;
 }
 
@@ -206,6 +209,14 @@ PSAstNode *ps_ast_identifier(const char *name, size_t length) {
     n->as.identifier.name = copy;
     n->as.identifier.length = length;
     n->as.identifier.str = ps_string_from_utf8(copy, length);
+    n->as.identifier.cache_fast_env = NULL;
+    n->as.identifier.cache_fast_index = 0;
+    n->as.identifier.cache_env = NULL;
+    n->as.identifier.cache_record = NULL;
+    n->as.identifier.cache_prop = NULL;
+    n->as.identifier.cache_shape = 0;
+    n->as.identifier.fast_num_kind = 0;
+    n->as.identifier.fast_num_index = 0;
     return n;
 }
 
@@ -263,6 +274,7 @@ PSAstNode *ps_ast_call(PSAstNode *callee, PSAstNode **args, size_t argc) {
     n->as.call.callee = callee;
     n->as.call.args = args;
     n->as.call.argc = argc;
+    n->as.call.fast_num_math_id = 0;
     return n;
 }
 
@@ -302,6 +314,12 @@ PSAstNode *ps_ast_object_literal(PSAstProperty *props, size_t count) {
 
 void ps_ast_free(PSAstNode *node) {
     if (!node) return;
+
+    if (node->expr_bc) {
+        ps_expr_bc_free(node->expr_bc);
+        node->expr_bc = NULL;
+        node->expr_bc_state = 0;
+    }
 
     switch (node->kind) {
         case AST_PROGRAM:

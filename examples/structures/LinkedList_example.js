@@ -1,5 +1,4 @@
-include "LinkedList.js";
-
+ProtoScript.include("LinkedList.js");
 var list = new LinkedList();
 list.push("a");
 list.push("b");

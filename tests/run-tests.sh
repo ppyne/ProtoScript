@@ -227,6 +227,8 @@ run_case 169-object-proto 0
 run_case 170-perf-stats 0
 run_case 171-error-stack 0
 run_case 172-error-cause-code 0
+run_case 173-buffer32-basic 0
+run_case 174-fast-env-gc 0
 
 display_enabled=$(awk '/^#define PS_ENABLE_MODULE_DISPLAY/ {print $3}' include/ps_config.h)
 if [ "${display_enabled:-0}" -eq 1 ]; then

@@ -3,9 +3,17 @@
 
 /* Compile-time feature flags (0 = disabled, 1 = enabled) */
 
-#define PS_ENABLE_WITH 0
-#define PS_ENABLE_EVAL 0
-#define PS_ENABLE_ARGUMENTS_ALIASING 0
+#ifndef PS_ENABLE_WITH
+#define PS_ENABLE_WITH 1
+#endif
+
+#ifndef PS_ENABLE_EVAL
+#define PS_ENABLE_EVAL 1
+#endif
+
+#ifndef PS_ENABLE_ARGUMENTS_ALIASING
+#define PS_ENABLE_ARGUMENTS_ALIASING 1
+#endif
 
 #ifndef PS_ENABLE_UNICODE_IDENTIFIERS
 #define PS_ENABLE_UNICODE_IDENTIFIERS 1
@@ -15,7 +23,45 @@
 #define PS_ENABLE_FAST_CALLS 1
 #endif
 
+#ifndef PS_ENABLE_PERF
 #define PS_ENABLE_PERF 1
+#endif
+
+#ifndef PS_DISABLE_PEEPHOLE
+#define PS_DISABLE_PEEPHOLE 0
+#endif
+
+#ifndef PS_DISABLE_CF_FUSIONS
+#define PS_DISABLE_CF_FUSIONS 0
+#endif
+
+#ifndef PS_DISABLE_PROP_IC
+#define PS_DISABLE_PROP_IC 1
+#endif
+
+#ifndef PS_DISABLE_SPECIALIZATION
+#define PS_DISABLE_SPECIALIZATION 1
+#endif
+
+#ifndef PS_DISABLE_UNBOXED_SPEC
+#define PS_DISABLE_UNBOXED_SPEC 1
+#endif
+
+#ifndef PS_ENABLE_EXPR_BC
+#define PS_ENABLE_EXPR_BC 0
+#endif
+
+#ifndef PS_SPECIALIZATION_SLOT_MAX
+#define PS_SPECIALIZATION_SLOT_MAX 32
+#endif
+
+#ifndef PS_HOT_THRESHOLD
+#define PS_HOT_THRESHOLD 200
+#endif
+
+#ifndef PS_SPECIALIZATION_GUARD_MAX
+#define PS_SPECIALIZATION_GUARD_MAX 4
+#endif
 
 #ifndef PS_ENABLE_MODULE_DISPLAY
 #define PS_ENABLE_MODULE_DISPLAY 1

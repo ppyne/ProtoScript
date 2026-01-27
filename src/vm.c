@@ -1,5 +1,6 @@
 #include "ps_vm.h"
 #include "ps_object.h"
+#include "ps_array.h"
 #include "ps_value.h"
 #include "ps_string.h"
 #include "ps_env.h"
@@ -14,10 +15,13 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
+#include <float.h>
 #include <string.h>
 #include <ctype.h>
 #include <stdint.h>
 #include <time.h>
+
+static void ps_vm_profile_dump(PSVM *vm);
 
 /* Forward declaration (implemented in io.c) */
 void ps_io_init(PSVM *vm);
@@ -38,6 +42,12 @@ static size_t ps_utf8_encode(uint32_t code, char *out);
 static PSValue ps_native_is_finite(PSVM *vm, PSValue this_val, int argc, PSValue *argv);
 static PSValue ps_native_is_nan(PSVM *vm, PSValue this_val, int argc, PSValue *argv);
 static PSValue ps_native_parse_int(PSVM *vm, PSValue this_val, int argc, PSValue *argv);
+
+static uint64_t ps_vm_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
+}
 static PSValue ps_native_parse_float(PSVM *vm, PSValue this_val, int argc, PSValue *argv);
 static PSValue ps_native_escape(PSVM *vm, PSValue this_val, int argc, PSValue *argv);
 static PSValue ps_native_unescape(PSVM *vm, PSValue this_val, int argc, PSValue *argv);
@@ -762,7 +772,8 @@ static PSValue ps_native_parse_int(PSVM *vm, PSValue this_val, int argc, PSValue
 
 static PSValue ps_native_escape(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
     (void)this_val;
-    PSString *s = (argc > 0) ? ps_to_string(vm, argv[0]) : ps_string_from_cstr("");
+    PSValue arg = (argc > 0 && argv) ? argv[0] : ps_value_undefined();
+    PSString *s = ps_to_string(vm, arg);
     if (!s || s->glyph_count == 0) {
         return ps_value_string(ps_string_from_cstr(""));
     }
@@ -839,7 +850,8 @@ static PSValue ps_native_escape(PSVM *vm, PSValue this_val, int argc, PSValue *a
 
 static PSValue ps_native_unescape(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
     (void)this_val;
-    PSString *s = (argc > 0) ? ps_to_string(vm, argv[0]) : ps_string_from_cstr("");
+    PSValue arg = (argc > 0 && argv) ? argv[0] : ps_value_undefined();
+    PSString *s = ps_to_string(vm, arg);
     if (!s || s->byte_len == 0) {
         return ps_value_string(ps_string_from_cstr(""));
     }
@@ -929,6 +941,7 @@ static PSValue ps_native_array(PSVM *vm, PSValue this_val, int argc, PSValue *ar
     PSObject *obj = ps_object_new(vm->array_proto ? vm->array_proto : vm->object_proto);
     if (!obj) return ps_value_undefined();
     obj->kind = PS_OBJ_KIND_ARRAY;
+    (void)ps_array_init(obj);
     if (argc == 1 &&
         (argv[0].type == PS_T_NUMBER ||
          (argv[0].type == PS_T_OBJECT && argv[0].as.object &&
@@ -941,22 +954,14 @@ static PSValue ps_native_array(PSVM *vm, PSValue this_val, int argc, PSValue *ar
             ps_vm_throw_range_error(vm, msg);
             return ps_value_undefined();
         }
-        ps_object_define(obj,
-                         ps_string_from_cstr("length"),
-                         ps_value_number(num),
-                         PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
+        (void)ps_array_set_length_internal(obj, (size_t)num);
         return ps_value_object(obj);
     }
 
     for (int i = 0; i < argc; i++) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%d", i);
-        ps_object_define(obj, ps_string_from_cstr(buf), argv[i], PS_ATTR_NONE);
+        (void)ps_array_set_index(obj, (size_t)i, argv[i]);
     }
-    ps_object_define(obj,
-                     ps_string_from_cstr("length"),
-                     ps_value_number((double)argc),
-                     PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
+    (void)ps_array_set_length_internal(obj, (size_t)argc);
     return ps_value_object(obj);
 }
 
@@ -3170,6 +3175,10 @@ static PSValue ps_native_string_slice(PSVM *vm, PSValue this_val, int argc, PSVa
 
 static size_t ps_object_length(PSObject *obj) {
     if (!obj) return 0;
+    if (obj->kind == PS_OBJ_KIND_ARRAY) {
+        PSArray *arr = ps_array_from_object(obj);
+        if (arr) return arr->length;
+    }
     int found = 0;
     PSValue len_val = ps_object_get(obj, ps_string_from_cstr("length"), &found);
     if (!found) return 0;
@@ -3180,6 +3189,13 @@ static size_t ps_object_length(PSObject *obj) {
 
 static int ps_object_has_length(PSObject *obj, size_t *out_len) {
     if (!obj) return 0;
+    if (obj->kind == PS_OBJ_KIND_ARRAY) {
+        PSArray *arr = ps_array_from_object(obj);
+        if (arr) {
+            if (out_len) *out_len = arr->length;
+            return 1;
+        }
+    }
     int found = 0;
     PSValue len_val = ps_object_get(obj, ps_string_from_cstr("length"), &found);
     if (!found) return 0;
@@ -3191,6 +3207,10 @@ static int ps_object_has_length(PSObject *obj, size_t *out_len) {
 
 static void ps_object_set_length(PSObject *obj, size_t len) {
     if (!obj) return;
+    if (obj->kind == PS_OBJ_KIND_ARRAY) {
+        (void)ps_array_set_length_internal(obj, len);
+        return;
+    }
     int found = 0;
     (void)ps_object_get_own(obj, ps_string_from_cstr("length"), &found);
     if (found) {
@@ -3205,19 +3225,37 @@ static void ps_object_set_length(PSObject *obj, size_t len) {
                      PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
 }
 
-static PSString *ps_string_from_index_cached(PSVM *vm, size_t index) {
-    if (vm && vm->index_cache && index < vm->index_cache_size) {
-        PSString *cached = vm->index_cache[index];
-        if (cached) return cached;
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%zu", index);
-        cached = ps_string_from_cstr(buf);
-        vm->index_cache[index] = cached;
-        return cached;
+static int ps_array_get_index_value(PSVM *vm, PSObject *obj, size_t index, PSValue *out) {
+    if (!obj) return 0;
+    if (obj->kind == PS_OBJ_KIND_ARRAY) {
+        if (ps_array_get_index(obj, index, out)) return 1;
+        int found = 0;
+        PSValue val = ps_object_get(obj, ps_array_index_string(vm, index), &found);
+        if (found && out) *out = val;
+        return found;
     }
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%zu", index);
-    return ps_string_from_cstr(buf);
+    int found = 0;
+    PSValue val = ps_object_get(obj, ps_array_index_string(vm, index), &found);
+    if (found && out) *out = val;
+    return found;
+}
+
+static void ps_array_set_index_value(PSVM *vm, PSObject *obj, size_t index, PSValue value) {
+    if (!obj) return;
+    if (obj->kind == PS_OBJ_KIND_ARRAY) {
+        (void)ps_array_set_index(obj, index, value);
+        return;
+    }
+    ps_object_put(obj, ps_array_index_string(vm, index), value);
+}
+
+static void ps_array_delete_index_value(PSVM *vm, PSObject *obj, size_t index) {
+    if (!obj) return;
+    if (obj->kind == PS_OBJ_KIND_ARRAY) {
+        if (ps_array_delete_index(obj, index)) return;
+    }
+    int deleted = 0;
+    (void)ps_object_delete(obj, ps_array_index_string(vm, index), &deleted);
 }
 
 static PSValue ps_native_array_join(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
@@ -3229,7 +3267,7 @@ static PSValue ps_native_array_join(PSVM *vm, PSValue this_val, int argc, PSValu
         return ps_value_string(ps_string_from_cstr(""));
     }
     PSString *sep = ps_string_from_cstr(",");
-    if (argc > 0) {
+    if (argc > 0 && argv && argv[0].type != PS_T_UNDEFINED) {
         sep = ps_to_string(vm, argv[0]);
     }
     size_t len = ps_object_length(this_val.as.object);
@@ -3244,10 +3282,8 @@ static PSValue ps_native_array_join(PSVM *vm, PSValue this_val, int argc, PSValu
 
     size_t total_len = (len > 0) ? (sep->byte_len * (len - 1)) : 0;
     for (size_t i = 0; i < len; i++) {
-        int found = 0;
-        PSValue elem = ps_object_get(this_val.as.object,
-                                     ps_string_from_index_cached(vm, i),
-                                     &found);
+        PSValue elem = ps_value_undefined();
+        int found = ps_array_get_index_value(vm, this_val.as.object, i, &elem);
         if (!found || elem.type == PS_T_UNDEFINED || elem.type == PS_T_NULL) {
             elems[i] = NULL;
             continue;
@@ -3299,7 +3335,6 @@ static PSValue ps_native_array_to_string(PSVM *vm, PSValue this_val, int argc, P
 }
 
 static PSValue ps_native_array_push(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
-    (void)vm;
     if (this_val.type == PS_T_NULL || this_val.type == PS_T_UNDEFINED) {
         ps_vm_throw_type_error(vm, "Invalid receiver");
         return ps_value_undefined();
@@ -3310,9 +3345,7 @@ static PSValue ps_native_array_push(PSVM *vm, PSValue this_val, int argc, PSValu
     PSObject *obj = this_val.as.object;
     size_t len = ps_object_length(obj);
     for (int i = 0; i < argc; i++) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%zu", len + (size_t)i);
-        ps_object_put(obj, ps_string_from_cstr(buf), argv[i]);
+        ps_array_set_index_value(vm, obj, len + (size_t)i, argv[i]);
     }
     len += (size_t)argc;
     ps_object_set_length(obj, len);
@@ -3320,7 +3353,6 @@ static PSValue ps_native_array_push(PSVM *vm, PSValue this_val, int argc, PSValu
 }
 
 static PSValue ps_native_array_pop(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
-    (void)vm;
     (void)argc;
     (void)argv;
     if (this_val.type == PS_T_NULL || this_val.type == PS_T_UNDEFINED) {
@@ -3336,18 +3368,14 @@ static PSValue ps_native_array_pop(PSVM *vm, PSValue this_val, int argc, PSValue
         return ps_value_undefined();
     }
     size_t idx = len - 1;
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%zu", idx);
-    int found = 0;
-    PSValue elem = ps_object_get(obj, ps_string_from_cstr(buf), &found);
-    int deleted = 0;
-    ps_object_delete(obj, ps_string_from_cstr(buf), &deleted);
+    PSValue elem = ps_value_undefined();
+    int found = ps_array_get_index_value(vm, obj, idx, &elem);
+    ps_array_delete_index_value(vm, obj, idx);
     ps_object_set_length(obj, idx);
     return found ? elem : ps_value_undefined();
 }
 
 static PSValue ps_native_array_shift(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
-    (void)vm;
     (void)argc;
     (void)argv;
     if (this_val.type == PS_T_NULL || this_val.type == PS_T_UNDEFINED) {
@@ -3362,32 +3390,23 @@ static PSValue ps_native_array_shift(PSVM *vm, PSValue this_val, int argc, PSVal
     if (len == 0) {
         return ps_value_undefined();
     }
-    int found = 0;
-    PSValue first = ps_object_get(obj, ps_string_from_cstr("0"), &found);
+    PSValue first = ps_value_undefined();
+    int found = ps_array_get_index_value(vm, obj, 0, &first);
     for (size_t i = 1; i < len; i++) {
-        char from_buf[32];
-        char to_buf[32];
-        snprintf(from_buf, sizeof(from_buf), "%zu", i);
-        snprintf(to_buf, sizeof(to_buf), "%zu", i - 1);
-        int got = 0;
-        PSValue val = ps_object_get(obj, ps_string_from_cstr(from_buf), &got);
+        PSValue val = ps_value_undefined();
+        int got = ps_array_get_index_value(vm, obj, i, &val);
         if (got) {
-            ps_object_put(obj, ps_string_from_cstr(to_buf), val);
+            ps_array_set_index_value(vm, obj, i - 1, val);
         } else {
-            int deleted = 0;
-            ps_object_delete(obj, ps_string_from_cstr(to_buf), &deleted);
+            ps_array_delete_index_value(vm, obj, i - 1);
         }
     }
-    int deleted = 0;
-    char last_buf[32];
-    snprintf(last_buf, sizeof(last_buf), "%zu", len - 1);
-    ps_object_delete(obj, ps_string_from_cstr(last_buf), &deleted);
+    ps_array_delete_index_value(vm, obj, len - 1);
     ps_object_set_length(obj, len - 1);
     return found ? first : ps_value_undefined();
 }
 
 static PSValue ps_native_array_unshift(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
-    (void)vm;
     if (this_val.type == PS_T_NULL || this_val.type == PS_T_UNDEFINED) {
         ps_vm_throw_type_error(vm, "Invalid receiver");
         return ps_value_undefined();
@@ -3398,23 +3417,16 @@ static PSValue ps_native_array_unshift(PSVM *vm, PSValue this_val, int argc, PSV
     PSObject *obj = this_val.as.object;
     size_t len = ps_object_length(obj);
     for (size_t i = len; i > 0; i--) {
-        char from_buf[32];
-        char to_buf[32];
-        snprintf(from_buf, sizeof(from_buf), "%zu", i - 1);
-        snprintf(to_buf, sizeof(to_buf), "%zu", i - 1 + (size_t)argc);
-        int got = 0;
-        PSValue val = ps_object_get(obj, ps_string_from_cstr(from_buf), &got);
+        PSValue val = ps_value_undefined();
+        int got = ps_array_get_index_value(vm, obj, i - 1, &val);
         if (got) {
-            ps_object_put(obj, ps_string_from_cstr(to_buf), val);
+            ps_array_set_index_value(vm, obj, i - 1 + (size_t)argc, val);
         } else {
-            int deleted = 0;
-            ps_object_delete(obj, ps_string_from_cstr(to_buf), &deleted);
+            ps_array_delete_index_value(vm, obj, i - 1 + (size_t)argc);
         }
     }
     for (int i = 0; i < argc; i++) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%d", i);
-        ps_object_put(obj, ps_string_from_cstr(buf), argv[i]);
+        ps_array_set_index_value(vm, obj, (size_t)i, argv[i]);
     }
     size_t new_len = len + (size_t)argc;
     ps_object_set_length(obj, new_len);
@@ -3422,7 +3434,6 @@ static PSValue ps_native_array_unshift(PSVM *vm, PSValue this_val, int argc, PSV
 }
 
 static PSValue ps_native_array_slice(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
-    (void)vm;
     if (this_val.type == PS_T_NULL || this_val.type == PS_T_UNDEFINED) {
         ps_vm_throw_type_error(vm, "Invalid receiver");
         return ps_value_undefined();
@@ -3432,10 +3443,19 @@ static PSValue ps_native_array_slice(PSVM *vm, PSValue this_val, int argc, PSVal
     }
     PSObject *obj = this_val.as.object;
     size_t len = ps_object_length(obj);
-    double start_num = (argc > 0) ? ps_to_number(vm, argv[0]) : 0.0;
-    double end_num = (argc > 1) ? ps_to_number(vm, argv[1]) : (double)len;
+    double start_num = 0.0;
+    if (argc > 0 && argv) {
+        start_num = ps_to_number(vm, argv[0]);
+        if (argv[0].type == PS_T_UNDEFINED) start_num = 0.0;
+    }
+    double end_num = (double)len;
+    if (argc > 1 && argv) {
+        if (argv[1].type != PS_T_UNDEFINED) {
+            end_num = ps_to_number(vm, argv[1]);
+        }
+    }
     if (isnan(start_num)) start_num = 0.0;
-    if (isnan(end_num)) end_num = (double)len;
+    if (isnan(end_num)) end_num = 0.0;
     if (start_num < 0.0) start_num = (double)len + start_num;
     if (end_num < 0.0) end_num = (double)len + end_num;
     if (start_num < 0.0) start_num = 0.0;
@@ -3449,16 +3469,13 @@ static PSValue ps_native_array_slice(PSVM *vm, PSValue this_val, int argc, PSVal
     PSObject *out = ps_object_new(vm->array_proto ? vm->array_proto : vm->object_proto);
     if (!out) return ps_value_undefined();
     out->kind = PS_OBJ_KIND_ARRAY;
+    (void)ps_array_init(out);
     size_t out_index = 0;
     for (size_t i = start; i < end; i++) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%zu", i);
-        int got = 0;
-        PSValue val = ps_object_get(obj, ps_string_from_cstr(buf), &got);
+        PSValue val = ps_value_undefined();
+        int got = ps_array_get_index_value(vm, obj, i, &val);
         if (got) {
-            char out_buf[32];
-            snprintf(out_buf, sizeof(out_buf), "%zu", out_index++);
-            ps_object_put(out, ps_string_from_cstr(out_buf), val);
+            (void)ps_array_set_index(out, out_index++, val);
         }
     }
     ps_object_set_length(out, out_index);
@@ -3476,18 +3493,15 @@ static PSValue ps_native_array_concat(PSVM *vm, PSValue this_val, int argc, PSVa
     PSObject *out = ps_object_new(vm->array_proto ? vm->array_proto : vm->object_proto);
     if (!out) return ps_value_undefined();
     out->kind = PS_OBJ_KIND_ARRAY;
+    (void)ps_array_init(out);
 
     size_t out_index = 0;
     size_t len = ps_object_length(this_val.as.object);
     for (size_t i = 0; i < len; i++) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%zu", i);
-        int got = 0;
-        PSValue val = ps_object_get(this_val.as.object, ps_string_from_cstr(buf), &got);
+        PSValue val = ps_value_undefined();
+        int got = ps_array_get_index_value(vm, this_val.as.object, i, &val);
         if (got) {
-            char out_buf[32];
-            snprintf(out_buf, sizeof(out_buf), "%zu", out_index);
-            ps_object_put(out, ps_string_from_cstr(out_buf), val);
+            (void)ps_array_set_index(out, out_index, val);
         }
         out_index++;
     }
@@ -3497,23 +3511,17 @@ static PSValue ps_native_array_concat(PSVM *vm, PSValue this_val, int argc, PSVa
             size_t alen = 0;
             if (ps_object_has_length(argv[i].as.object, &alen)) {
                 for (size_t j = 0; j < alen; j++) {
-                    char buf[32];
-                    snprintf(buf, sizeof(buf), "%zu", j);
-                    int got = 0;
-                    PSValue val = ps_object_get(argv[i].as.object, ps_string_from_cstr(buf), &got);
+                    PSValue val = ps_value_undefined();
+                    int got = ps_array_get_index_value(vm, argv[i].as.object, j, &val);
                     if (got) {
-                        char out_buf[32];
-                        snprintf(out_buf, sizeof(out_buf), "%zu", out_index);
-                        ps_object_put(out, ps_string_from_cstr(out_buf), val);
+                        (void)ps_array_set_index(out, out_index, val);
                     }
                     out_index++;
                 }
                 continue;
             }
         }
-        char out_buf[32];
-        snprintf(out_buf, sizeof(out_buf), "%zu", out_index++);
-        ps_object_put(out, ps_string_from_cstr(out_buf), argv[i]);
+        (void)ps_array_set_index(out, out_index++, argv[i]);
     }
 
     ps_object_set_length(out, out_index);
@@ -3534,25 +3542,19 @@ static PSValue ps_native_array_reverse(PSVM *vm, PSValue this_val, int argc, PSV
     size_t len = ps_object_length(obj);
     for (size_t i = 0; i < len / 2; i++) {
         size_t j = len - 1 - i;
-        char a_buf[32];
-        char b_buf[32];
-        snprintf(a_buf, sizeof(a_buf), "%zu", i);
-        snprintf(b_buf, sizeof(b_buf), "%zu", j);
-        int got_a = 0;
-        int got_b = 0;
-        PSValue a_val = ps_object_get(obj, ps_string_from_cstr(a_buf), &got_a);
-        PSValue b_val = ps_object_get(obj, ps_string_from_cstr(b_buf), &got_b);
+        PSValue a_val = ps_value_undefined();
+        PSValue b_val = ps_value_undefined();
+        int got_a = ps_array_get_index_value(vm, obj, i, &a_val);
+        int got_b = ps_array_get_index_value(vm, obj, j, &b_val);
         if (got_a) {
-            ps_object_put(obj, ps_string_from_cstr(b_buf), a_val);
+            ps_array_set_index_value(vm, obj, j, a_val);
         } else {
-            int deleted = 0;
-            ps_object_delete(obj, ps_string_from_cstr(b_buf), &deleted);
+            ps_array_delete_index_value(vm, obj, j);
         }
         if (got_b) {
-            ps_object_put(obj, ps_string_from_cstr(a_buf), b_val);
+            ps_array_set_index_value(vm, obj, i, b_val);
         } else {
-            int deleted = 0;
-            ps_object_delete(obj, ps_string_from_cstr(a_buf), &deleted);
+            ps_array_delete_index_value(vm, obj, i);
         }
     }
     return this_val;
@@ -3592,10 +3594,8 @@ static PSValue ps_native_array_sort(PSVM *vm, PSValue this_val, int argc, PSValu
         if (!items) return this_val;
     }
     for (size_t i = 0; i < len; i++) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%zu", i);
-        int got = 0;
-        PSValue val = ps_object_get(obj, ps_string_from_cstr(buf), &got);
+        PSValue val = ps_value_undefined();
+        int got = ps_array_get_index_value(vm, obj, i, &val);
         if (got) {
             items[count++] = val;
         }
@@ -3610,13 +3610,10 @@ static PSValue ps_native_array_sort(PSVM *vm, PSValue this_val, int argc, PSValu
         }
     }
     for (size_t i = 0; i < len; i++) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%zu", i);
         if (i < count) {
-            ps_object_put(obj, ps_string_from_cstr(buf), items[i]);
+            ps_array_set_index_value(vm, obj, i, items[i]);
         } else {
-            int deleted = 0;
-            ps_object_delete(obj, ps_string_from_cstr(buf), &deleted);
+            ps_array_delete_index_value(vm, obj, i);
         }
     }
     free(items);
@@ -3633,7 +3630,11 @@ static PSValue ps_native_array_splice(PSVM *vm, PSValue this_val, int argc, PSVa
     }
     PSObject *obj = this_val.as.object;
     size_t len = ps_object_length(obj);
-    double start_num = (argc > 0) ? ps_to_number(vm, argv[0]) : 0.0;
+    double start_num = 0.0;
+    if (argc > 0 && argv) {
+        start_num = ps_to_number(vm, argv[0]);
+        if (argv[0].type == PS_T_UNDEFINED) start_num = 0.0;
+    }
     if (isnan(start_num)) start_num = 0.0;
     if (start_num < 0.0) start_num = (double)len + start_num;
     if (start_num < 0.0) start_num = 0.0;
@@ -3643,7 +3644,10 @@ static PSValue ps_native_array_splice(PSVM *vm, PSValue this_val, int argc, PSVa
     if (argc < 2) {
         delete_count = len - start;
     } else {
-        double del_num = ps_to_number(vm, argv[1]);
+        double del_num = 0.0;
+        if (argv[1].type != PS_T_UNDEFINED) {
+            del_num = ps_to_number(vm, argv[1]);
+        }
         if (isnan(del_num) || del_num < 0.0) del_num = 0.0;
         if (del_num > (double)(len - start)) del_num = (double)(len - start);
         delete_count = (size_t)del_num;
@@ -3653,15 +3657,12 @@ static PSValue ps_native_array_splice(PSVM *vm, PSValue this_val, int argc, PSVa
     PSObject *out = ps_object_new(vm->array_proto ? vm->array_proto : vm->object_proto);
     if (!out) return ps_value_undefined();
     out->kind = PS_OBJ_KIND_ARRAY;
+    (void)ps_array_init(out);
     for (size_t i = 0; i < delete_count; i++) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%zu", start + i);
-        int got = 0;
-        PSValue val = ps_object_get(obj, ps_string_from_cstr(buf), &got);
+        PSValue val = ps_value_undefined();
+        int got = ps_array_get_index_value(vm, obj, start + i, &val);
         if (got) {
-            char out_buf[32];
-            snprintf(out_buf, sizeof(out_buf), "%zu", i);
-            ps_object_put(out, ps_string_from_cstr(out_buf), val);
+            (void)ps_array_set_index(out, i, val);
         }
     }
     ps_object_set_length(out, delete_count);
@@ -3669,46 +3670,31 @@ static PSValue ps_native_array_splice(PSVM *vm, PSValue this_val, int argc, PSVa
     if (insert_count < delete_count) {
         size_t shift = delete_count - insert_count;
         for (size_t i = start + delete_count; i < len; i++) {
-            char from_buf[32];
-            char to_buf[32];
-            snprintf(from_buf, sizeof(from_buf), "%zu", i);
-            snprintf(to_buf, sizeof(to_buf), "%zu", i - shift);
-            int got = 0;
-            PSValue val = ps_object_get(obj, ps_string_from_cstr(from_buf), &got);
+            PSValue val = ps_value_undefined();
+            int got = ps_array_get_index_value(vm, obj, i, &val);
             if (got) {
-                ps_object_put(obj, ps_string_from_cstr(to_buf), val);
+                ps_array_set_index_value(vm, obj, i - shift, val);
             } else {
-                int deleted = 0;
-                ps_object_delete(obj, ps_string_from_cstr(to_buf), &deleted);
+                ps_array_delete_index_value(vm, obj, i - shift);
             }
         }
         for (size_t i = len; i > len - shift; i--) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%zu", i - 1);
-            int deleted = 0;
-            ps_object_delete(obj, ps_string_from_cstr(buf), &deleted);
+            ps_array_delete_index_value(vm, obj, i - 1);
         }
     } else if (insert_count > delete_count) {
         size_t shift = insert_count - delete_count;
         for (size_t i = len; i > start + delete_count; i--) {
-            char from_buf[32];
-            char to_buf[32];
-            snprintf(from_buf, sizeof(from_buf), "%zu", i - 1);
-            snprintf(to_buf, sizeof(to_buf), "%zu", i - 1 + shift);
-            int got = 0;
-            PSValue val = ps_object_get(obj, ps_string_from_cstr(from_buf), &got);
+            PSValue val = ps_value_undefined();
+            int got = ps_array_get_index_value(vm, obj, i - 1, &val);
             if (got) {
-                ps_object_put(obj, ps_string_from_cstr(to_buf), val);
+                ps_array_set_index_value(vm, obj, i - 1 + shift, val);
             } else {
-                int deleted = 0;
-                ps_object_delete(obj, ps_string_from_cstr(to_buf), &deleted);
+                ps_array_delete_index_value(vm, obj, i - 1 + shift);
             }
         }
     }
     for (size_t i = 0; i < insert_count; i++) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%zu", start + i);
-        ps_object_put(obj, ps_string_from_cstr(buf), argv[2 + (int)i]);
+        ps_array_set_index_value(vm, obj, start + i, argv[2 + (int)i]);
     }
     size_t new_len = len - delete_count + insert_count;
     ps_object_set_length(obj, new_len);
@@ -4818,10 +4804,8 @@ static int ps_collect_array_like(PSObject *obj, PSValue **out_args, size_t *out_
     PSValue *args = (PSValue *)calloc(len, sizeof(PSValue));
     if (!args) return 0;
     for (size_t i = 0; i < len; i++) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%zu", i);
-        int got = 0;
-        PSValue val = ps_object_get(obj, ps_string_from_cstr(buf), &got);
+        PSValue val = ps_value_undefined();
+        int got = ps_array_get_index_value(NULL, obj, i, &val);
         args[i] = got ? val : ps_value_undefined();
     }
     *out_args = args;
@@ -4831,6 +4815,14 @@ static int ps_collect_array_like(PSObject *obj, PSValue **out_args, size_t *out_
 
 static int ps_object_length_uint32(PSObject *obj, uint32_t *out_len) {
     if (!obj) return 0;
+    if (obj->kind == PS_OBJ_KIND_ARRAY) {
+        PSArray *arr = ps_array_from_object(obj);
+        if (arr) {
+            if (arr->length > 4294967295ULL) return 0;
+            if (out_len) *out_len = (uint32_t)arr->length;
+            return 1;
+        }
+    }
     int found = 0;
     PSValue len_val = ps_object_get(obj, ps_string_from_cstr("length"), &found);
     if (!found) return 0;
@@ -4849,10 +4841,8 @@ static int ps_collect_array_like_len(PSObject *obj, size_t len, PSValue **out_ar
     PSValue *args = (PSValue *)calloc(len, sizeof(PSValue));
     if (!args) return 0;
     for (size_t i = 0; i < len; i++) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%zu", i);
-        int got = 0;
-        PSValue val = ps_object_get(obj, ps_string_from_cstr(buf), &got);
+        PSValue val = ps_value_undefined();
+        int got = ps_array_get_index_value(NULL, obj, i, &val);
         args[i] = got ? val : ps_value_undefined();
     }
     *out_args = args;
@@ -5375,20 +5365,19 @@ static PSValue json_parse_array(PSJsonParser *p) {
     PSObject *arr = ps_object_new(p->vm->array_proto ? p->vm->array_proto : p->vm->object_proto);
     if (!arr) return ps_value_undefined();
     arr->kind = PS_OBJ_KIND_ARRAY;
+    (void)ps_array_init(arr);
     size_t index = 0;
     json_skip_ws(p);
     if (p->pos < p->len && p->buf[p->pos] == ']') {
         p->pos++;
-        ps_object_set_length(arr, 0);
+        (void)ps_array_set_length_internal(arr, 0);
         return ps_value_object(arr);
     }
     while (p->pos < p->len) {
         json_skip_ws(p);
         PSValue val = json_parse_value(p);
         if (p->error) return ps_value_undefined();
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%zu", index);
-        ps_object_define(arr, ps_string_from_cstr(buf), val, PS_ATTR_NONE);
+        (void)ps_array_set_index(arr, index, val);
         index++;
         json_skip_ws(p);
         if (p->pos >= p->len) break;
@@ -5398,7 +5387,7 @@ static PSValue json_parse_array(PSJsonParser *p) {
         }
         if (p->buf[p->pos] == ']') {
             p->pos++;
-            ps_object_set_length(arr, index);
+            (void)ps_array_set_length_internal(arr, index);
             return ps_value_object(arr);
         }
         break;
@@ -5573,10 +5562,8 @@ static int json_stringify_array(PSVM *vm, PSObject *obj, PSJsonBuilder *b, PSJso
         if (i > 0) {
             if (!json_builder_append_char(b, ',')) return -1;
         }
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%zu", i);
-        int found = 0;
-        PSValue val = ps_object_get(obj, ps_string_from_cstr(buf), &found);
+        PSValue val = ps_value_undefined();
+        int found = ps_array_get_index_value(vm, obj, i, &val);
         if (!found) val = ps_value_undefined();
         int rc = json_stringify_value(vm, val, b, stack);
         if (rc < 0) return -1;
@@ -5760,6 +5747,10 @@ PSVM *ps_vm_new(void) {
 #else
     vm->display = NULL;
 #endif
+    vm->perf_dump_interval_ms = 0;
+    vm->perf_dump_next_ms = 0;
+    vm->intern_cache_size = 2048;
+    vm->intern_cache = (PSString **)calloc(vm->intern_cache_size, sizeof(PSString *));
 
     /* Create Global Object (no prototype for now) */
     vm->global = ps_object_new(NULL);
@@ -5791,6 +5782,17 @@ PSVM *ps_vm_new(void) {
     vm->current_node = NULL;
     vm->index_cache_size = 10000;
     vm->index_cache = (PSString **)calloc(vm->index_cache_size, sizeof(PSString *));
+    vm->math_intrinsics_valid = 0;
+    vm->profile.enabled = 0;
+    vm->profile.items = NULL;
+    vm->profile.count = 0;
+    vm->profile.cap = 0;
+    {
+        const char *prof_env = getenv("PS_PROFILE_CALLS");
+        if (prof_env && prof_env[0]) {
+            vm->profile.enabled = 1;
+        }
+    }
     /* Initialize built-ins and host extensions */
     ps_vm_init_builtins(vm);
     ps_vm_init_buffer(vm);
@@ -5809,9 +5811,79 @@ PSVM *ps_vm_new(void) {
     return vm;
 }
 
+void ps_vm_set_perf_interval(PSVM *vm, uint64_t interval_ms) {
+    if (!vm) return;
+    if (interval_ms == 0) {
+        vm->perf_dump_interval_ms = 0;
+        vm->perf_dump_next_ms = 0;
+        return;
+    }
+    vm->perf_dump_interval_ms = interval_ms;
+    vm->perf_dump_next_ms = ps_vm_now_ms() + interval_ms;
+}
+
+void ps_vm_perf_poll(PSVM *vm) {
+    if (!vm || vm->perf_dump_interval_ms == 0) return;
+    uint64_t now = ps_vm_now_ms();
+    if (now < vm->perf_dump_next_ms) return;
+    ps_vm_perf_dump(vm);
+    vm->perf_dump_next_ms = now + vm->perf_dump_interval_ms;
+}
+
+void ps_vm_perf_dump(PSVM *vm) {
+    if (!vm) return;
+    fprintf(stderr,
+            "perfStats allocCount=%llu allocBytes=%llu objectNew=%llu stringNew=%llu "
+            "functionNew=%llu envNew=%llu callCount=%llu evalNodeCount=%llu evalExprCount=%llu "
+            "callIdentCount=%llu callMemberCount=%llu callOtherCount=%llu nativeCallCount=%llu "
+            "objectGet=%llu objectPut=%llu objectDefine=%llu objectDelete=%llu "
+            "arrayGet=%llu arraySet=%llu arrayDelete=%llu stringFromCstr=%llu "
+            "bufferReadIndex=%llu bufferWriteIndex=%llu bufferReadIndexFast=%llu bufferWriteIndexFast=%llu "
+            "buffer32ReadIndex=%llu buffer32WriteIndex=%llu buffer32ReadIndexFast=%llu buffer32WriteIndexFast=%llu "
+            "gcCollections=%d gcLiveBytes=%zu\n",
+            (unsigned long long)vm->perf.alloc_count,
+            (unsigned long long)vm->perf.alloc_bytes,
+            (unsigned long long)vm->perf.object_new,
+            (unsigned long long)vm->perf.string_new,
+            (unsigned long long)vm->perf.function_new,
+            (unsigned long long)vm->perf.env_new,
+            (unsigned long long)vm->perf.call_count,
+            (unsigned long long)vm->perf.eval_node_count,
+            (unsigned long long)vm->perf.eval_expr_count,
+            (unsigned long long)vm->perf.call_ident_count,
+            (unsigned long long)vm->perf.call_member_count,
+            (unsigned long long)vm->perf.call_other_count,
+            (unsigned long long)vm->perf.native_call_count,
+            (unsigned long long)vm->perf.object_get,
+            (unsigned long long)vm->perf.object_put,
+            (unsigned long long)vm->perf.object_define,
+            (unsigned long long)vm->perf.object_delete,
+            (unsigned long long)vm->perf.array_get,
+            (unsigned long long)vm->perf.array_set,
+            (unsigned long long)vm->perf.array_delete,
+            (unsigned long long)vm->perf.string_from_cstr,
+            (unsigned long long)vm->perf.buffer_read_index,
+            (unsigned long long)vm->perf.buffer_write_index,
+            (unsigned long long)vm->perf.buffer_read_index_fast,
+            (unsigned long long)vm->perf.buffer_write_index_fast,
+            (unsigned long long)vm->perf.buffer32_read_index,
+            (unsigned long long)vm->perf.buffer32_write_index,
+            (unsigned long long)vm->perf.buffer32_read_index_fast,
+            (unsigned long long)vm->perf.buffer32_write_index_fast,
+            vm->gc.collections,
+            vm->gc.live_bytes_last);
+    fprintf(stderr, "perfAstCounts");
+    for (size_t i = 0; i < PS_AST_KIND_COUNT; i++) {
+        fprintf(stderr, " k%zu=%llu", i, (unsigned long long)vm->perf.ast_counts[i]);
+    }
+    fprintf(stderr, "\n");
+}
+
 void ps_vm_free(PSVM *vm) {
     if (!vm) return;
-
+    if (vm->profile.enabled && vm->profile.count > 0) {
+        ps_vm_profile_dump(vm);
+    }
     ps_gc_destroy(vm);
     if (ps_gc_active_vm() == vm) {
         ps_gc_set_active_vm(NULL);
@@ -5821,8 +5893,63 @@ void ps_vm_free(PSVM *vm) {
 #endif
     free(vm->event_queue);
     free(vm->index_cache);
+    free(vm->intern_cache);
     free(vm->stack_frames);
+    free(vm->profile.items);
     free(vm);
+}
+
+static int ps_profile_entry_cmp(const void *a, const void *b) {
+    const PSProfileEntry *ea = (const PSProfileEntry *)a;
+    const PSProfileEntry *eb = (const PSProfileEntry *)b;
+    if (ea->total_ms < eb->total_ms) return 1;
+    if (ea->total_ms > eb->total_ms) return -1;
+    return 0;
+}
+
+static void ps_vm_profile_dump(PSVM *vm) {
+    if (!vm || !vm->profile.enabled || vm->profile.count == 0) return;
+    qsort(vm->profile.items, vm->profile.count, sizeof(PSProfileEntry), ps_profile_entry_cmp);
+    size_t limit = vm->profile.count < 32 ? vm->profile.count : 32;
+    fprintf(stderr, "profileCalls top=%zu\n", limit);
+    for (size_t i = 0; i < limit; i++) {
+        PSProfileEntry *e = &vm->profile.items[i];
+        const char *name_fallback = "<anon>";
+        PSString *name = e->func ? e->func->name : NULL;
+        fprintf(stderr, "profileCalls calls=%llu ms=%llu name=",
+                (unsigned long long)e->calls,
+                (unsigned long long)e->total_ms);
+        if (name && name->utf8 && name->byte_len > 0) {
+            fwrite(name->utf8, 1, name->byte_len, stderr);
+        } else {
+            fputs(name_fallback, stderr);
+        }
+        fprintf(stderr, " func=%p\n", (void *)e->func);
+    }
+}
+
+void ps_vm_profile_add(PSVM *vm, PSFunction *func, uint64_t elapsed_ms) {
+    if (!vm || !vm->profile.enabled || !func) return;
+    for (size_t i = 0; i < vm->profile.count; i++) {
+        PSProfileEntry *e = &vm->profile.items[i];
+        if (e->func == func) {
+            e->calls++;
+            e->total_ms += elapsed_ms;
+            return;
+        }
+    }
+    if (vm->profile.count == vm->profile.cap) {
+        size_t new_cap = vm->profile.cap ? vm->profile.cap * 2 : 32;
+        PSProfileEntry *next = (PSProfileEntry *)realloc(vm->profile.items,
+                                                         new_cap * sizeof(PSProfileEntry));
+        if (!next) return;
+        vm->profile.items = next;
+        vm->profile.cap = new_cap;
+    }
+    PSProfileEntry *slot = &vm->profile.items[vm->profile.count++];
+    slot->func = func;
+    slot->calls = 1;
+    slot->total_ms = elapsed_ms;
 }
 
 /* --------------------------------------------------------- */
@@ -5915,6 +6042,10 @@ void ps_vm_init_builtins(PSVM *vm) {
         ps_object_define(vm->global,
                          ps_string_from_cstr("NaN"),
                          ps_value_number(NAN),
+                         PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+        ps_object_define(vm->global,
+                         ps_string_from_cstr("Infinity"),
+                         ps_value_number(INFINITY),
                          PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
     }
 
@@ -6318,6 +6449,26 @@ void ps_vm_init_builtins(PSVM *vm) {
     if (number_ctor) {
         ps_function_setup(number_ctor, vm->function_proto, vm->object_proto, vm->number_proto);
         ps_define_function_props(number_ctor, "Number", 1);
+        ps_object_define(number_ctor,
+                         ps_string_from_cstr("MAX_VALUE"),
+                         ps_value_number(DBL_MAX),
+                         PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+        ps_object_define(number_ctor,
+                         ps_string_from_cstr("MIN_VALUE"),
+                         ps_value_number(DBL_MIN),
+                         PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+        ps_object_define(number_ctor,
+                         ps_string_from_cstr("NaN"),
+                         ps_value_number(NAN),
+                         PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+        ps_object_define(number_ctor,
+                         ps_string_from_cstr("POSITIVE_INFINITY"),
+                         ps_value_number(INFINITY),
+                         PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+        ps_object_define(number_ctor,
+                         ps_string_from_cstr("NEGATIVE_INFINITY"),
+                         ps_value_number(-INFINITY),
+                         PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
         if (vm->number_proto) {
             ps_object_define(vm->number_proto,
                              ps_string_from_cstr("constructor"),
@@ -7014,6 +7165,7 @@ void ps_vm_init_builtins(PSVM *vm) {
                          ps_string_from_cstr("Math"),
                          ps_value_object(vm->math_obj),
                          PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
+        vm->math_intrinsics_valid = 1;
     }
 
     PSObject *json_obj = ps_object_new(vm->object_proto);

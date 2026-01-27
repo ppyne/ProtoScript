@@ -27,7 +27,7 @@ does not describe every ES1 rule in detail.
 ```
 var if else while do for in of switch case default function return
 break continue with try catch finally throw new true false null typeof
-this instanceof void delete include
+this instanceof void delete
 ```
 
 ---
@@ -67,14 +67,14 @@ this instanceof void delete include
 - `try / catch / finally`, `throw`
 - `return`
 - `with` (compile-time gated)
-- `include "path/to/file.js"` (top-level only, before statements)
+- `ProtoScript.include("path/to/file.js")` (top-level only, before statements)
 
-### 4.1 `include`
+### 4.1 `ProtoScript.include`
 
 ProtoScript supports a static source inclusion directive:
 
 ```js
-include "relative/or/absolute/path.js";
+ProtoScript.include("relative/or/absolute/path.js");
 ```
 
 Rules:
@@ -83,6 +83,7 @@ Rules:
 - argument must be a string literal ending in `.js`
 - relative paths resolve from the including file
 - cycles are detected and reported as errors
+- this is a parse-time directive, not a runtime function
 
 ---
 
@@ -90,6 +91,7 @@ Rules:
 
 - `undefined` (read-only)
 - `NaN` (read-only)
+- `Infinity` (read-only)
 
 ### 5.1 Global functions
 
@@ -246,6 +248,7 @@ Object: `ProtoScript`
 - `ProtoScript.sleep(seconds)`
 - `ProtoScript.usleep(microseconds)`
 - `ProtoScript.perfStats()`
+- `ProtoScript.include(path)` (parse-time only)
 
 ### 7.1 Io
 Object: `Io`
@@ -297,19 +300,29 @@ Object: `Buffer`
 - `Buffer.size(buffer)`
 - `Buffer.slice(buffer, offset, length)`
 - `buffer.length` (bytes)
+- Indexed writes (`buffer[i] = value`) convert via `ToNumber`, round (`floor(x + 0.5)`), then clamp to `0–255` (NaN/Infinity -> 0, values in `(0, 1)` -> 0).
 
-### 7.5 Event
+### 7.5 Buffer32
+Object: `Buffer32`
+- `Buffer32.alloc(length)`
+- `Buffer32.size(buffer32)`
+- `Buffer32.byteLength(buffer32)`
+- `Buffer32.view(buffer, offset?, length?)`
+- `buffer32.length` (uint32 elements)
+- Indexed writes (`buffer32[i] = value`) convert via `ToNumber`, round (`floor(x + 0.5)`), then clamp to `0–4294967295` (NaN/Infinity -> 0, values in `(0, 1)` -> 0).
+
+### 7.6 Event
 Object: `Event`
 - `Event.next()`
 
-### 7.6 Image (optional)
+### 7.7 Image (optional)
 Object: `Image` (requires `PS_ENABLE_MODULE_IMG=1`)
 - `Image.detectFormat(buffer)`
 - `Image.decodePNG(buffer)`
 - `Image.decodeJPEG(buffer)`
 - `Image.resample(image, newWidth, newHeight, mode)`
 
-### 7.7 Display (optional)
+### 7.8 Display (optional)
 Object: `Display` (requires `PS_ENABLE_MODULE_DISPLAY=1`)
 - `Display.open(width, height, title, options)`
 - `Display.close()`

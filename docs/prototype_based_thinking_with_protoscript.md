@@ -278,7 +278,9 @@ Instead of designing a rigid architecture up front, you start with something con
 Rather than subclassing, you create a new object and delegate:
 
 ```
-basicOsc = {
+ProtoScript.include("examples/utils/clone.js");
+
+baseOsc = {
   freq: 440,
   play: function() { /* ... */ }
 };
@@ -299,6 +301,8 @@ Each object tells its own story.
 You can add behavior *after* objects already exist:
 
 ```
+ProtoScript.include("examples/utils/clone.js");
+
 filter = { cutoff: 1000 };
 
 osc = {};

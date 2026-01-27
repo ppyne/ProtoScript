@@ -63,6 +63,8 @@ PSString *ps_string_from_utf8(const char *data, size_t byte_len) {
         hash *= 16777619u;
     }
     s->hash = hash;
+    s->index_state = 0;
+    s->index_value = 0;
 
     /* First pass: count glyphs */
     size_t i = 0;
@@ -111,7 +113,39 @@ PSString *ps_string_from_utf8(const char *data, size_t byte_len) {
 }
 
 PSString *ps_string_from_cstr(const char *cstr) {
-    return ps_string_from_utf8(cstr, strlen(cstr));
+#if PS_ENABLE_PERF
+    {
+        PSVM *vm = ps_gc_active_vm();
+        if (vm) {
+            vm->perf.string_from_cstr++;
+        }
+    }
+#endif
+    if (!cstr) return ps_string_from_utf8("", 0);
+    size_t len = strlen(cstr);
+    PSVM *vm = ps_gc_active_vm();
+    if (vm && vm->intern_cache && vm->intern_cache_size > 0 && len <= 64) {
+        uint32_t hash = 2166136261u;
+        for (size_t i = 0; i < len; i++) {
+            hash ^= (uint8_t)cstr[i];
+            hash *= 16777619u;
+        }
+        size_t idx = hash & (vm->intern_cache_size - 1);
+        PSString *cached = vm->intern_cache[idx];
+        if (cached &&
+            cached->hash == hash &&
+            cached->byte_len == len &&
+            cached->utf8 &&
+            memcmp(cached->utf8, cstr, len) == 0) {
+            return cached;
+        }
+        PSString *s = ps_string_from_utf8(cstr, len);
+        if (s) {
+            vm->intern_cache[idx] = s;
+        }
+        return s;
+    }
+    return ps_string_from_utf8(cstr, len);
 }
 
 /* --------------------------------------------------------- */

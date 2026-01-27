@@ -1,5 +1,4 @@
-include "Heap.js";
-
+ProtoScript.include("Heap.js");
 var h = new Heap();
 h.push(5);
 h.push(3);

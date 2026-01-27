@@ -1,5 +1,4 @@
-include "HashTable.js";
-
+ProtoScript.include("HashTable.js");
 var table = new HashTable(8);
 Io.print(table.has("a") ? "has a\n" : "no a\n");
 

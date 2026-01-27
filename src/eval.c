@@ -2,6 +2,7 @@
 #include "ps_vm.h"
 #include "ps_eval.h"
 #include "ps_object.h"
+#include "ps_array.h"
 #include "ps_value.h"
 #include "ps_string.h"
 #include "ps_lexer.h"
@@ -11,12 +12,80 @@
 #include "ps_config.h"
 #include "ps_gc.h"
 #include "ps_buffer.h"
+#include "ps_numeric_map.h"
+#include "ps_expr_bc.h"
+#include "ps_stmt_bc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
 #include <stdint.h>
+#include <limits.h>
+#include <time.h>
+
+#define PS_PERF_POLL(vm) do { \
+    if ((vm) && (vm)->perf_dump_interval_ms) { \
+        ps_vm_perf_poll(vm); \
+    } \
+} while (0)
+
+static uint64_t ps_eval_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
+}
+
+static int ps_eval_trace_enabled = -1;
+
+static void ps_eval_trace_poll(PSVM *vm, PSAstNode *node) {
+    static int init = 0;
+    static uint64_t interval_ms = 0;
+    static uint64_t next_ms = 0;
+    static uint64_t trace_every = 0;
+    if (!vm) return;
+    if (!init) {
+        const char *env_every = getenv("PS_EVAL_TRACE_EVERY");
+        if (env_every && env_every[0]) {
+            char *end_every = NULL;
+            unsigned long long v = strtoull(env_every, &end_every, 10);
+            if (end_every && end_every != env_every && v > 0) {
+                trace_every = (uint64_t)v;
+            }
+        }
+        const char *env = getenv("PS_EVAL_TRACE_MS");
+        if (env && env[0]) {
+            char *end = NULL;
+            unsigned long long v = strtoull(env, &end, 10);
+            if (end && end != env && v > 0) {
+                interval_ms = (uint64_t)v;
+                next_ms = ps_eval_now_ms() + interval_ms;
+            }
+        }
+        ps_eval_trace_enabled = (trace_every > 0 || interval_ms > 0) ? 1 : 0;
+        init = 1;
+    }
+    if (trace_every > 0) {
+        if (vm->perf.eval_node_count % trace_every != 0) return;
+    } else if (interval_ms > 0) {
+        uint64_t now = ps_eval_now_ms();
+        if (now < next_ms) return;
+        next_ms = now + interval_ms;
+    } else {
+        return;
+    }
+    if (node && node->line && node->column) {
+        if (node->source_path) {
+            fprintf(stderr, "evalTrace %s:%zu:%zu kind=%d\n",
+                    node->source_path, node->line, node->column, (int)node->kind);
+        } else {
+            fprintf(stderr, "evalTrace <unknown>:%zu:%zu kind=%d\n",
+                    node->line, node->column, (int)node->kind);
+        }
+    } else {
+        fprintf(stderr, "evalTrace <unknown> kind=%d\n", node ? (int)node->kind : -1);
+    }
+}
 
 /* --------------------------------------------------------- */
 /* Forward declarations                                      */
@@ -34,10 +103,34 @@ typedef struct {
 
 static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *ctl);
 static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *ctl);
+static PSValue eval_expression_inner(PSVM *vm,
+                                     PSEnv *env,
+                                     PSAstNode *node,
+                                     PSEvalControl *ctl,
+                                     int allow_bc);
+static PSStmtBC *ps_stmt_bc_compile(PSAstNode *node);
+static PSValue ps_stmt_bc_execute(PSVM *vm, PSEnv *env, PSFunction *func, PSStmtBC *bc, PSEvalControl *ctl);
+static PSValue ps_stmt_bc_eval_expr(PSVM *vm, PSEnv *env, PSAstNode *expr, PSEvalControl *ctl);
 static PSValue eval_block(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *ctl);
 static PSValue ps_eval_source(PSVM *vm, PSEnv *env, PSString *source, PSEvalControl *ctl);
 static void hoist_decls(PSVM *vm, PSEnv *env, PSAstNode *node);
 static PSString *ps_identifier_string(PSAstNode *node);
+static int ps_identifier_cached_get(PSEnv *env,
+                                    PSAstNode *id,
+                                    PSValue *out,
+                                    int *found);
+static int ps_string_to_index_size(PSString *name, size_t *out_index);
+static void ps_array_update_length(PSObject *obj, PSString *prop);
+static int ps_array_write_index_value(PSVM *vm,
+                                      PSObject *obj,
+                                      PSValue key_val,
+                                      PSValue value,
+                                      PSEvalControl *ctl);
+static PSValue ps_eval_binary_values(PSVM *vm,
+                                     int op,
+                                     PSValue left,
+                                     PSValue right,
+                                     PSEvalControl *ctl);
 
 static int ps_value_is_nan(double v) {
     return isnan(v);
@@ -297,7 +390,9 @@ static int ps_check_pending_throw(PSVM *vm, PSEvalControl *ctl) {
 }
 
 static uint8_t ps_clamp_byte(double num);
+static uint32_t ps_clamp_u32(double num);
 static int ps_buffer_index_from_prop(PSObject *obj, PSString *prop, size_t *out_index);
+static int ps_buffer32_index_from_prop(PSObject *obj, PSString *prop, size_t *out_index);
 static int ps_buffer_read_index(PSVM *vm,
                                 PSObject *obj,
                                 PSString *prop,
@@ -308,6 +403,37 @@ static int ps_buffer_write_index(PSVM *vm,
                                  PSString *prop,
                                  PSValue value,
                                  PSEvalControl *ctl);
+static int ps_buffer32_read_index(PSVM *vm,
+                                  PSObject *obj,
+                                  PSString *prop,
+                                  PSValue *out_value,
+                                  PSEvalControl *ctl);
+static int ps_buffer32_write_index(PSVM *vm,
+                                   PSObject *obj,
+                                   PSString *prop,
+                                   PSValue value,
+                                   PSEvalControl *ctl);
+static int ps_value_to_index(PSVM *vm, PSValue value, size_t *out_index, PSEvalControl *ctl);
+static int ps_buffer_read_index_value(PSVM *vm,
+                                      PSObject *obj,
+                                      PSValue key_val,
+                                      PSValue *out_value,
+                                      PSEvalControl *ctl);
+static int ps_buffer_write_index_value(PSVM *vm,
+                                       PSObject *obj,
+                                       PSValue key_val,
+                                       PSValue value,
+                                       PSEvalControl *ctl);
+static int ps_buffer32_read_index_value(PSVM *vm,
+                                        PSObject *obj,
+                                        PSValue key_val,
+                                        PSValue *out_value,
+                                        PSEvalControl *ctl);
+static int ps_buffer32_write_index_value(PSVM *vm,
+                                         PSObject *obj,
+                                         PSValue key_val,
+                                         PSValue value,
+                                         PSEvalControl *ctl);
 
 static void ps_define_script_function_props(PSObject *fn, PSString *name, size_t param_count) {
     if (!fn) return;
@@ -411,6 +537,13 @@ static int ps_string_equals(const PSString *a, const PSString *b) {
     return 1;
 }
 
+static int ps_string_equals_cstr(const PSString *s, const char *lit) {
+    if (!s || !lit) return 0;
+    size_t len = strlen(lit);
+    if (s->byte_len != len) return 0;
+    return memcmp(s->utf8, lit, len) == 0;
+}
+
 static int ps_string_compare(const PSString *a, const PSString *b) {
     size_t min = (a->glyph_count < b->glyph_count) ? a->glyph_count : b->glyph_count;
     for (size_t i = 0; i < min; i++) {
@@ -442,6 +575,48 @@ static uint32_t ps_to_uint32(PSVM *vm, const PSValue *v) {
     double val = fmod(sign * abs, 4294967296.0);
     if (val < 0) val += 4294967296.0;
     return (uint32_t)val;
+}
+
+static int32_t ps_to_int32_num(double num) {
+    if (ps_value_is_nan(num) || num == 0.0 || isinf(num)) return 0;
+    double sign = num < 0 ? -1.0 : 1.0;
+    double abs = floor(fabs(num));
+    double val = fmod(sign * abs, 4294967296.0);
+    if (val >= 2147483648.0) val -= 4294967296.0;
+    return (int32_t)val;
+}
+
+static uint32_t ps_to_uint32_num(double num) {
+    if (ps_value_is_nan(num) || num == 0.0 || isinf(num)) return 0;
+    double sign = num < 0 ? -1.0 : 1.0;
+    double abs = floor(fabs(num));
+    double val = fmod(sign * abs, 4294967296.0);
+    if (val < 0) val += 4294967296.0;
+    return (uint32_t)val;
+}
+
+static int ps_number_to_int32_strict(double num, int32_t *out) {
+    if (isnan(num) || isinf(num)) return 0;
+    if (num < (double)INT32_MIN || num > (double)INT32_MAX) return 0;
+    int32_t v = (int32_t)num;
+    if ((double)v != num) return 0;
+    if (out) *out = v;
+    return 1;
+}
+
+static double ps_to_number_fast(PSVM *vm, PSValue value) {
+    if (value.type == PS_T_NUMBER) return value.as.number;
+    return ps_to_number(vm, value);
+}
+
+static int32_t ps_to_int32_fast(PSVM *vm, PSValue value) {
+    if (value.type == PS_T_NUMBER) return ps_to_int32_num(value.as.number);
+    return ps_to_int32(vm, &value);
+}
+
+static uint32_t ps_to_uint32_fast(PSVM *vm, PSValue value) {
+    if (value.type == PS_T_NUMBER) return ps_to_uint32_num(value.as.number);
+    return ps_to_uint32(vm, &value);
 }
 
 static int ps_strict_equals(const PSValue *a, const PSValue *b) {
@@ -530,7 +705,9 @@ static PSObject *ps_to_object(PSVM *vm, const PSValue *v, PSEvalControl *ctl) {
 static PSString *ps_identifier_string(PSAstNode *node) {
     if (!node || node->kind != AST_IDENTIFIER) return NULL;
     if (node->as.identifier.str) return node->as.identifier.str;
-    return ps_string_from_utf8(node->as.identifier.name, node->as.identifier.length);
+    PSString *s = ps_string_from_utf8(node->as.identifier.name, node->as.identifier.length);
+    node->as.identifier.str = s;
+    return s;
 }
 
 static int ps_literal_string_equals(PSAstNode *node, const char *lit, size_t len) {
@@ -585,6 +762,21 @@ static PSString *ps_member_key_read(PSVM *vm,
         return ps_identifier_string(member->as.member.property);
     }
     PSAstNode *prop = member->as.member.property;
+    if (prop && prop->kind == AST_LITERAL) {
+        PSValue lit = prop->as.literal.value;
+        if (lit.type == PS_T_STRING) {
+            return lit.as.string;
+        }
+        if (lit.type == PS_T_NUMBER) {
+            double num = lit.as.number;
+            if (num >= 0.0 && num <= (double)SIZE_MAX) {
+                size_t idx = (size_t)num;
+                if ((double)idx == num) {
+                    return ps_array_index_string(vm, idx);
+                }
+            }
+        }
+    }
     if (prop && prop->kind == AST_BINARY && prop->as.binary.op == TOK_PLUS) {
         PSAstNode *left = prop->as.binary.left;
         PSAstNode *right = prop->as.binary.right;
@@ -603,6 +795,8 @@ static PSString *ps_member_key_read(PSVM *vm,
                     tmp->byte_len = 1 + num_len;
                     tmp->glyph_offsets = NULL;
                     tmp->glyph_count = 0;
+                    tmp->index_state = 0;
+                    tmp->index_value = 0;
                     uint32_t hash = 2166136261u;
                     for (size_t i = 0; i < tmp->byte_len; i++) {
                         hash ^= (uint8_t)tmp_buf[i];
@@ -624,13 +818,420 @@ static PSString *ps_member_key(PSVM *vm, PSEnv *env, PSAstNode *member, PSEvalCo
     }
     PSValue key_val = eval_expression(vm, env, member->as.member.property, ctl);
     if (ctl->did_throw) return NULL;
+    if (key_val.type == PS_T_NUMBER) {
+        double num = key_val.as.number;
+        if (num >= 0.0 && num <= (double)SIZE_MAX) {
+            size_t idx = (size_t)num;
+            if ((double)idx == num) {
+                return ps_array_index_string(vm, idx);
+            }
+        }
+    }
     PSString *key = ps_to_string(vm, key_val);
     if (ps_check_pending_throw(vm, ctl)) return NULL;
     return key;
 }
 
 #define PS_FAST_FLAG_FIB 0x01
+#define PS_FAST_FLAG_ENV 0x02
+#define PS_FAST_FLAG_MATH 0x04
+#define PS_FAST_FLAG_NUM 0x08
+#define PS_FAST_FLAG_CLAMP 0x10
+#define PS_FAST_FLAG_HOIST 0x20
 #define PS_FAST_CHECKED_FIB 0x01
+#define PS_FAST_CHECKED_ENV 0x02
+#define PS_FAST_CHECKED_MATH 0x04
+#define PS_FAST_CHECKED_NUM 0x08
+#define PS_FAST_CHECKED_CLAMP 0x10
+#define PS_FAST_CHECKED_HOIST 0x20
+
+enum {
+    PS_CALL_CACHE_NONE = 0,
+    PS_CALL_CACHE_IDENT_FAST = 1,
+    PS_CALL_CACHE_IDENT_PROP = 2,
+    PS_CALL_CACHE_MEMBER = 3
+};
+
+typedef struct {
+    PSString **items;
+    size_t count;
+    size_t cap;
+} PSFastNameList;
+
+typedef struct {
+    PSFastNameList locals;
+    int has_inner_func;
+    int uses_eval;
+    int uses_arguments;
+    int uses_with;
+} PSFastEnvScan;
+
+static int ps_fast_name_list_add(PSFastNameList *list, PSString *name) {
+    if (!list || !name) return 1;
+    for (size_t i = 0; i < list->count; i++) {
+        if (ps_string_equals(list->items[i], name)) return 1;
+    }
+    if (list->count == list->cap) {
+        size_t new_cap = list->cap ? list->cap * 2 : 8;
+        PSString **next = (PSString **)realloc(list->items, sizeof(PSString *) * new_cap);
+        if (!next) return 0;
+        list->items = next;
+        list->cap = new_cap;
+    }
+    list->items[list->count++] = name;
+    return 1;
+}
+
+static void ps_fast_env_scan_node(PSAstNode *node, PSFastEnvScan *scan);
+
+static void ps_fast_env_scan_list(PSAstNode **items, size_t count, PSFastEnvScan *scan) {
+    if (!items || !scan) return;
+    for (size_t i = 0; i < count; i++) {
+        ps_fast_env_scan_node(items[i], scan);
+    }
+}
+
+static void ps_fast_env_scan_node(PSAstNode *node, PSFastEnvScan *scan) {
+    if (!node || !scan) return;
+    switch (node->kind) {
+        case AST_PROGRAM:
+        case AST_BLOCK:
+            ps_fast_env_scan_list(node->as.list.items, node->as.list.count, scan);
+            return;
+        case AST_VAR_DECL: {
+            PSString *name = ps_identifier_string(node->as.var_decl.id);
+            (void)ps_fast_name_list_add(&scan->locals, name);
+            if (node->as.var_decl.init) {
+                ps_fast_env_scan_node(node->as.var_decl.init, scan);
+            }
+            return;
+        }
+        case AST_EXPR_STMT:
+            ps_fast_env_scan_node(node->as.expr_stmt.expr, scan);
+            return;
+        case AST_RETURN:
+            ps_fast_env_scan_node(node->as.ret.expr, scan);
+            return;
+        case AST_IF:
+            ps_fast_env_scan_node(node->as.if_stmt.cond, scan);
+            ps_fast_env_scan_node(node->as.if_stmt.then_branch, scan);
+            ps_fast_env_scan_node(node->as.if_stmt.else_branch, scan);
+            return;
+        case AST_WHILE:
+            ps_fast_env_scan_node(node->as.while_stmt.cond, scan);
+            ps_fast_env_scan_node(node->as.while_stmt.body, scan);
+            return;
+        case AST_DO_WHILE:
+            ps_fast_env_scan_node(node->as.do_while.body, scan);
+            ps_fast_env_scan_node(node->as.do_while.cond, scan);
+            return;
+        case AST_FOR:
+            ps_fast_env_scan_node(node->as.for_stmt.init, scan);
+            ps_fast_env_scan_node(node->as.for_stmt.test, scan);
+            ps_fast_env_scan_node(node->as.for_stmt.update, scan);
+            ps_fast_env_scan_node(node->as.for_stmt.body, scan);
+            return;
+        case AST_FOR_IN:
+            if (node->as.for_in.is_var &&
+                node->as.for_in.target &&
+                node->as.for_in.target->kind == AST_IDENTIFIER) {
+                PSString *name = ps_identifier_string(node->as.for_in.target);
+                (void)ps_fast_name_list_add(&scan->locals, name);
+            }
+            ps_fast_env_scan_node(node->as.for_in.target, scan);
+            ps_fast_env_scan_node(node->as.for_in.object, scan);
+            ps_fast_env_scan_node(node->as.for_in.body, scan);
+            return;
+        case AST_FOR_OF:
+            if (node->as.for_of.is_var &&
+                node->as.for_of.target &&
+                node->as.for_of.target->kind == AST_IDENTIFIER) {
+                PSString *name = ps_identifier_string(node->as.for_of.target);
+                (void)ps_fast_name_list_add(&scan->locals, name);
+            }
+            ps_fast_env_scan_node(node->as.for_of.target, scan);
+            ps_fast_env_scan_node(node->as.for_of.object, scan);
+            ps_fast_env_scan_node(node->as.for_of.body, scan);
+            return;
+        case AST_SWITCH:
+            ps_fast_env_scan_node(node->as.switch_stmt.expr, scan);
+            ps_fast_env_scan_list(node->as.switch_stmt.cases,
+                                  node->as.switch_stmt.case_count, scan);
+            return;
+        case AST_CASE:
+            ps_fast_env_scan_node(node->as.case_stmt.test, scan);
+            ps_fast_env_scan_list(node->as.case_stmt.items,
+                                  node->as.case_stmt.count, scan);
+            return;
+        case AST_LABEL:
+            ps_fast_env_scan_node(node->as.label_stmt.stmt, scan);
+            return;
+        case AST_WITH:
+            scan->uses_with = 1;
+            ps_fast_env_scan_node(node->as.with_stmt.object, scan);
+            ps_fast_env_scan_node(node->as.with_stmt.body, scan);
+            return;
+        case AST_THROW:
+            ps_fast_env_scan_node(node->as.throw_stmt.expr, scan);
+            return;
+        case AST_TRY:
+            ps_fast_env_scan_node(node->as.try_stmt.try_block, scan);
+            ps_fast_env_scan_node(node->as.try_stmt.catch_block, scan);
+            ps_fast_env_scan_node(node->as.try_stmt.finally_block, scan);
+            return;
+        case AST_FUNCTION_DECL: {
+            PSString *name = ps_identifier_string(node->as.func_decl.id);
+            (void)ps_fast_name_list_add(&scan->locals, name);
+            scan->has_inner_func = 1;
+            return;
+        }
+        case AST_FUNCTION_EXPR:
+            scan->has_inner_func = 1;
+            return;
+        case AST_IDENTIFIER: {
+            PSString *name = ps_identifier_string(node);
+            if (ps_string_equals_cstr(name, "arguments")) {
+                scan->uses_arguments = 1;
+            }
+            return;
+        }
+        case AST_ASSIGN:
+            ps_fast_env_scan_node(node->as.assign.target, scan);
+            ps_fast_env_scan_node(node->as.assign.value, scan);
+            return;
+        case AST_BINARY:
+            ps_fast_env_scan_node(node->as.binary.left, scan);
+            ps_fast_env_scan_node(node->as.binary.right, scan);
+            return;
+        case AST_UNARY:
+            ps_fast_env_scan_node(node->as.unary.expr, scan);
+            return;
+        case AST_UPDATE:
+            ps_fast_env_scan_node(node->as.update.expr, scan);
+            return;
+        case AST_CONDITIONAL:
+            ps_fast_env_scan_node(node->as.conditional.cond, scan);
+            ps_fast_env_scan_node(node->as.conditional.then_expr, scan);
+            ps_fast_env_scan_node(node->as.conditional.else_expr, scan);
+            return;
+        case AST_CALL: {
+            PSAstNode *callee = node->as.call.callee;
+            if (callee && callee->kind == AST_IDENTIFIER) {
+                PSString *name = ps_identifier_string(callee);
+                if (ps_string_equals_cstr(name, "eval")) {
+                    scan->uses_eval = 1;
+                }
+            }
+            ps_fast_env_scan_node(callee, scan);
+            ps_fast_env_scan_list(node->as.call.args, node->as.call.argc, scan);
+            return;
+        }
+        case AST_MEMBER:
+            ps_fast_env_scan_node(node->as.member.object, scan);
+            if (node->as.member.computed) {
+                ps_fast_env_scan_node(node->as.member.property, scan);
+            }
+            return;
+        case AST_NEW:
+            ps_fast_env_scan_node(node->as.new_expr.callee, scan);
+            ps_fast_env_scan_list(node->as.new_expr.args, node->as.new_expr.argc, scan);
+            return;
+        case AST_ARRAY_LITERAL:
+            ps_fast_env_scan_list(node->as.array_literal.items,
+                                  node->as.array_literal.count, scan);
+            return;
+        case AST_OBJECT_LITERAL: {
+            for (size_t i = 0; i < node->as.object_literal.count; i++) {
+                ps_fast_env_scan_node(node->as.object_literal.props[i].value, scan);
+            }
+            return;
+        }
+        case AST_THIS:
+        case AST_LITERAL:
+        case AST_BREAK:
+        case AST_CONTINUE:
+            return;
+        default:
+            return;
+    }
+}
+
+static void ps_fast_env_prepare(PSFunction *func) {
+    if (!func || func->is_native) return;
+    if (func->fast_checked & PS_FAST_CHECKED_ENV) return;
+    func->fast_checked |= PS_FAST_CHECKED_ENV;
+
+    PSFastEnvScan scan = {0};
+    ps_fast_env_scan_node(func->body, &scan);
+    if (func->param_defaults) {
+        for (size_t i = 0; i < func->param_count; i++) {
+            if (func->param_defaults[i]) {
+                ps_fast_env_scan_node(func->param_defaults[i], &scan);
+            }
+        }
+    }
+
+    int can_fast_env = !(scan.has_inner_func || scan.uses_eval || scan.uses_arguments || scan.uses_with);
+
+    PSFastNameList names = {0};
+    PSString *this_name = ps_string_from_cstr("this");
+    if (!ps_fast_name_list_add(&names, this_name)) {
+        free(scan.locals.items);
+        free(names.items);
+        return;
+    }
+    for (size_t i = 0; i < func->param_count; i++) {
+        PSString *pname = func->param_names ? func->param_names[i] : NULL;
+        if (!pname && func->params && func->params[i] && func->params[i]->kind == AST_IDENTIFIER) {
+            pname = ps_identifier_string(func->params[i]);
+        }
+        if (pname) {
+            if (!ps_fast_name_list_add(&names, pname)) {
+                free(scan.locals.items);
+                free(names.items);
+                return;
+            }
+        }
+    }
+    size_t *local_index = NULL;
+    size_t local_index_count = 0;
+    if (scan.locals.count > 0) {
+        local_index = (size_t *)calloc(scan.locals.count, sizeof(size_t));
+        if (!local_index) {
+            free(scan.locals.items);
+            free(names.items);
+            return;
+        }
+    }
+    for (size_t i = 0; i < scan.locals.count; i++) {
+        PSString *lname = scan.locals.items[i];
+        size_t existing_idx = SIZE_MAX;
+        for (size_t j = 0; j < names.count; j++) {
+            if (ps_string_equals(names.items[j], lname)) {
+                existing_idx = j;
+                break;
+            }
+        }
+        if (existing_idx != SIZE_MAX) {
+            continue;
+        }
+        if (!ps_fast_name_list_add(&names, lname)) {
+            free(scan.locals.items);
+            free(names.items);
+            free(local_index);
+            return;
+        }
+        local_index[local_index_count++] = names.count - 1;
+    }
+
+    size_t *param_index = NULL;
+    if (func->param_count > 0) {
+        param_index = (size_t *)calloc(func->param_count, sizeof(size_t));
+        if (!param_index) {
+            free(scan.locals.items);
+            free(names.items);
+            return;
+        }
+        for (size_t i = 0; i < func->param_count; i++) {
+            PSString *pname = func->param_names ? func->param_names[i] : NULL;
+            if (!pname && func->params && func->params[i] && func->params[i]->kind == AST_IDENTIFIER) {
+                pname = ps_identifier_string(func->params[i]);
+            }
+            size_t idx = SIZE_MAX;
+            if (pname) {
+                for (size_t j = 0; j < names.count; j++) {
+                    if (ps_string_equals(names.items[j], pname)) {
+                        idx = j;
+                        break;
+                    }
+                }
+            }
+            param_index[i] = idx;
+        }
+    }
+
+    func->fast_names = names.items;
+    func->fast_count = names.count;
+    func->fast_param_index = param_index;
+    func->fast_local_count = scan.locals.count;
+    func->fast_this_index = 0;
+    func->fast_local_index = local_index;
+    func->fast_local_index_count = local_index_count;
+    if (can_fast_env) {
+        func->fast_flags |= PS_FAST_FLAG_ENV;
+    }
+
+    free(scan.locals.items);
+}
+
+static int ps_hoist_scan_node(PSAstNode *node) {
+    if (!node) return 0;
+    switch (node->kind) {
+        case AST_VAR_DECL:
+            return 1;
+        case AST_FUNCTION_DECL:
+            return 1;
+        case AST_PROGRAM:
+        case AST_BLOCK:
+            for (size_t i = 0; i < node->as.list.count; i++) {
+                if (ps_hoist_scan_node(node->as.list.items[i])) return 1;
+            }
+            return 0;
+        case AST_IF:
+            return ps_hoist_scan_node(node->as.if_stmt.then_branch) ||
+                   ps_hoist_scan_node(node->as.if_stmt.else_branch);
+        case AST_WHILE:
+            return ps_hoist_scan_node(node->as.while_stmt.body);
+        case AST_DO_WHILE:
+            return ps_hoist_scan_node(node->as.do_while.body);
+        case AST_FOR:
+            return ps_hoist_scan_node(node->as.for_stmt.init) ||
+                   ps_hoist_scan_node(node->as.for_stmt.body);
+        case AST_FOR_IN:
+            if (node->as.for_in.is_var &&
+                node->as.for_in.target &&
+                node->as.for_in.target->kind == AST_IDENTIFIER) {
+                return 1;
+            }
+            return ps_hoist_scan_node(node->as.for_in.body);
+        case AST_FOR_OF:
+            if (node->as.for_of.is_var &&
+                node->as.for_of.target &&
+                node->as.for_of.target->kind == AST_IDENTIFIER) {
+                return 1;
+            }
+            return ps_hoist_scan_node(node->as.for_of.body);
+        case AST_SWITCH:
+            for (size_t i = 0; i < node->as.switch_stmt.case_count; i++) {
+                if (ps_hoist_scan_node(node->as.switch_stmt.cases[i])) return 1;
+            }
+            return 0;
+        case AST_CASE:
+            for (size_t i = 0; i < node->as.case_stmt.count; i++) {
+                if (ps_hoist_scan_node(node->as.case_stmt.items[i])) return 1;
+            }
+            return 0;
+        case AST_WITH:
+            return ps_hoist_scan_node(node->as.with_stmt.body);
+        case AST_TRY:
+            return ps_hoist_scan_node(node->as.try_stmt.try_block) ||
+                   ps_hoist_scan_node(node->as.try_stmt.catch_block) ||
+                   ps_hoist_scan_node(node->as.try_stmt.finally_block);
+        case AST_LABEL:
+            return ps_hoist_scan_node(node->as.label_stmt.stmt);
+        default:
+            return 0;
+    }
+}
+
+static void ps_fast_hoist_prepare(PSFunction *func) {
+    if (!func || func->is_native) return;
+    if (func->fast_checked & PS_FAST_CHECKED_HOIST) return;
+    func->fast_checked |= PS_FAST_CHECKED_HOIST;
+    if (ps_hoist_scan_node(func->body)) {
+        func->fast_flags |= PS_FAST_FLAG_HOIST;
+    }
+}
 
 static int ps_fast_add_applicable(PSFunction *func, PSAstNode **left_id, PSAstNode **right_id) {
 #if !PS_ENABLE_FAST_CALLS
@@ -746,10 +1347,1456 @@ static double ps_fast_fib_value(uint64_t n) {
     return a;
 }
 
+static int ps_fast_math_param_index(PSFunction *func, PSString *name, size_t *out_index) {
+    if (!func || !name || !func->param_names) return 0;
+    for (size_t i = 0; i < func->param_count; i++) {
+        if (func->param_names[i] && ps_string_equals(func->param_names[i], name)) {
+            if (out_index) *out_index = i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int ps_fast_math_expr_ok(PSFunction *func, PSAstNode *expr) {
+    if (!expr || !func) return 0;
+    switch (expr->kind) {
+        case AST_LITERAL:
+            return expr->as.literal.value.type == PS_T_NUMBER;
+        case AST_IDENTIFIER:
+            return ps_fast_math_param_index(func, ps_identifier_string(expr), NULL);
+        case AST_UNARY:
+            if (expr->as.unary.op != TOK_PLUS && expr->as.unary.op != TOK_MINUS) return 0;
+            return ps_fast_math_expr_ok(func, expr->as.unary.expr);
+        case AST_BINARY: {
+            int op = expr->as.binary.op;
+            if (op != TOK_PLUS && op != TOK_MINUS && op != TOK_STAR &&
+                op != TOK_SLASH && op != TOK_PERCENT) {
+                return 0;
+            }
+            return ps_fast_math_expr_ok(func, expr->as.binary.left) &&
+                ps_fast_math_expr_ok(func, expr->as.binary.right);
+        }
+        default:
+            return 0;
+    }
+}
+
+static int ps_match_identifier_node(PSAstNode *node, PSString *name) {
+    if (!node || node->kind != AST_IDENTIFIER || !name) return 0;
+    return ps_string_equals(ps_identifier_string(node), name);
+}
+
+static int ps_match_math_floor_call(PSAstNode *expr, PSString *param_name) {
+    if (!expr || expr->kind != AST_CALL) return 0;
+    PSAstNode *callee = expr->as.call.callee;
+    if (!callee || callee->kind != AST_MEMBER) return 0;
+    PSAstNode *member = callee;
+    if (member->as.member.computed) return 0;
+    PSAstNode *obj = member->as.member.object;
+    PSAstNode *prop = member->as.member.property;
+    if (!obj || obj->kind != AST_IDENTIFIER) return 0;
+    PSString *obj_name = ps_identifier_string(obj);
+    if (!ps_string_equals_cstr(obj_name, "Math")) return 0;
+    if (!prop || prop->kind != AST_IDENTIFIER) return 0;
+    PSString *fn = ps_identifier_string(prop);
+    if (!ps_string_equals_cstr(fn, "floor")) return 0;
+    if (expr->as.call.argc != 1) return 0;
+    return ps_match_identifier_node(expr->as.call.args[0], param_name);
+}
+
+static void ps_fast_math_prepare(PSFunction *func) {
+    if (!func || func->is_native) return;
+    if (func->fast_checked & PS_FAST_CHECKED_MATH) return;
+    func->fast_checked |= PS_FAST_CHECKED_MATH;
+    if (!func->body || func->body->kind != AST_BLOCK) return;
+    if (func->body->as.list.count != 1) return;
+    PSAstNode *stmt = func->body->as.list.items[0];
+    if (!stmt || stmt->kind != AST_RETURN || !stmt->as.ret.expr) return;
+    if (!ps_fast_math_expr_ok(func, stmt->as.ret.expr)) return;
+    func->fast_flags |= PS_FAST_FLAG_MATH;
+    func->fast_math_expr = stmt->as.ret.expr;
+}
+
+static int ps_fast_math_eval(PSFunction *func,
+                             PSAstNode *expr,
+                             int argc,
+                             PSValue *argv,
+                             double *out) {
+    if (!expr || !func) return 0;
+    switch (expr->kind) {
+        case AST_LITERAL:
+            if (expr->as.literal.value.type != PS_T_NUMBER) return 0;
+            if (out) *out = expr->as.literal.value.as.number;
+            return 1;
+        case AST_IDENTIFIER: {
+            size_t idx = 0;
+            if (!ps_fast_math_param_index(func, ps_identifier_string(expr), &idx)) return 0;
+            if ((int)idx >= argc || !argv) return 0;
+            if (argv[idx].type != PS_T_NUMBER) return 0;
+            if (out) *out = argv[idx].as.number;
+            return 1;
+        }
+        case AST_UNARY: {
+            double v = 0.0;
+            if (!ps_fast_math_eval(func, expr->as.unary.expr, argc, argv, &v)) return 0;
+            if (expr->as.unary.op == TOK_MINUS) v = -v;
+            if (out) *out = v;
+            return 1;
+        }
+        case AST_BINARY: {
+            double l = 0.0;
+            double r = 0.0;
+            if (!ps_fast_math_eval(func, expr->as.binary.left, argc, argv, &l)) return 0;
+            if (!ps_fast_math_eval(func, expr->as.binary.right, argc, argv, &r)) return 0;
+            switch (expr->as.binary.op) {
+                case TOK_PLUS: l = l + r; break;
+                case TOK_MINUS: l = l - r; break;
+                case TOK_STAR: l = l * r; break;
+                case TOK_SLASH: l = l / r; break;
+                case TOK_PERCENT: l = fmod(l, r); break;
+                default: return 0;
+            }
+            if (out) *out = l;
+            return 1;
+        }
+        default:
+            return 0;
+    }
+}
+
+typedef struct {
+    PSVM *vm;
+    PSFunction *func;
+    int argc;
+    PSValue *argv;
+    PSString **local_names;
+    double *local_vals;
+    size_t local_count;
+} PSFastNumCtx;
+
+typedef struct PSFastNumOp {
+    uint8_t op;
+    uint8_t kind;
+    uint16_t pad;
+    uint32_t index;
+    double imm;
+    PSAstNode *node;
+} PSFastNumOp;
+
+typedef struct {
+    PSFastNumOp *items;
+    size_t count;
+    size_t cap;
+} PSFastNumOpList;
+
+#define PS_FAST_NUM_OP_CONST 1
+#define PS_FAST_NUM_OP_PARAM 2
+#define PS_FAST_NUM_OP_LOCAL 3
+#define PS_FAST_NUM_OP_ENV 4
+#define PS_FAST_NUM_OP_STORE_LOCAL 5
+#define PS_FAST_NUM_OP_MEMBER 6
+#define PS_FAST_NUM_OP_NEG 7
+#define PS_FAST_NUM_OP_ADD 8
+#define PS_FAST_NUM_OP_SUB 9
+#define PS_FAST_NUM_OP_MUL 10
+#define PS_FAST_NUM_OP_DIV 11
+#define PS_FAST_NUM_OP_MOD 12
+#define PS_FAST_NUM_OP_MATH_SQRT 13
+#define PS_FAST_NUM_OP_MATH_ABS 14
+#define PS_FAST_NUM_OP_MATH_POW 15
+#define PS_FAST_NUM_OP_MATH_FLOOR 16
+#define PS_FAST_NUM_OP_MATH_CEIL 17
+#define PS_FAST_NUM_OP_MATH_ROUND 18
+#define PS_FAST_NUM_OP_MATH_MIN 19
+#define PS_FAST_NUM_OP_MATH_MAX 20
+#define PS_FAST_NUM_OP_RETURN 21
+
+#define PS_FAST_NUM_KIND_NONE 0
+#define PS_FAST_NUM_KIND_PARAM 1
+#define PS_FAST_NUM_KIND_LOCAL 2
+#define PS_FAST_NUM_KIND_ENV 3
+
+#define PS_FAST_NUM_MATH_NONE 0
+#define PS_FAST_NUM_MATH_SQRT 1
+#define PS_FAST_NUM_MATH_ABS 2
+#define PS_FAST_NUM_MATH_MIN 3
+#define PS_FAST_NUM_MATH_MAX 4
+#define PS_FAST_NUM_MATH_POW 5
+#define PS_FAST_NUM_MATH_FLOOR 6
+#define PS_FAST_NUM_MATH_CEIL 7
+#define PS_FAST_NUM_MATH_ROUND 8
+
+static uint8_t ps_fast_num_math_id(PSAstNode *expr) {
+    if (!expr || expr->kind != AST_CALL) return PS_FAST_NUM_MATH_NONE;
+    PSAstNode *callee = expr->as.call.callee;
+    if (!callee || callee->kind != AST_MEMBER) return PS_FAST_NUM_MATH_NONE;
+    PSAstNode *member = callee;
+    if (member->as.member.computed) return PS_FAST_NUM_MATH_NONE;
+    PSAstNode *obj = member->as.member.object;
+    PSAstNode *prop = member->as.member.property;
+    if (!obj || obj->kind != AST_IDENTIFIER) return PS_FAST_NUM_MATH_NONE;
+    if (!prop || prop->kind != AST_IDENTIFIER) return PS_FAST_NUM_MATH_NONE;
+    PSString *obj_name = ps_identifier_string(obj);
+    if (!ps_string_equals_cstr(obj_name, "Math")) return PS_FAST_NUM_MATH_NONE;
+    PSString *fn = ps_identifier_string(prop);
+    if (!fn) return PS_FAST_NUM_MATH_NONE;
+    if (ps_string_equals_cstr(fn, "sqrt")) return PS_FAST_NUM_MATH_SQRT;
+    if (ps_string_equals_cstr(fn, "abs")) return PS_FAST_NUM_MATH_ABS;
+    if (ps_string_equals_cstr(fn, "min")) return PS_FAST_NUM_MATH_MIN;
+    if (ps_string_equals_cstr(fn, "max")) return PS_FAST_NUM_MATH_MAX;
+    if (ps_string_equals_cstr(fn, "pow")) return PS_FAST_NUM_MATH_POW;
+    if (ps_string_equals_cstr(fn, "floor")) return PS_FAST_NUM_MATH_FLOOR;
+    if (ps_string_equals_cstr(fn, "ceil")) return PS_FAST_NUM_MATH_CEIL;
+    if (ps_string_equals_cstr(fn, "round")) return PS_FAST_NUM_MATH_ROUND;
+    return PS_FAST_NUM_MATH_NONE;
+}
+
+static int ps_fast_num_op_push(PSFastNumOpList *list, PSFastNumOp op) {
+    if (!list) return 0;
+    if (list->count >= list->cap) {
+        size_t new_cap = list->cap ? list->cap * 2 : 32;
+        PSFastNumOp *items = (PSFastNumOp *)realloc(list->items, new_cap * sizeof(PSFastNumOp));
+        if (!items) return 0;
+        list->items = items;
+        list->cap = new_cap;
+    }
+    list->items[list->count++] = op;
+    return 1;
+}
+
+static int ps_fast_num_emit_expr(PSFunction *func, PSAstNode *expr, PSFastNumOpList *out) {
+    if (!func || !expr || !out) return 0;
+    switch (expr->kind) {
+        case AST_LITERAL: {
+            if (expr->as.literal.value.type != PS_T_NUMBER) return 0;
+            PSFastNumOp op = {0};
+            op.op = PS_FAST_NUM_OP_CONST;
+            op.imm = expr->as.literal.value.as.number;
+            return ps_fast_num_op_push(out, op);
+        }
+        case AST_IDENTIFIER: {
+            uint8_t kind = expr->as.identifier.fast_num_kind;
+            uint32_t idx = expr->as.identifier.fast_num_index;
+            PSFastNumOp op = {0};
+            if (kind == PS_FAST_NUM_KIND_PARAM) {
+                op.op = PS_FAST_NUM_OP_PARAM;
+                op.index = idx;
+                return ps_fast_num_op_push(out, op);
+            }
+            if (kind == PS_FAST_NUM_KIND_LOCAL) {
+                op.op = PS_FAST_NUM_OP_LOCAL;
+                op.index = idx;
+                return ps_fast_num_op_push(out, op);
+            }
+            if (kind == PS_FAST_NUM_KIND_ENV) {
+                op.op = PS_FAST_NUM_OP_ENV;
+                op.node = expr;
+                return ps_fast_num_op_push(out, op);
+            }
+            return 0;
+        }
+        case AST_UNARY: {
+            if (!ps_fast_num_emit_expr(func, expr->as.unary.expr, out)) return 0;
+            if (expr->as.unary.op == TOK_MINUS) {
+                PSFastNumOp op = {0};
+                op.op = PS_FAST_NUM_OP_NEG;
+                return ps_fast_num_op_push(out, op);
+            }
+            return 1;
+        }
+        case AST_BINARY: {
+            int op = expr->as.binary.op;
+            if (!ps_fast_num_emit_expr(func, expr->as.binary.left, out)) return 0;
+            if (!ps_fast_num_emit_expr(func, expr->as.binary.right, out)) return 0;
+            PSFastNumOp inst = {0};
+            switch (op) {
+                case TOK_PLUS: inst.op = PS_FAST_NUM_OP_ADD; break;
+                case TOK_MINUS: inst.op = PS_FAST_NUM_OP_SUB; break;
+                case TOK_STAR: inst.op = PS_FAST_NUM_OP_MUL; break;
+                case TOK_SLASH: inst.op = PS_FAST_NUM_OP_DIV; break;
+                case TOK_PERCENT: inst.op = PS_FAST_NUM_OP_MOD; break;
+                default: return 0;
+            }
+            return ps_fast_num_op_push(out, inst);
+        }
+        case AST_MEMBER: {
+            PSAstNode *obj_node = expr->as.member.object;
+            PSAstNode *prop = expr->as.member.property;
+            if (!expr->as.member.computed) return 0;
+            if (!obj_node || obj_node->kind != AST_IDENTIFIER) return 0;
+            if (!prop || prop->kind != AST_LITERAL || prop->as.literal.value.type != PS_T_NUMBER) return 0;
+            double num = prop->as.literal.value.as.number;
+            if (num < 0.0 || num > (double)UINT32_MAX) return 0;
+            uint32_t index = (uint32_t)num;
+            if ((double)index != num) return 0;
+            PSFastNumOp op = {0};
+            op.op = PS_FAST_NUM_OP_MEMBER;
+            op.index = index;
+            op.node = obj_node;
+            return ps_fast_num_op_push(out, op);
+        }
+        case AST_CALL: {
+            uint8_t math_id = expr->as.call.fast_num_math_id;
+            if (math_id == PS_FAST_NUM_MATH_NONE) {
+                math_id = ps_fast_num_math_id(expr);
+            }
+            size_t argc = expr->as.call.argc;
+            PSAstNode **args = expr->as.call.args;
+            if (math_id == PS_FAST_NUM_MATH_MIN || math_id == PS_FAST_NUM_MATH_MAX) {
+                for (size_t i = 0; i < argc; i++) {
+                    if (!ps_fast_num_emit_expr(func, args[i], out)) return 0;
+                }
+                PSFastNumOp op = {0};
+                op.op = (math_id == PS_FAST_NUM_MATH_MIN) ? PS_FAST_NUM_OP_MATH_MIN
+                                                          : PS_FAST_NUM_OP_MATH_MAX;
+                op.index = (uint32_t)argc;
+                return ps_fast_num_op_push(out, op);
+            }
+            if (math_id == PS_FAST_NUM_MATH_POW) {
+                if (argc > 0) {
+                    if (!ps_fast_num_emit_expr(func, args[0], out)) return 0;
+                } else {
+                    PSFastNumOp zero = {0};
+                    zero.op = PS_FAST_NUM_OP_CONST;
+                    zero.imm = 0.0;
+                    if (!ps_fast_num_op_push(out, zero)) return 0;
+                }
+                if (argc > 1) {
+                    if (!ps_fast_num_emit_expr(func, args[1], out)) return 0;
+                } else {
+                    PSFastNumOp zero = {0};
+                    zero.op = PS_FAST_NUM_OP_CONST;
+                    zero.imm = 0.0;
+                    if (!ps_fast_num_op_push(out, zero)) return 0;
+                }
+                PSFastNumOp op = {0};
+                op.op = PS_FAST_NUM_OP_MATH_POW;
+                return ps_fast_num_op_push(out, op);
+            }
+            if (math_id == PS_FAST_NUM_MATH_SQRT || math_id == PS_FAST_NUM_MATH_ABS ||
+                math_id == PS_FAST_NUM_MATH_FLOOR || math_id == PS_FAST_NUM_MATH_CEIL ||
+                math_id == PS_FAST_NUM_MATH_ROUND) {
+                if (argc > 0) {
+                    if (!ps_fast_num_emit_expr(func, args[0], out)) return 0;
+                } else {
+                    PSFastNumOp zero = {0};
+                    zero.op = PS_FAST_NUM_OP_CONST;
+                    zero.imm = 0.0;
+                    if (!ps_fast_num_op_push(out, zero)) return 0;
+                }
+                PSFastNumOp op = {0};
+                if (math_id == PS_FAST_NUM_MATH_SQRT) op.op = PS_FAST_NUM_OP_MATH_SQRT;
+                else if (math_id == PS_FAST_NUM_MATH_ABS) op.op = PS_FAST_NUM_OP_MATH_ABS;
+                else if (math_id == PS_FAST_NUM_MATH_FLOOR) op.op = PS_FAST_NUM_OP_MATH_FLOOR;
+                else if (math_id == PS_FAST_NUM_MATH_CEIL) op.op = PS_FAST_NUM_OP_MATH_CEIL;
+                else op.op = PS_FAST_NUM_OP_MATH_ROUND;
+                return ps_fast_num_op_push(out, op);
+            }
+            return 0;
+        }
+        default:
+            return 0;
+    }
+}
+
+static int ps_fast_num_compile_ops(PSFunction *func,
+                                   PSAstNode **inits,
+                                   size_t init_count,
+                                   PSAstNode *ret_expr) {
+    if (!func || !ret_expr) return 0;
+    PSFastNumOpList list = {0};
+    for (size_t i = 0; i < init_count; i++) {
+        if (!ps_fast_num_emit_expr(func, inits[i], &list)) {
+            free(list.items);
+            return 0;
+        }
+        PSFastNumOp store = {0};
+        store.op = PS_FAST_NUM_OP_STORE_LOCAL;
+        store.index = (uint32_t)i;
+        if (!ps_fast_num_op_push(&list, store)) {
+            free(list.items);
+            return 0;
+        }
+    }
+    if (!ps_fast_num_emit_expr(func, ret_expr, &list)) {
+        free(list.items);
+        return 0;
+    }
+    PSFastNumOp ret = {0};
+    ret.op = PS_FAST_NUM_OP_RETURN;
+    if (!ps_fast_num_op_push(&list, ret)) {
+        free(list.items);
+        return 0;
+    }
+    func->fast_num_ops = list.items;
+    func->fast_num_ops_count = list.count;
+    return 1;
+}
+
+static void ps_fast_num_bind_identifier(PSFunction *func, PSAstNode *expr) {
+    if (!func || !expr || expr->kind != AST_IDENTIFIER) return;
+    if (expr->as.identifier.fast_num_kind != PS_FAST_NUM_KIND_NONE) return;
+    PSString *name = ps_identifier_string(expr);
+    if (!name) return;
+    if (func->param_names) {
+        for (size_t i = 0; i < func->param_count; i++) {
+            if (func->param_names[i] &&
+                ps_string_equals(func->param_names[i], name)) {
+                expr->as.identifier.fast_num_kind = PS_FAST_NUM_KIND_PARAM;
+                expr->as.identifier.fast_num_index = (uint32_t)i;
+                return;
+            }
+        }
+    }
+    if (func->fast_num_names) {
+        for (size_t i = 0; i < func->fast_num_count; i++) {
+            if (func->fast_num_names[i] &&
+                ps_string_equals(func->fast_num_names[i], name)) {
+                expr->as.identifier.fast_num_kind = PS_FAST_NUM_KIND_LOCAL;
+                expr->as.identifier.fast_num_index = (uint32_t)i;
+                return;
+            }
+        }
+    }
+    expr->as.identifier.fast_num_kind = PS_FAST_NUM_KIND_ENV;
+    expr->as.identifier.fast_num_index = 0;
+}
+
+static void ps_fast_num_bind_expr(PSFunction *func, PSAstNode *expr) {
+    if (!func || !expr) return;
+    switch (expr->kind) {
+        case AST_IDENTIFIER:
+            ps_fast_num_bind_identifier(func, expr);
+            return;
+        case AST_UNARY:
+            ps_fast_num_bind_expr(func, expr->as.unary.expr);
+            return;
+        case AST_BINARY:
+            ps_fast_num_bind_expr(func, expr->as.binary.left);
+            ps_fast_num_bind_expr(func, expr->as.binary.right);
+            return;
+        case AST_CONDITIONAL:
+            ps_fast_num_bind_expr(func, expr->as.conditional.cond);
+            ps_fast_num_bind_expr(func, expr->as.conditional.then_expr);
+            ps_fast_num_bind_expr(func, expr->as.conditional.else_expr);
+            return;
+        case AST_MEMBER:
+            ps_fast_num_bind_expr(func, expr->as.member.object);
+            if (expr->as.member.computed) {
+                ps_fast_num_bind_expr(func, expr->as.member.property);
+            }
+            return;
+        case AST_CALL:
+            ps_fast_num_bind_expr(func, expr->as.call.callee);
+            for (size_t i = 0; i < expr->as.call.argc; i++) {
+                ps_fast_num_bind_expr(func, expr->as.call.args[i]);
+            }
+            if (expr->as.call.fast_num_math_id == PS_FAST_NUM_MATH_NONE) {
+                expr->as.call.fast_num_math_id = ps_fast_num_math_id(expr);
+            }
+            return;
+        case AST_LITERAL:
+        default:
+            return;
+    }
+}
+
+static int ps_fast_num_cond_ok(PSFunction *func, PSAstNode *expr);
+
+static int ps_fast_num_expr_ok(PSFunction *func, PSAstNode *expr) {
+    if (!expr || !func) return 0;
+    switch (expr->kind) {
+        case AST_LITERAL:
+            return expr->as.literal.value.type == PS_T_NUMBER;
+        case AST_IDENTIFIER:
+            return 1;
+        case AST_UNARY:
+            if (expr->as.unary.op != TOK_PLUS && expr->as.unary.op != TOK_MINUS) return 0;
+            return ps_fast_num_expr_ok(func, expr->as.unary.expr);
+        case AST_BINARY: {
+            int op = expr->as.binary.op;
+            if (op != TOK_PLUS && op != TOK_MINUS && op != TOK_STAR &&
+                op != TOK_SLASH && op != TOK_PERCENT) {
+                return 0;
+            }
+            return ps_fast_num_expr_ok(func, expr->as.binary.left) &&
+                ps_fast_num_expr_ok(func, expr->as.binary.right);
+        }
+        case AST_CONDITIONAL:
+            if (!ps_fast_num_cond_ok(func, expr->as.conditional.cond)) return 0;
+            return ps_fast_num_expr_ok(func, expr->as.conditional.then_expr) &&
+                ps_fast_num_expr_ok(func, expr->as.conditional.else_expr);
+        case AST_MEMBER: {
+            if (!expr->as.member.computed) return 0;
+            PSAstNode *obj = expr->as.member.object;
+            PSAstNode *prop = expr->as.member.property;
+            if (!obj || obj->kind != AST_IDENTIFIER) return 0;
+            if (!prop) return 0;
+            if (prop->kind == AST_LITERAL) {
+                return prop->as.literal.value.type == PS_T_NUMBER ||
+                    prop->as.literal.value.type == PS_T_STRING;
+            }
+            if (prop->kind == AST_IDENTIFIER) return 1;
+            return 0;
+        }
+        case AST_CALL: {
+            PSAstNode *callee = expr->as.call.callee;
+            if (!callee || callee->kind != AST_MEMBER) return 0;
+            PSAstNode *member = callee;
+            if (member->as.member.computed) return 0;
+            PSAstNode *obj = member->as.member.object;
+            PSAstNode *prop = member->as.member.property;
+            if (!obj || obj->kind != AST_IDENTIFIER) return 0;
+            PSString *obj_name = ps_identifier_string(obj);
+            if (!ps_string_equals_cstr(obj_name, "Math")) return 0;
+            if (!prop || prop->kind != AST_IDENTIFIER) return 0;
+            PSString *fn = ps_identifier_string(prop);
+            if (!fn) return 0;
+            if (!ps_string_equals_cstr(fn, "sqrt") &&
+                !ps_string_equals_cstr(fn, "abs") &&
+                !ps_string_equals_cstr(fn, "min") &&
+                !ps_string_equals_cstr(fn, "max") &&
+                !ps_string_equals_cstr(fn, "pow") &&
+                !ps_string_equals_cstr(fn, "floor") &&
+                !ps_string_equals_cstr(fn, "ceil") &&
+                !ps_string_equals_cstr(fn, "round")) {
+                return 0;
+            }
+            for (size_t i = 0; i < expr->as.call.argc; i++) {
+                if (!ps_fast_num_expr_ok(func, expr->as.call.args[i])) return 0;
+            }
+            return 1;
+        }
+        default:
+            return 0;
+    }
+}
+
+static int ps_fast_num_cond_ok(PSFunction *func, PSAstNode *expr) {
+    if (!expr || !func) return 0;
+    if (expr->kind == AST_CONDITIONAL) return 0;
+    if (ps_fast_num_expr_ok(func, expr)) return 1;
+    if (expr->kind == AST_LITERAL) {
+        return expr->as.literal.value.type == PS_T_BOOLEAN;
+    }
+    if (expr->kind == AST_UNARY && expr->as.unary.op == TOK_NOT) {
+        return ps_fast_num_cond_ok(func, expr->as.unary.expr);
+    }
+    if (expr->kind == AST_BINARY) {
+        int op = expr->as.binary.op;
+        if (op == TOK_AND_AND || op == TOK_OR_OR) {
+            return ps_fast_num_cond_ok(func, expr->as.binary.left) &&
+                ps_fast_num_cond_ok(func, expr->as.binary.right);
+        }
+        if (op == TOK_LT || op == TOK_LTE || op == TOK_GT || op == TOK_GTE ||
+            op == TOK_EQ || op == TOK_NEQ || op == TOK_STRICT_EQ || op == TOK_STRICT_NEQ) {
+            return ps_fast_num_expr_ok(func, expr->as.binary.left) &&
+                ps_fast_num_expr_ok(func, expr->as.binary.right);
+        }
+    }
+    return 0;
+}
+
+static int ps_fast_num_lookup(PSFastNumCtx *ctx, PSString *name, double *out) {
+    if (!ctx || !name || !out) return 0;
+    if (ctx->func && ctx->func->param_names) {
+        for (size_t i = 0; i < ctx->func->param_count; i++) {
+            if (ctx->func->param_names[i] &&
+                ps_string_equals(ctx->func->param_names[i], name)) {
+                if (i >= (size_t)ctx->argc) return 0;
+                if (!ctx->argv || ctx->argv[i].type != PS_T_NUMBER) return 0;
+                *out = ctx->argv[i].as.number;
+                return 1;
+            }
+        }
+    }
+    for (size_t i = 0; i < ctx->local_count; i++) {
+        if (ctx->local_names[i] &&
+            ps_string_equals(ctx->local_names[i], name)) {
+            *out = ctx->local_vals[i];
+            return 1;
+        }
+    }
+    if (ctx->func && ctx->func->env) {
+        int found = 0;
+        PSValue v = ps_env_get(ctx->func->env, name, &found);
+        if (found && v.type == PS_T_NUMBER) {
+            *out = v.as.number;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int ps_fast_num_identifier_value(PSFastNumCtx *ctx, PSAstNode *node, PSValue *out) {
+    if (!ctx || !node || node->kind != AST_IDENTIFIER || !out) return 0;
+    uint8_t kind = node->as.identifier.fast_num_kind;
+    if (kind == PS_FAST_NUM_KIND_PARAM) {
+        size_t idx = (size_t)node->as.identifier.fast_num_index;
+        if (idx >= (size_t)ctx->argc) return 0;
+        if (!ctx->argv) return 0;
+        *out = ctx->argv[idx];
+        return 1;
+    }
+    if (kind == PS_FAST_NUM_KIND_LOCAL) {
+        size_t idx = (size_t)node->as.identifier.fast_num_index;
+        if (idx >= ctx->local_count) return 0;
+        *out = ps_value_number(ctx->local_vals[idx]);
+        return 1;
+    }
+    if (kind == PS_FAST_NUM_KIND_ENV) {
+        if (ctx->func && ctx->func->env) {
+            int found = 0;
+            PSValue v = ps_value_undefined();
+            if (!ps_identifier_cached_get(ctx->func->env, node, &v, &found)) {
+                PSString *name = ps_identifier_string(node);
+                if (!name) return 0;
+                v = ps_env_get(ctx->func->env, name, &found);
+            }
+            if (found) {
+                *out = v;
+                return 1;
+            }
+        }
+        return 0;
+    }
+    PSString *name = ps_identifier_string(node);
+    if (!name) return 0;
+    if (ctx->func && ctx->func->param_names) {
+        for (size_t i = 0; i < ctx->func->param_count; i++) {
+            if (ctx->func->param_names[i] &&
+                ps_string_equals(ctx->func->param_names[i], name)) {
+                if (i >= (size_t)ctx->argc) return 0;
+                if (!ctx->argv) return 0;
+                *out = ctx->argv[i];
+                return 1;
+            }
+        }
+    }
+    if (ctx->func && ctx->func->env) {
+        int found = 0;
+        PSValue v = ps_env_get(ctx->func->env, name, &found);
+        if (found) {
+            *out = v;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int ps_fast_num_eval_expr(PSFastNumCtx *ctx, PSAstNode *expr, double *out);
+static int ps_fast_num_eval_cond(PSFastNumCtx *ctx, PSAstNode *expr, int *out);
+
+static int ps_fast_num_eval_member(PSFastNumCtx *ctx, PSAstNode *expr, double *out) {
+    if (!ctx || !expr || expr->kind != AST_MEMBER || !out) return 0;
+    if (!expr->as.member.computed) return 0;
+    PSAstNode *obj_node = expr->as.member.object;
+    PSAstNode *prop = expr->as.member.property;
+    if (!obj_node || obj_node->kind != AST_IDENTIFIER || !prop) return 0;
+
+    PSValue obj_val = ps_value_undefined();
+    if (!ps_fast_num_identifier_value(ctx, obj_node, &obj_val)) return 0;
+    if (obj_val.type != PS_T_OBJECT || !obj_val.as.object) return 0;
+    PSObject *obj = obj_val.as.object;
+
+    PSValue key_val = ps_value_undefined();
+    if (prop->kind == AST_LITERAL) {
+        key_val = prop->as.literal.value;
+    } else if (prop->kind == AST_IDENTIFIER) {
+        if (!ps_fast_num_identifier_value(ctx, prop, &key_val)) return 0;
+    } else {
+        return 0;
+    }
+
+    if (obj->kind == PS_OBJ_KIND_ARRAY || obj->kind == PS_OBJ_KIND_BUFFER) {
+        size_t index = 0;
+        if (key_val.type == PS_T_NUMBER) {
+            double num = key_val.as.number;
+            if (num < 0.0 || num > (double)SIZE_MAX) return 0;
+            index = (size_t)num;
+            if ((double)index != num) return 0;
+        } else if (key_val.type == PS_T_STRING) {
+            if (!ps_array_string_to_index(key_val.as.string, &index)) return 0;
+        } else {
+            return 0;
+        }
+        if (obj->kind == PS_OBJ_KIND_ARRAY) {
+            PSValue elem = ps_value_undefined();
+            if (!ps_array_get_index(obj, index, &elem)) return 0;
+            if (elem.type != PS_T_NUMBER) return 0;
+            *out = elem.as.number;
+            return 1;
+        }
+        PSBuffer *buf = ps_buffer_from_object(obj);
+        if (!buf || index >= buf->size) return 0;
+        *out = (double)buf->data[index];
+        return 1;
+    }
+
+    if (obj->kind == PS_OBJ_KIND_PLAIN) {
+        if (key_val.type == PS_T_STRING) {
+            if (obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                size_t index = 0;
+                if (ps_string_to_index_size(key_val.as.string, &index)) {
+                    PSValue mapped = ps_value_undefined();
+                    if (ps_num_map_get(obj, index, &mapped)) {
+                        if (mapped.type != PS_T_NUMBER) return 0;
+                        *out = mapped.as.number;
+                        return 1;
+                    }
+                }
+            }
+            int found = 0;
+            PSValue val = ps_object_get(obj, key_val.as.string, &found);
+            if (!found || val.type != PS_T_NUMBER) return 0;
+            *out = val.as.number;
+            return 1;
+        }
+        if (key_val.type == PS_T_NUMBER) {
+            double num = key_val.as.number;
+            if (num >= 0.0 && num <= (double)SIZE_MAX) {
+                size_t index = (size_t)num;
+                if ((double)index == num && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                    PSValue mapped = ps_value_undefined();
+                    if (ps_num_map_get(obj, index, &mapped)) {
+                        if (mapped.type != PS_T_NUMBER) return 0;
+                        *out = mapped.as.number;
+                        return 1;
+                    }
+                }
+            }
+            PSString *name = ps_value_to_string(&key_val);
+            int found = 0;
+            PSValue val = ps_object_get(obj, name, &found);
+            if (!found || val.type != PS_T_NUMBER) return 0;
+            *out = val.as.number;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int ps_fast_num_eval_call(PSFastNumCtx *ctx, PSAstNode *expr, double *out) {
+    if (!ctx || !expr || expr->kind != AST_CALL || !out) return 0;
+    uint8_t math_id = expr->as.call.fast_num_math_id;
+    if (math_id == PS_FAST_NUM_MATH_NONE) {
+        math_id = ps_fast_num_math_id(expr);
+        expr->as.call.fast_num_math_id = math_id;
+    }
+    if (math_id == PS_FAST_NUM_MATH_NONE) return 0;
+
+    size_t argc = expr->as.call.argc;
+    double arg0 = 0.0;
+    double arg1 = 0.0;
+    if (argc > 0) {
+        if (!ps_fast_num_eval_expr(ctx, expr->as.call.args[0], &arg0)) return 0;
+    }
+    if (argc > 1) {
+        if (!ps_fast_num_eval_expr(ctx, expr->as.call.args[1], &arg1)) return 0;
+    }
+
+    if (math_id == PS_FAST_NUM_MATH_SQRT) {
+        *out = sqrt(arg0);
+        return 1;
+    }
+    if (math_id == PS_FAST_NUM_MATH_ABS) {
+        *out = fabs(arg0);
+        return 1;
+    }
+    if (math_id == PS_FAST_NUM_MATH_POW) {
+        *out = pow(arg0, arg1);
+        return 1;
+    }
+    if (math_id == PS_FAST_NUM_MATH_FLOOR) {
+        *out = floor(arg0);
+        return 1;
+    }
+    if (math_id == PS_FAST_NUM_MATH_CEIL) {
+        *out = ceil(arg0);
+        return 1;
+    }
+    if (math_id == PS_FAST_NUM_MATH_ROUND) {
+        if (ps_value_is_nan(arg0) || isinf(arg0)) {
+            *out = arg0;
+            return 1;
+        }
+        double r = floor(arg0 + 0.5);
+        if (r == 0.0 && arg0 < 0.0) r = -0.0;
+        *out = r;
+        return 1;
+    }
+    if (math_id == PS_FAST_NUM_MATH_MIN) {
+        if (argc == 0) {
+            *out = INFINITY;
+            return 1;
+        }
+        double minv = INFINITY;
+        for (size_t i = 0; i < argc; i++) {
+            double v = 0.0;
+            if (!ps_fast_num_eval_expr(ctx, expr->as.call.args[i], &v)) return 0;
+            if (ps_value_is_nan(v)) {
+                *out = 0.0 / 0.0;
+                return 1;
+            }
+            if (v < minv) minv = v;
+        }
+        *out = minv;
+        return 1;
+    }
+    if (math_id == PS_FAST_NUM_MATH_MAX) {
+        if (argc == 0) {
+            *out = -INFINITY;
+            return 1;
+        }
+        double maxv = -INFINITY;
+        for (size_t i = 0; i < argc; i++) {
+            double v = 0.0;
+            if (!ps_fast_num_eval_expr(ctx, expr->as.call.args[i], &v)) return 0;
+            if (ps_value_is_nan(v)) {
+                *out = 0.0 / 0.0;
+                return 1;
+            }
+            if (v > maxv) maxv = v;
+        }
+        *out = maxv;
+        return 1;
+    }
+    return 0;
+}
+
+static int ps_fast_num_eval_cond(PSFastNumCtx *ctx, PSAstNode *expr, int *out) {
+    if (!ctx || !expr || !out) return 0;
+    if (expr->kind == AST_LITERAL) {
+        if (expr->as.literal.value.type == PS_T_BOOLEAN) {
+            *out = expr->as.literal.value.as.boolean ? 1 : 0;
+            return 1;
+        }
+        if (expr->as.literal.value.type == PS_T_NUMBER) {
+            double v = expr->as.literal.value.as.number;
+            *out = (!ps_value_is_nan(v) && v != 0.0) ? 1 : 0;
+            return 1;
+        }
+        return 0;
+    }
+    if (expr->kind == AST_IDENTIFIER) {
+        PSValue v = ps_value_undefined();
+        if (!ps_fast_num_identifier_value(ctx, expr, &v)) return 0;
+        if (v.type == PS_T_BOOLEAN) {
+            *out = v.as.boolean ? 1 : 0;
+            return 1;
+        }
+        if (v.type == PS_T_NUMBER) {
+            *out = (!ps_value_is_nan(v.as.number) && v.as.number != 0.0) ? 1 : 0;
+            return 1;
+        }
+        return 0;
+    }
+    if (expr->kind == AST_UNARY && expr->as.unary.op == TOK_NOT) {
+        int inner = 0;
+        if (!ps_fast_num_eval_cond(ctx, expr->as.unary.expr, &inner)) return 0;
+        *out = inner ? 0 : 1;
+        return 1;
+    }
+    if (expr->kind == AST_BINARY) {
+        int op = expr->as.binary.op;
+        if (op == TOK_AND_AND) {
+            int left = 0;
+            if (!ps_fast_num_eval_cond(ctx, expr->as.binary.left, &left)) return 0;
+            if (!left) {
+                *out = 0;
+                return 1;
+            }
+            return ps_fast_num_eval_cond(ctx, expr->as.binary.right, out);
+        }
+        if (op == TOK_OR_OR) {
+            int left = 0;
+            if (!ps_fast_num_eval_cond(ctx, expr->as.binary.left, &left)) return 0;
+            if (left) {
+                *out = 1;
+                return 1;
+            }
+            return ps_fast_num_eval_cond(ctx, expr->as.binary.right, out);
+        }
+        if (op == TOK_LT || op == TOK_LTE || op == TOK_GT || op == TOK_GTE ||
+            op == TOK_EQ || op == TOK_NEQ || op == TOK_STRICT_EQ || op == TOK_STRICT_NEQ) {
+            double l = 0.0;
+            double r = 0.0;
+            if (!ps_fast_num_eval_expr(ctx, expr->as.binary.left, &l)) return 0;
+            if (!ps_fast_num_eval_expr(ctx, expr->as.binary.right, &r)) return 0;
+            int ln = ps_value_is_nan(l);
+            int rn = ps_value_is_nan(r);
+            if (op == TOK_EQ || op == TOK_STRICT_EQ) {
+                if (ln || rn) {
+                    *out = 0;
+                } else {
+                    *out = (l == r) ? 1 : 0;
+                }
+                return 1;
+            }
+            if (op == TOK_NEQ || op == TOK_STRICT_NEQ) {
+                if (ln || rn) {
+                    *out = 1;
+                } else {
+                    *out = (l != r) ? 1 : 0;
+                }
+                return 1;
+            }
+            if (ln || rn) {
+                *out = 0;
+                return 1;
+            }
+            if (op == TOK_LT) *out = (l < r) ? 1 : 0;
+            else if (op == TOK_LTE) *out = (l <= r) ? 1 : 0;
+            else if (op == TOK_GT) *out = (l > r) ? 1 : 0;
+            else *out = (l >= r) ? 1 : 0;
+            return 1;
+        }
+    }
+    {
+        double v = 0.0;
+        if (!ps_fast_num_eval_expr(ctx, expr, &v)) return 0;
+        *out = (!ps_value_is_nan(v) && v != 0.0) ? 1 : 0;
+        return 1;
+    }
+}
+
+static int ps_fast_num_eval_expr(PSFastNumCtx *ctx, PSAstNode *expr, double *out) {
+    if (!ctx || !expr || !out) return 0;
+    switch (expr->kind) {
+        case AST_LITERAL:
+            if (expr->as.literal.value.type != PS_T_NUMBER) return 0;
+            *out = expr->as.literal.value.as.number;
+            return 1;
+        case AST_IDENTIFIER: {
+            uint8_t kind = expr->as.identifier.fast_num_kind;
+            if (kind == PS_FAST_NUM_KIND_PARAM) {
+                size_t idx = (size_t)expr->as.identifier.fast_num_index;
+                if (idx >= (size_t)ctx->argc) return 0;
+                if (!ctx->argv || ctx->argv[idx].type != PS_T_NUMBER) return 0;
+                *out = ctx->argv[idx].as.number;
+                return 1;
+            }
+            if (kind == PS_FAST_NUM_KIND_LOCAL) {
+                size_t idx = (size_t)expr->as.identifier.fast_num_index;
+                if (idx >= ctx->local_count) return 0;
+                *out = ctx->local_vals[idx];
+                return 1;
+            }
+            if (kind == PS_FAST_NUM_KIND_ENV) {
+                if (ctx->func && ctx->func->env) {
+                    int found = 0;
+                    PSValue v = ps_value_undefined();
+                    if (!ps_identifier_cached_get(ctx->func->env, expr, &v, &found)) {
+                        PSString *name = ps_identifier_string(expr);
+                        if (!name) return 0;
+                        v = ps_env_get(ctx->func->env, name, &found);
+                    }
+                    if (found && v.type == PS_T_NUMBER) {
+                        *out = v.as.number;
+                        return 1;
+                    }
+                }
+                return 0;
+            }
+            PSString *name = ps_identifier_string(expr);
+            return ps_fast_num_lookup(ctx, name, out);
+        }
+        case AST_UNARY: {
+            double v = 0.0;
+            if (!ps_fast_num_eval_expr(ctx, expr->as.unary.expr, &v)) return 0;
+            if (expr->as.unary.op == TOK_MINUS) v = -v;
+            *out = v;
+            return 1;
+        }
+        case AST_CONDITIONAL: {
+            int cond = 0;
+            if (!ps_fast_num_eval_cond(ctx, expr->as.conditional.cond, &cond)) return 0;
+            if (cond) {
+                return ps_fast_num_eval_expr(ctx, expr->as.conditional.then_expr, out);
+            }
+            return ps_fast_num_eval_expr(ctx, expr->as.conditional.else_expr, out);
+        }
+        case AST_BINARY: {
+            double l = 0.0;
+            double r = 0.0;
+            if (!ps_fast_num_eval_expr(ctx, expr->as.binary.left, &l)) return 0;
+            if (!ps_fast_num_eval_expr(ctx, expr->as.binary.right, &r)) return 0;
+            switch (expr->as.binary.op) {
+                case TOK_PLUS: *out = l + r; return 1;
+                case TOK_MINUS: *out = l - r; return 1;
+                case TOK_STAR: *out = l * r; return 1;
+                case TOK_SLASH: *out = l / r; return 1;
+                case TOK_PERCENT: *out = fmod(l, r); return 1;
+                default: return 0;
+            }
+        }
+        case AST_MEMBER:
+            return ps_fast_num_eval_member(ctx, expr, out);
+        case AST_CALL:
+            return ps_fast_num_eval_call(ctx, expr, out);
+        default:
+            return 0;
+    }
+}
+
+static void ps_fast_num_prepare(PSFunction *func) {
+    if (!func || func->is_native) return;
+    if (func->fast_checked & PS_FAST_CHECKED_NUM) return;
+    func->fast_checked |= PS_FAST_CHECKED_NUM;
+    if (!func->body || func->body->kind != AST_BLOCK) return;
+
+    PSAstNode **items = func->body->as.list.items;
+    size_t count = func->body->as.list.count;
+    if (!items || count == 0) return;
+
+    size_t local_count = 0;
+    PSAstNode *ret_expr = NULL;
+    PSAstNode *if_cond = NULL;
+    PSAstNode *if_ret_expr = NULL;
+    int saw_if = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        PSAstNode *stmt = items[i];
+        if (!stmt) return;
+        if (stmt->kind == AST_VAR_DECL) {
+            PSAstNode *id = stmt->as.var_decl.id;
+            PSAstNode *init = stmt->as.var_decl.init;
+            if (!id || id->kind != AST_IDENTIFIER || !init) return;
+            if (!ps_fast_num_expr_ok(func, init)) return;
+            local_count++;
+            continue;
+        }
+        if (stmt->kind == AST_IF) {
+            if (saw_if) return;
+            PSAstNode *cond = stmt->as.if_stmt.cond;
+            PSAstNode *then_branch = stmt->as.if_stmt.then_branch;
+            PSAstNode *else_branch = stmt->as.if_stmt.else_branch;
+            if (!cond || !then_branch || else_branch) return;
+            if (then_branch->kind != AST_RETURN || !then_branch->as.ret.expr) return;
+            if (!ps_fast_num_cond_ok(func, cond)) return;
+            if (!ps_fast_num_expr_ok(func, then_branch->as.ret.expr)) return;
+            if_cond = cond;
+            if_ret_expr = then_branch->as.ret.expr;
+            saw_if = 1;
+            continue;
+        }
+        if (stmt->kind == AST_RETURN) {
+            if (!stmt->as.ret.expr) return;
+            if (!ps_fast_num_expr_ok(func, stmt->as.ret.expr)) return;
+            ret_expr = stmt->as.ret.expr;
+            if (i + 1 != count) return;
+            break;
+        }
+        return;
+    }
+
+    if (!ret_expr) return;
+    if (local_count == 0) return;
+
+    PSAstNode **inits = (PSAstNode **)calloc(local_count, sizeof(PSAstNode *));
+    PSString **names = (PSString **)calloc(local_count, sizeof(PSString *));
+    if (!inits || !names) {
+        free(inits);
+        free(names);
+        return;
+    }
+
+    size_t idx = 0;
+    for (size_t i = 0; i < count; i++) {
+        PSAstNode *stmt = items[i];
+        if (stmt && stmt->kind == AST_VAR_DECL) {
+            PSAstNode *id = stmt->as.var_decl.id;
+            PSAstNode *init = stmt->as.var_decl.init;
+            if (!id || id->kind != AST_IDENTIFIER || !init) {
+                free(inits);
+                free(names);
+                return;
+            }
+            PSString *name = ps_identifier_string(id);
+            for (size_t j = 0; j < idx; j++) {
+                if (names[j] && ps_string_equals(names[j], name)) {
+                    free(inits);
+                    free(names);
+                    return;
+                }
+            }
+            inits[idx] = init;
+            names[idx] = name;
+            idx++;
+        }
+    }
+    if (idx != local_count) {
+        free(inits);
+        free(names);
+        return;
+    }
+
+    func->fast_num_inits = inits;
+    func->fast_num_names = names;
+    func->fast_num_count = local_count;
+    func->fast_num_return = ret_expr;
+    func->fast_num_if_cond = if_cond;
+    func->fast_num_if_return = if_ret_expr;
+    func->fast_flags |= PS_FAST_FLAG_NUM;
+    for (size_t i = 0; i < local_count; i++) {
+        ps_fast_num_bind_expr(func, inits[i]);
+    }
+    if (if_cond) {
+        ps_fast_num_bind_expr(func, if_cond);
+    }
+    if (if_ret_expr) {
+        ps_fast_num_bind_expr(func, if_ret_expr);
+    }
+    ps_fast_num_bind_expr(func, ret_expr);
+    if (!func->fast_num_if_cond) {
+        (void)ps_fast_num_compile_ops(func, inits, local_count, ret_expr);
+    }
+}
+
+static int ps_fast_num_eval_ops(PSFastNumCtx *ctx,
+                                PSFastNumOp *ops,
+                                size_t op_count,
+                                double *out) {
+    if (!ctx || !ops || !out || op_count == 0) return 0;
+    double stack_buf[64];
+    double *stack = stack_buf;
+    size_t sp = 0;
+    if (op_count > 64) {
+        stack = (double *)calloc(op_count, sizeof(double));
+        if (!stack) return 0;
+    }
+    for (size_t ip = 0; ip < op_count; ip++) {
+        PSFastNumOp *op = &ops[ip];
+        switch (op->op) {
+            case PS_FAST_NUM_OP_CONST:
+                stack[sp++] = op->imm;
+                break;
+            case PS_FAST_NUM_OP_PARAM: {
+                size_t idx = (size_t)op->index;
+                if (idx >= (size_t)ctx->argc) goto fail;
+                if (!ctx->argv || ctx->argv[idx].type != PS_T_NUMBER) goto fail;
+                stack[sp++] = ctx->argv[idx].as.number;
+                break;
+            }
+            case PS_FAST_NUM_OP_LOCAL: {
+                size_t idx = (size_t)op->index;
+                if (idx >= ctx->local_count) goto fail;
+                stack[sp++] = ctx->local_vals[idx];
+                break;
+            }
+            case PS_FAST_NUM_OP_ENV: {
+                PSAstNode *node = op->node;
+                if (!ctx->func || !ctx->func->env || !node) goto fail;
+                int found = 0;
+                PSValue v = ps_value_undefined();
+                if (!ps_identifier_cached_get(ctx->func->env, node, &v, &found)) {
+                    PSString *name = ps_identifier_string(node);
+                    if (!name) goto fail;
+                    v = ps_env_get(ctx->func->env, name, &found);
+                }
+                if (!found || v.type != PS_T_NUMBER) goto fail;
+                stack[sp++] = v.as.number;
+                break;
+            }
+            case PS_FAST_NUM_OP_STORE_LOCAL: {
+                size_t idx = (size_t)op->index;
+                if (idx >= ctx->local_count || sp == 0) goto fail;
+                ctx->local_vals[idx] = stack[--sp];
+                break;
+            }
+            case PS_FAST_NUM_OP_MEMBER: {
+                PSAstNode *node = op->node;
+                PSValue obj_val = ps_value_undefined();
+                if (!ps_fast_num_identifier_value(ctx, node, &obj_val)) goto fail;
+                if (obj_val.type != PS_T_OBJECT || !obj_val.as.object) goto fail;
+                PSObject *obj = obj_val.as.object;
+                size_t index = (size_t)op->index;
+                if (obj->kind == PS_OBJ_KIND_ARRAY) {
+                    PSValue elem = ps_value_undefined();
+                    if (!ps_array_get_index(obj, index, &elem)) goto fail;
+                    if (elem.type != PS_T_NUMBER) goto fail;
+                    stack[sp++] = elem.as.number;
+                    break;
+                }
+                if (obj->kind == PS_OBJ_KIND_BUFFER) {
+                    PSBuffer *buf = ps_buffer_from_object(obj);
+                    if (!buf || index >= buf->size) goto fail;
+                    stack[sp++] = (double)buf->data[index];
+                    break;
+                }
+                goto fail;
+            }
+            case PS_FAST_NUM_OP_NEG:
+                if (sp == 0) goto fail;
+                stack[sp - 1] = -stack[sp - 1];
+                break;
+            case PS_FAST_NUM_OP_ADD:
+                if (sp < 2) goto fail;
+                stack[sp - 2] = stack[sp - 2] + stack[sp - 1];
+                sp--;
+                break;
+            case PS_FAST_NUM_OP_SUB:
+                if (sp < 2) goto fail;
+                stack[sp - 2] = stack[sp - 2] - stack[sp - 1];
+                sp--;
+                break;
+            case PS_FAST_NUM_OP_MUL:
+                if (sp < 2) goto fail;
+                stack[sp - 2] = stack[sp - 2] * stack[sp - 1];
+                sp--;
+                break;
+            case PS_FAST_NUM_OP_DIV:
+                if (sp < 2) goto fail;
+                stack[sp - 2] = stack[sp - 2] / stack[sp - 1];
+                sp--;
+                break;
+            case PS_FAST_NUM_OP_MOD:
+                if (sp < 2) goto fail;
+                stack[sp - 2] = fmod(stack[sp - 2], stack[sp - 1]);
+                sp--;
+                break;
+            case PS_FAST_NUM_OP_MATH_SQRT:
+                if (sp == 0) goto fail;
+                stack[sp - 1] = sqrt(stack[sp - 1]);
+                break;
+            case PS_FAST_NUM_OP_MATH_ABS:
+                if (sp == 0) goto fail;
+                stack[sp - 1] = fabs(stack[sp - 1]);
+                break;
+            case PS_FAST_NUM_OP_MATH_POW:
+                if (sp < 2) goto fail;
+                stack[sp - 2] = pow(stack[sp - 2], stack[sp - 1]);
+                sp--;
+                break;
+            case PS_FAST_NUM_OP_MATH_FLOOR:
+                if (sp == 0) goto fail;
+                stack[sp - 1] = floor(stack[sp - 1]);
+                break;
+            case PS_FAST_NUM_OP_MATH_CEIL:
+                if (sp == 0) goto fail;
+                stack[sp - 1] = ceil(stack[sp - 1]);
+                break;
+            case PS_FAST_NUM_OP_MATH_ROUND:
+                if (sp == 0) goto fail;
+                if (!ps_value_is_nan(stack[sp - 1]) && !isinf(stack[sp - 1])) {
+                    double r = floor(stack[sp - 1] + 0.5);
+                    if (r == 0.0 && stack[sp - 1] < 0.0) r = -0.0;
+                    stack[sp - 1] = r;
+                }
+                break;
+            case PS_FAST_NUM_OP_MATH_MIN: {
+                uint32_t argc = op->index;
+                if (argc == 0) {
+                    stack[sp++] = INFINITY;
+                    break;
+                }
+                if (sp < argc) goto fail;
+                double minv = INFINITY;
+                for (uint32_t i = 0; i < argc; i++) {
+                    double v = stack[sp - 1 - i];
+                    if (ps_value_is_nan(v)) {
+                        stack[sp - argc] = 0.0 / 0.0;
+                        sp = sp - argc + 1;
+                        goto next_op;
+                    }
+                    if (v < minv) minv = v;
+                }
+                stack[sp - argc] = minv;
+                sp = sp - argc + 1;
+                break;
+            }
+            case PS_FAST_NUM_OP_MATH_MAX: {
+                uint32_t argc = op->index;
+                if (argc == 0) {
+                    stack[sp++] = -INFINITY;
+                    break;
+                }
+                if (sp < argc) goto fail;
+                double maxv = -INFINITY;
+                for (uint32_t i = 0; i < argc; i++) {
+                    double v = stack[sp - 1 - i];
+                    if (ps_value_is_nan(v)) {
+                        stack[sp - argc] = 0.0 / 0.0;
+                        sp = sp - argc + 1;
+                        goto next_op;
+                    }
+                    if (v > maxv) maxv = v;
+                }
+                stack[sp - argc] = maxv;
+                sp = sp - argc + 1;
+                break;
+            }
+            case PS_FAST_NUM_OP_RETURN:
+                if (sp == 0) goto fail;
+                *out = stack[--sp];
+                if (stack != stack_buf) free(stack);
+                return 1;
+            default:
+                goto fail;
+        }
+next_op:
+        ;
+    }
+fail:
+    if (stack != stack_buf) free(stack);
+    return 0;
+}
+
+static int ps_fast_num_eval(PSVM *vm,
+                            PSFunction *func,
+                            int argc,
+                            PSValue *argv,
+                            double *out) {
+    if (!vm || !func || !out) return 0;
+    if (!(func->fast_flags & PS_FAST_FLAG_NUM)) return 0;
+    if (!func->fast_num_inits || !func->fast_num_names || !func->fast_num_return) return 0;
+
+    double stack_vals[8];
+    double *locals = stack_vals;
+    if (func->fast_num_count > 8) {
+        locals = (double *)calloc(func->fast_num_count, sizeof(double));
+        if (!locals) return 0;
+    }
+
+    PSFastNumCtx ctx = {
+        .vm = vm,
+        .func = func,
+        .argc = argc,
+        .argv = argv,
+        .local_names = func->fast_num_names,
+        .local_vals = locals,
+        .local_count = func->fast_num_count
+    };
+
+    if (!func->fast_num_if_cond && func->fast_num_ops && func->fast_num_ops_count > 0) {
+        if (ps_fast_num_eval_ops(&ctx, func->fast_num_ops, func->fast_num_ops_count, out)) {
+            if (locals != stack_vals) free(locals);
+            return 1;
+        }
+    }
+
+    for (size_t i = 0; i < func->fast_num_count; i++) {
+        double v = 0.0;
+        if (!ps_fast_num_eval_expr(&ctx, func->fast_num_inits[i], &v)) {
+            if (locals != stack_vals) free(locals);
+            return 0;
+        }
+        locals[i] = v;
+    }
+
+    if (func->fast_num_if_cond && func->fast_num_if_return) {
+        int cond = 0;
+        if (!ps_fast_num_eval_cond(&ctx, func->fast_num_if_cond, &cond)) {
+            if (locals != stack_vals) free(locals);
+            return 0;
+        }
+        if (cond) {
+            double result = 0.0;
+            if (!ps_fast_num_eval_expr(&ctx, func->fast_num_if_return, &result)) {
+                if (locals != stack_vals) free(locals);
+                return 0;
+            }
+            if (locals != stack_vals) free(locals);
+            *out = result;
+            return 1;
+        }
+    }
+
+    double result = 0.0;
+    int ok = ps_fast_num_eval_expr(&ctx, func->fast_num_return, &result);
+    if (locals != stack_vals) free(locals);
+    if (!ok) return 0;
+    *out = result;
+    return 1;
+}
+
+static void ps_fast_clamp_prepare(PSFunction *func) {
+    if (!func || func->is_native) return;
+    if (func->fast_checked & PS_FAST_CHECKED_CLAMP) return;
+    func->fast_checked |= PS_FAST_CHECKED_CLAMP;
+    if (func->param_count != 1 || !func->params || !func->params[0]) return;
+    if (func->param_defaults && func->param_defaults[0]) return;
+    if (!func->body || func->body->kind != AST_BLOCK) return;
+    if (func->body->as.list.count != 3) return;
+
+    PSAstNode *param = func->params[0];
+    if (!param || param->kind != AST_IDENTIFIER) return;
+    PSString *param_name = ps_identifier_string(param);
+    if (!param_name) return;
+
+    PSAstNode *stmt0 = func->body->as.list.items[0];
+    PSAstNode *stmt1 = func->body->as.list.items[1];
+    PSAstNode *stmt2 = func->body->as.list.items[2];
+    if (!stmt0 || !stmt1 || !stmt2) return;
+    if (stmt0->kind != AST_IF || stmt1->kind != AST_IF || stmt2->kind != AST_RETURN) return;
+
+    PSAstNode *cond0 = stmt0->as.if_stmt.cond;
+    PSAstNode *then0 = stmt0->as.if_stmt.then_branch;
+    if (!cond0 || !then0 || stmt0->as.if_stmt.else_branch) return;
+    if (cond0->kind != AST_BINARY || cond0->as.binary.op != TOK_LT) return;
+    if (!ps_match_identifier_node(cond0->as.binary.left, param_name)) return;
+    if (!cond0->as.binary.right ||
+        cond0->as.binary.right->kind != AST_LITERAL ||
+        cond0->as.binary.right->as.literal.value.type != PS_T_NUMBER) {
+        return;
+    }
+    double min_val = cond0->as.binary.right->as.literal.value.as.number;
+    if (then0->kind != AST_RETURN || !then0->as.ret.expr) return;
+    if (then0->as.ret.expr->kind != AST_LITERAL ||
+        then0->as.ret.expr->as.literal.value.type != PS_T_NUMBER) return;
+    if (then0->as.ret.expr->as.literal.value.as.number != min_val) return;
+
+    PSAstNode *cond1 = stmt1->as.if_stmt.cond;
+    PSAstNode *then1 = stmt1->as.if_stmt.then_branch;
+    if (!cond1 || !then1 || stmt1->as.if_stmt.else_branch) return;
+    if (cond1->kind != AST_BINARY || cond1->as.binary.op != TOK_GT) return;
+    if (!ps_match_identifier_node(cond1->as.binary.left, param_name)) return;
+    if (cond1->as.binary.right->kind != AST_LITERAL ||
+        cond1->as.binary.right->as.literal.value.type != PS_T_NUMBER) return;
+    double max_val = cond1->as.binary.right->as.literal.value.as.number;
+    if (then1->kind != AST_RETURN || !then1->as.ret.expr) return;
+    if (then1->as.ret.expr->kind != AST_LITERAL ||
+        then1->as.ret.expr->as.literal.value.type != PS_T_NUMBER) return;
+    double ret_max = then1->as.ret.expr->as.literal.value.as.number;
+    if (ret_max != max_val) return;
+
+    PSAstNode *ret_expr = stmt2->as.ret.expr;
+    int use_floor = 0;
+    if (ps_match_identifier_node(ret_expr, param_name)) {
+        use_floor = 0;
+    } else if (ps_match_math_floor_call(ret_expr, param_name)) {
+        use_floor = 1;
+    } else {
+        return;
+    }
+
+    func->fast_clamp_min = min_val;
+    func->fast_clamp_max = max_val;
+    func->fast_clamp_use_floor = (uint8_t)use_floor;
+    func->fast_flags |= PS_FAST_FLAG_CLAMP;
+}
+
 static int ps_string_is_length(const PSString *s) {
     static const char *length_str = "length";
     if (!s || s->byte_len != 6) return 0;
     return memcmp(s->utf8, length_str, 6) == 0;
+}
+
+static int ps_string_to_k_index(const PSString *name, uint32_t *out_index) {
+    if (!name || name->byte_len < 2 || !name->utf8) return 0;
+    if (name->utf8[0] != 'k') return 0;
+    const unsigned char *p = (const unsigned char *)name->utf8 + 1;
+    size_t len = name->byte_len - 1;
+    if (len > 1 && p[0] == '0') return 0;
+    unsigned long long value = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (p[i] < '0' || p[i] > '9') return 0;
+        value = value * 10ULL + (unsigned long long)(p[i] - '0');
+        if (value > UINT32_MAX) return 0;
+    }
+    if (out_index) *out_index = (uint32_t)value;
+    return 1;
 }
 
 typedef struct {
@@ -777,26 +2824,8 @@ static int ps_array_set_length(PSVM *vm, PSObject *obj, PSValue value, PSEvalCon
         ctl->throw_value = ps_vm_make_error(vm, "RangeError", msg);
         return -1;
     }
-
     size_t new_len = (size_t)num;
-    size_t old_len = 0;
-    int found = 0;
-    PSValue len_val = ps_object_get(obj, ps_string_from_cstr("length"), &found);
-    if (found) {
-        double len_num = ps_value_to_number(&len_val);
-        if (!isnan(len_num) && len_num > 0.0) {
-            old_len = (size_t)len_num;
-        }
-    }
-    if (new_len < old_len) {
-        for (size_t i = new_len; i < old_len; i++) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%zu", i);
-            int deleted = 0;
-            ps_object_delete(obj, ps_string_from_cstr(buf), &deleted);
-        }
-    }
-    ps_object_put(obj, ps_string_from_cstr("length"), ps_value_number((double)new_len));
+    if (!ps_array_set_length_internal(obj, new_len)) return 0;
     return 1;
 }
 
@@ -824,52 +2853,269 @@ static int ps_assign_for_target(PSVM *vm,
         if (ctl->did_throw) return 0;
         PSObject *target_obj = ps_to_object(vm, &target_val, ctl);
         if (ctl->did_throw) return 0;
-        PSString *prop = ps_member_key(vm, env, target, ctl);
-        if (ctl->did_throw) return 0;
-        int handled = ps_buffer_write_index(vm, target_obj, prop, value, ctl);
-        if (handled < 0) return 0;
-        if (handled == 0) {
-            ps_object_put(target_obj, prop, value);
-            (void)ps_env_update_arguments(env, target_obj, prop, value);
+        if (target_obj && target_obj->kind == PS_OBJ_KIND_BUFFER && target->as.member.computed) {
+            PSValue key_val = eval_expression(vm, env, target->as.member.property, ctl);
+            if (ctl->did_throw) return 0;
+            int handled = ps_buffer_write_index_value(vm, target_obj, key_val, value, ctl);
+            if (handled < 0) return 0;
+            if (handled == 0) {
+                PSString *prop = ps_to_string(vm, key_val);
+                if (ps_check_pending_throw(vm, ctl)) return 0;
+                handled = ps_buffer_write_index(vm, target_obj, prop, value, ctl);
+                if (handled < 0) return 0;
+                if (handled == 0) {
+                    ps_object_put(target_obj, prop, value);
+                    (void)ps_env_update_arguments(env, target_obj, prop, value);
+                }
+            }
+        } else if (target_obj && target_obj->kind == PS_OBJ_KIND_BUFFER32 && target->as.member.computed) {
+            PSValue key_val = eval_expression(vm, env, target->as.member.property, ctl);
+            if (ctl->did_throw) return 0;
+            int handled = ps_buffer32_write_index_value(vm, target_obj, key_val, value, ctl);
+            if (handled < 0) return 0;
+            if (handled == 0) {
+                PSString *prop = ps_to_string(vm, key_val);
+                if (ps_check_pending_throw(vm, ctl)) return 0;
+                handled = ps_buffer32_write_index(vm, target_obj, prop, value, ctl);
+                if (handled < 0) return 0;
+                if (handled == 0) {
+                    ps_object_put(target_obj, prop, value);
+                    (void)ps_env_update_arguments(env, target_obj, prop, value);
+                }
+            }
+        } else if (target_obj && target_obj->kind == PS_OBJ_KIND_ARRAY && target->as.member.computed) {
+            PSValue key_val = eval_expression(vm, env, target->as.member.property, ctl);
+            if (ctl->did_throw) return 0;
+            int handled = ps_array_write_index_value(vm, target_obj, key_val, value, ctl);
+            if (handled < 0) return 0;
+            if (handled == 0) {
+                PSString *prop = ps_to_string(vm, key_val);
+                if (ps_check_pending_throw(vm, ctl)) return 0;
+                ps_object_put(target_obj, prop, value);
+                ps_array_update_length(target_obj, prop);
+                (void)ps_env_update_arguments(env, target_obj, prop, value);
+            }
+        } else if (target_obj && target_obj->kind == PS_OBJ_KIND_PLAIN && target->as.member.computed) {
+            PSValue key_val = eval_expression(vm, env, target->as.member.property, ctl);
+            if (ctl->did_throw) return 0;
+            size_t index = 0;
+            int idx = ps_value_to_index(vm, key_val, &index, ctl);
+            if (idx < 0) return 0;
+            if (idx > 0 && (target_obj->internal == NULL || target_obj->internal_kind == PS_INTERNAL_NUMMAP)) {
+                int is_new = 0;
+                if (!ps_num_map_set(target_obj, index, value, &is_new)) return 0;
+                if (is_new) ps_object_bump_shape(target_obj);
+                if (env && env->arguments_obj == target_obj) {
+                    PSString *prop = ps_array_index_string(vm, index);
+                    (void)ps_env_update_arguments(env, target_obj, prop, value);
+                }
+            } else {
+                PSString *prop = ps_to_string(vm, key_val);
+                if (ps_check_pending_throw(vm, ctl)) return 0;
+                ps_object_put(target_obj, prop, value);
+                (void)ps_env_update_arguments(env, target_obj, prop, value);
+            }
+        } else {
+            PSString *prop = ps_member_key(vm, env, target, ctl);
+            if (ctl->did_throw) return 0;
+            int handled = ps_buffer_write_index(vm, target_obj, prop, value, ctl);
+            if (handled < 0) return 0;
+            if (handled == 0) {
+                ps_object_put(target_obj, prop, value);
+                (void)ps_env_update_arguments(env, target_obj, prop, value);
+            }
         }
         return 1;
     }
     return 0;
 }
 
-static int ps_string_to_array_index(const PSString *name, size_t *out_index) {
-    if (!name || name->byte_len == 0 || !name->utf8) return 0;
-    const unsigned char *p = (const unsigned char *)name->utf8;
-    if (name->byte_len > 1 && p[0] == '0') return 0;
-    unsigned long long value = 0;
-    for (size_t i = 0; i < name->byte_len; i++) {
-        if (p[i] < '0' || p[i] > '9') return 0;
-        value = value * 10ULL + (unsigned long long)(p[i] - '0');
-        if (value >= 4294967295ULL) return 0;
-    }
-    if (out_index) *out_index = (size_t)value;
-    return 1;
-}
-
 static uint8_t ps_clamp_byte(double num) {
     if (isnan(num) || isinf(num)) return 0;
     if (num <= 0.0) return 0;
     if (num >= 255.0) return 255;
-    return (uint8_t)num;
+    if (num < 1.0) return 0;
+    return (uint8_t)floor(num + 0.5);
+}
+
+static uint32_t ps_clamp_u32(double num) {
+    if (isnan(num) || isinf(num)) return 0;
+    if (num <= 0.0) return 0;
+    if (num >= 4294967295.0) return 4294967295u;
+    if (num < 1.0) return 0;
+    return (uint32_t)floor(num + 0.5);
 }
 
 static int ps_buffer_index_from_prop(PSObject *obj, PSString *prop, size_t *out_index) {
     if (!obj || obj->kind != PS_OBJ_KIND_BUFFER || !prop) return 0;
-    return ps_string_to_array_index(prop, out_index);
+    return ps_array_string_to_index(prop, out_index);
 }
 
-static int ps_buffer_read_index(PSVM *vm,
-                                PSObject *obj,
-                                PSString *prop,
-                                PSValue *out_value,
-                                PSEvalControl *ctl) {
+static int ps_buffer32_index_from_prop(PSObject *obj, PSString *prop, size_t *out_index) {
+    if (!obj || obj->kind != PS_OBJ_KIND_BUFFER32 || !prop) return 0;
+    return ps_array_string_to_index(prop, out_index);
+}
+
+static int ps_string_to_index_size(PSString *name, size_t *out_index) {
+    if (!name || !name->utf8) return 0;
+    if (name->index_state == 1) {
+        if (out_index) *out_index = name->index_value;
+        return 1;
+    }
+    if (name->index_state == 2) return 0;
+    if (name->byte_len == 0) {
+        name->index_state = 1;
+        name->index_value = 0;
+        if (out_index) *out_index = 0;
+        return 1;
+    }
+    size_t value = 0;
+    for (size_t i = 0; i < name->byte_len; i++) {
+        unsigned char c = (unsigned char)name->utf8[i];
+        if (c < '0' || c > '9') {
+            name->index_state = 2;
+            return 0;
+        }
+        size_t digit = (size_t)(c - '0');
+        if (value > (SIZE_MAX - digit) / 10) {
+            name->index_state = 2;
+            return 0;
+        }
+        value = (value * 10) + digit;
+    }
+    name->index_state = 1;
+    name->index_value = value;
+    if (out_index) *out_index = value;
+    return 1;
+}
+
+static int ps_value_to_index(PSVM *vm, PSValue value, size_t *out_index, PSEvalControl *ctl) {
+    if (value.type == PS_T_NUMBER) {
+        double num = value.as.number;
+        if (num >= 0.0 && num <= (double)SIZE_MAX) {
+            size_t idx = (size_t)num;
+            if ((double)idx == num) {
+                if (out_index) *out_index = idx;
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (value.type == PS_T_STRING) {
+        if (ps_string_to_index_size(value.as.string, out_index)) return 1;
+    }
+    double num = ps_to_number(vm, value);
+    if (ps_check_pending_throw(vm, ctl)) return -1;
+    if (num >= 0.0 && num <= (double)SIZE_MAX) {
+        size_t idx = (size_t)num;
+        if ((double)idx == num) {
+            if (out_index) *out_index = idx;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int ps_value_to_array_index(PSVM *vm, PSValue value, size_t *out_index, PSEvalControl *ctl) {
+    if (value.type == PS_T_NUMBER) {
+        double num = value.as.number;
+        if (num >= 0.0 && num < 4294967295.0) {
+            size_t idx = (size_t)num;
+            if ((double)idx == num) {
+                if (out_index) *out_index = idx;
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (value.type == PS_T_STRING) {
+        if (ps_array_string_to_index(value.as.string, out_index)) return 1;
+        return 0;
+    }
+    PSString *key = ps_to_string(vm, value);
+    if (ps_check_pending_throw(vm, ctl)) return -1;
+    if (ps_array_string_to_index(key, out_index)) return 1;
+    return 0;
+}
+
+static int ps_array_key_to_index_fast(PSValue key_val, size_t *out_index) {
+    if (key_val.type == PS_T_NUMBER) {
+        double num = key_val.as.number;
+        if (num >= 0.0 && num < 4294967295.0) {
+            size_t idx = (size_t)num;
+            if ((double)idx == num) {
+                if (out_index) *out_index = idx;
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (key_val.type == PS_T_STRING) {
+        if (ps_array_string_to_index(key_val.as.string, out_index)) return 1;
+    }
+    return 0;
+}
+
+static int ps_array_read_index_fast_value(PSObject *obj,
+                                          PSValue key_val,
+                                          PSValue *out_value,
+                                          size_t *out_index) {
+    if (!obj || obj->kind != PS_OBJ_KIND_ARRAY) return 0;
     size_t index = 0;
-    if (!ps_buffer_index_from_prop(obj, prop, &index)) return 0;
+    if (!ps_array_key_to_index_fast(key_val, &index)) return 0;
+    if (out_index) *out_index = index;
+    if (ps_array_get_index(obj, index, out_value)) return 1;
+    return -1;
+}
+
+static int ps_array_write_index_fast_value(PSObject *obj,
+                                           PSValue key_val,
+                                           PSValue value,
+                                           size_t *out_index) {
+    if (!obj || obj->kind != PS_OBJ_KIND_ARRAY) return 0;
+    size_t index = 0;
+    if (!ps_array_key_to_index_fast(key_val, &index)) return 0;
+    if (out_index) *out_index = index;
+    return ps_array_set_index(obj, index, value) ? 1 : 0;
+}
+
+static int ps_array_read_index_value(PSVM *vm,
+                                     PSObject *obj,
+                                     PSValue key_val,
+                                     PSValue *out_value,
+                                     PSEvalControl *ctl) {
+    if (!obj || obj->kind != PS_OBJ_KIND_ARRAY) return 0;
+    size_t index = 0;
+    int idx = ps_value_to_array_index(vm, key_val, &index, ctl);
+    if (idx <= 0) return idx;
+    if (ps_array_get_index(obj, index, out_value)) return 1;
+    return 0;
+}
+
+static int ps_array_write_index_value(PSVM *vm,
+                                      PSObject *obj,
+                                      PSValue key_val,
+                                      PSValue value,
+                                      PSEvalControl *ctl) {
+    if (!obj || obj->kind != PS_OBJ_KIND_ARRAY) return 0;
+    size_t index = 0;
+    int idx = ps_value_to_array_index(vm, key_val, &index, ctl);
+    if (idx <= 0) return idx;
+    (void)vm;
+    (void)ctl;
+    return ps_array_set_index(obj, index, value) ? 1 : 0;
+}
+
+static int ps_buffer_read_index_value(PSVM *vm,
+                                      PSObject *obj,
+                                      PSValue key_val,
+                                      PSValue *out_value,
+                                      PSEvalControl *ctl) {
+    if (!obj || obj->kind != PS_OBJ_KIND_BUFFER) return 0;
+    size_t index = 0;
+    int idx = ps_value_to_index(vm, key_val, &index, ctl);
+    if (idx <= 0) return idx;
+    if (vm) vm->perf.buffer_read_index_fast++;
     PSBuffer *buf = ps_buffer_from_object(obj);
     if (!buf || index >= buf->size) {
         ctl->did_throw = 1;
@@ -882,6 +3128,318 @@ static int ps_buffer_read_index(PSVM *vm,
     return 1;
 }
 
+static int ps_member_cached_get(PSObject *obj,
+                                PSAstNode *member,
+                                PSString *prop,
+                                PSValue *out) {
+    if (!obj || !member || member->kind != AST_MEMBER) return 0;
+    if (member->as.member.computed) {
+        PSAstNode *lit = member->as.member.property;
+        if (!lit || lit->kind != AST_LITERAL || lit->as.literal.value.type != PS_T_STRING) {
+            return 0;
+        }
+    }
+    if (member->as.member.cache_obj == obj &&
+        member->as.member.cache_shape == obj->shape_id &&
+        member->as.member.cache_prop &&
+        member->as.member.cache_prop->name == prop) {
+        if (out) *out = member->as.member.cache_prop->value;
+        return 1;
+    }
+    PSProperty *p = ps_object_get_own_prop(obj, prop);
+    if (!p) return 0;
+    member->as.member.cache_obj = obj;
+    member->as.member.cache_prop = p;
+    member->as.member.cache_shape = obj->shape_id;
+    if (out) *out = p->value;
+    return 1;
+}
+
+static int ps_identifier_cached_get(PSEnv *env,
+                                    PSAstNode *id,
+                                    PSValue *out,
+                                    int *found) {
+    if (found) *found = 0;
+    if (out) *out = ps_value_undefined();
+    if (!env || !id || id->kind != AST_IDENTIFIER) return 0;
+    PSString *name = ps_identifier_string(id);
+    if (!name) return 0;
+    if (ps_string_equals_cstr(name, "arguments")) {
+        PSValue v = ps_env_get(env, name, found);
+        if (found && *found && out) {
+            *out = v;
+        }
+        return 1;
+    }
+    if (id->as.identifier.cache_fast_env == env) {
+        size_t idx = id->as.identifier.cache_fast_index;
+        if (env->fast_values && idx < env->fast_count) {
+            if (out) *out = env->fast_values[idx];
+            if (found) *found = 1;
+            return 1;
+        }
+    }
+    if (id->as.identifier.cache_env == env &&
+        id->as.identifier.cache_record == env->record &&
+        id->as.identifier.cache_prop &&
+        env->record &&
+        id->as.identifier.cache_shape == env->record->shape_id) {
+        if (out) *out = id->as.identifier.cache_prop->value;
+        if (found) *found = 1;
+        return 1;
+    }
+    for (PSEnv *cur = env; cur; cur = cur->parent) {
+        if (cur->fast_names && cur->fast_values) {
+            for (size_t i = 0; i < cur->fast_count; i++) {
+                if (cur->fast_names[i] && ps_string_equals(cur->fast_names[i], name)) {
+                    id->as.identifier.cache_fast_env = cur;
+                    id->as.identifier.cache_fast_index = i;
+                    if (out) *out = cur->fast_values[i];
+                    if (found) *found = 1;
+                    return 1;
+                }
+            }
+        }
+        if (!cur->record) continue;
+        PSProperty *prop = ps_object_get_own_prop(cur->record, name);
+        if (!prop) continue;
+        id->as.identifier.cache_env = cur;
+        id->as.identifier.cache_record = cur->record;
+        id->as.identifier.cache_prop = prop;
+        id->as.identifier.cache_shape = cur->record->shape_id;
+        if (out) *out = prop->value;
+        if (found) *found = 1;
+        return 1;
+    }
+    return 1;
+}
+
+#if PS_ENABLE_ARGUMENTS_ALIASING
+static void ps_env_update_arguments_for_name(PSEnv *env, PSString *name, PSValue value) {
+    if (!env || !env->arguments_obj || !env->param_names || !name) return;
+    for (size_t i = 0; i < env->param_count; i++) {
+        if (env->param_names[i] && ps_string_equals(env->param_names[i], name)) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%zu", i);
+            ps_object_put(env->arguments_obj, ps_string_from_cstr(buf), value);
+            break;
+        }
+    }
+}
+#endif
+
+static int ps_identifier_cached_set(PSEnv *env,
+                                    PSAstNode *id,
+                                    PSValue value) {
+    if (!env || !id || id->kind != AST_IDENTIFIER) return 0;
+    PSString *name = ps_identifier_string(id);
+    if (!name) return 0;
+    if (ps_string_equals_cstr(name, "arguments")) return 0;
+    if (id->as.identifier.cache_fast_env == env) {
+        size_t idx = id->as.identifier.cache_fast_index;
+        if (env->fast_values && idx < env->fast_count) {
+            env->fast_values[idx] = value;
+            if (env->record) {
+                (void)ps_object_put(env->record, name, value);
+            }
+#if PS_ENABLE_ARGUMENTS_ALIASING
+            ps_env_update_arguments_for_name(env, name, value);
+#endif
+            return 1;
+        }
+    }
+    if (id->as.identifier.cache_env == env &&
+        id->as.identifier.cache_record == env->record &&
+        id->as.identifier.cache_prop &&
+        env->record &&
+        id->as.identifier.cache_shape == env->record->shape_id) {
+        id->as.identifier.cache_prop->value = value;
+#if PS_ENABLE_ARGUMENTS_ALIASING
+        ps_env_update_arguments_for_name(env, name, value);
+#endif
+        return 1;
+    }
+    return 0;
+}
+
+static int ps_buffer_write_index_value(PSVM *vm,
+                                      PSObject *obj,
+                                      PSValue key_val,
+                                      PSValue value,
+                                      PSEvalControl *ctl) {
+    if (!obj || obj->kind != PS_OBJ_KIND_BUFFER) return 0;
+    size_t index = 0;
+    int idx = ps_value_to_index(vm, key_val, &index, ctl);
+    if (idx <= 0) return idx;
+    if (vm) vm->perf.buffer_write_index_fast++;
+    PSBuffer *buf = ps_buffer_from_object(obj);
+    if (!buf || index >= buf->size) {
+        ctl->did_throw = 1;
+        ctl->throw_value = ps_vm_make_error(vm, "RangeError", "Buffer index out of range");
+        return -1;
+    }
+    double num = ps_to_number(vm, value);
+    if (ps_check_pending_throw(vm, ctl)) return -1;
+    buf->data[index] = ps_clamp_byte(num);
+    return 1;
+}
+
+static int ps_buffer_read_index(PSVM *vm,
+                                PSObject *obj,
+                                PSString *prop,
+                                PSValue *out_value,
+                                PSEvalControl *ctl) {
+    size_t index = 0;
+    if (!ps_buffer_index_from_prop(obj, prop, &index)) return 0;
+    if (vm) vm->perf.buffer_read_index++;
+    PSBuffer *buf = ps_buffer_from_object(obj);
+    if (!buf || index >= buf->size) {
+        ctl->did_throw = 1;
+        ctl->throw_value = ps_vm_make_error(vm, "RangeError", "Buffer index out of range");
+        return -1;
+    }
+    if (out_value) {
+        *out_value = ps_value_number((double)buf->data[index]);
+    }
+    return 1;
+}
+
+static int ps_buffer32_read_index_value(PSVM *vm,
+                                        PSObject *obj,
+                                        PSValue key_val,
+                                        PSValue *out_value,
+                                        PSEvalControl *ctl) {
+    if (!obj || obj->kind != PS_OBJ_KIND_BUFFER32) return 0;
+    size_t index = 0;
+    int idx = ps_value_to_index(vm, key_val, &index, ctl);
+    if (idx <= 0) return idx;
+    if (vm) vm->perf.buffer32_read_index_fast++;
+    PSBuffer32 *view = ps_buffer32_from_object(obj);
+    if (!view || !view->source) return 0;
+    PSBuffer *buf = ps_buffer_from_object(view->source);
+    if (!buf) return 0;
+    if (index >= view->length) {
+        ctl->did_throw = 1;
+        ctl->throw_value = ps_vm_make_error(vm, "RangeError", "Buffer32 index out of range");
+        return -1;
+    }
+    size_t base = view->offset + index * 4u;
+    if (base + 3u >= buf->size) {
+        ctl->did_throw = 1;
+        ctl->throw_value = ps_vm_make_error(vm, "RangeError", "Buffer32 index out of range");
+        return -1;
+    }
+    if (out_value) {
+        uint32_t v = (uint32_t)buf->data[base] |
+                     ((uint32_t)buf->data[base + 1] << 8) |
+                     ((uint32_t)buf->data[base + 2] << 16) |
+                     ((uint32_t)buf->data[base + 3] << 24);
+        *out_value = ps_value_number((double)v);
+    }
+    return 1;
+}
+
+static int ps_buffer32_write_index_value(PSVM *vm,
+                                         PSObject *obj,
+                                         PSValue key_val,
+                                         PSValue value,
+                                         PSEvalControl *ctl) {
+    if (!obj || obj->kind != PS_OBJ_KIND_BUFFER32) return 0;
+    size_t index = 0;
+    int idx = ps_value_to_index(vm, key_val, &index, ctl);
+    if (idx <= 0) return idx;
+    if (vm) vm->perf.buffer32_write_index_fast++;
+    PSBuffer32 *view = ps_buffer32_from_object(obj);
+    if (!view || !view->source) return 0;
+    PSBuffer *buf = ps_buffer_from_object(view->source);
+    if (!buf) return 0;
+    if (index >= view->length) {
+        ctl->did_throw = 1;
+        ctl->throw_value = ps_vm_make_error(vm, "RangeError", "Buffer32 index out of range");
+        return -1;
+    }
+    size_t base = view->offset + index * 4u;
+    if (base + 3u >= buf->size) {
+        ctl->did_throw = 1;
+        ctl->throw_value = ps_vm_make_error(vm, "RangeError", "Buffer32 index out of range");
+        return -1;
+    }
+    double num = ps_to_number(vm, value);
+    if (ps_check_pending_throw(vm, ctl)) return -1;
+    uint32_t v = ps_clamp_u32(num);
+    buf->data[base] = (uint8_t)(v & 0xffu);
+    buf->data[base + 1] = (uint8_t)((v >> 8) & 0xffu);
+    buf->data[base + 2] = (uint8_t)((v >> 16) & 0xffu);
+    buf->data[base + 3] = (uint8_t)((v >> 24) & 0xffu);
+    return 1;
+}
+
+static int ps_buffer32_read_index(PSVM *vm,
+                                  PSObject *obj,
+                                  PSString *prop,
+                                  PSValue *out_value,
+                                  PSEvalControl *ctl) {
+    size_t index = 0;
+    if (!ps_buffer32_index_from_prop(obj, prop, &index)) return 0;
+    if (vm) vm->perf.buffer32_read_index++;
+    PSBuffer32 *view = ps_buffer32_from_object(obj);
+    if (!view || !view->source) return 0;
+    PSBuffer *buf = ps_buffer_from_object(view->source);
+    if (!buf) return 0;
+    if (index >= view->length) {
+        ctl->did_throw = 1;
+        ctl->throw_value = ps_vm_make_error(vm, "RangeError", "Buffer32 index out of range");
+        return -1;
+    }
+    size_t base = view->offset + index * 4u;
+    if (base + 3u >= buf->size) {
+        ctl->did_throw = 1;
+        ctl->throw_value = ps_vm_make_error(vm, "RangeError", "Buffer32 index out of range");
+        return -1;
+    }
+    if (out_value) {
+        uint32_t v = (uint32_t)buf->data[base] |
+                     ((uint32_t)buf->data[base + 1] << 8) |
+                     ((uint32_t)buf->data[base + 2] << 16) |
+                     ((uint32_t)buf->data[base + 3] << 24);
+        *out_value = ps_value_number((double)v);
+    }
+    return 1;
+}
+
+static int ps_buffer32_write_index(PSVM *vm,
+                                   PSObject *obj,
+                                   PSString *prop,
+                                   PSValue value,
+                                   PSEvalControl *ctl) {
+    size_t index = 0;
+    if (!ps_buffer32_index_from_prop(obj, prop, &index)) return 0;
+    if (vm) vm->perf.buffer32_write_index++;
+    PSBuffer32 *view = ps_buffer32_from_object(obj);
+    if (!view || !view->source) return 0;
+    PSBuffer *buf = ps_buffer_from_object(view->source);
+    if (!buf) return 0;
+    if (index >= view->length) {
+        ctl->did_throw = 1;
+        ctl->throw_value = ps_vm_make_error(vm, "RangeError", "Buffer32 index out of range");
+        return -1;
+    }
+    size_t base = view->offset + index * 4u;
+    if (base + 3u >= buf->size) {
+        ctl->did_throw = 1;
+        ctl->throw_value = ps_vm_make_error(vm, "RangeError", "Buffer32 index out of range");
+        return -1;
+    }
+    double num = ps_to_number(vm, value);
+    if (ps_check_pending_throw(vm, ctl)) return -1;
+    uint32_t v = ps_clamp_u32(num);
+    buf->data[base] = (uint8_t)(v & 0xffu);
+    buf->data[base + 1] = (uint8_t)((v >> 8) & 0xffu);
+    buf->data[base + 2] = (uint8_t)((v >> 16) & 0xffu);
+    buf->data[base + 3] = (uint8_t)((v >> 24) & 0xffu);
+    return 1;
+}
+
 static int ps_buffer_write_index(PSVM *vm,
                                  PSObject *obj,
                                  PSString *prop,
@@ -889,6 +3447,7 @@ static int ps_buffer_write_index(PSVM *vm,
                                  PSEvalControl *ctl) {
     size_t index = 0;
     if (!ps_buffer_index_from_prop(obj, prop, &index)) return 0;
+    if (vm) vm->perf.buffer_write_index++;
     PSBuffer *buf = ps_buffer_from_object(obj);
     if (!buf || index >= buf->size) {
         ctl->did_throw = 1;
@@ -904,20 +3463,16 @@ static int ps_buffer_write_index(PSVM *vm,
 static void ps_array_update_length(PSObject *obj, PSString *prop) {
     if (!obj || obj->kind != PS_OBJ_KIND_ARRAY || !prop) return;
     size_t index = 0;
-    if (!ps_string_to_array_index(prop, &index)) return;
-    size_t len = 0;
-    int found = 0;
-    PSValue len_val = ps_object_get(obj, ps_string_from_cstr("length"), &found);
-    if (found) {
-        double num = ps_value_to_number(&len_val);
-        if (!isnan(num) && num >= 0.0) {
-            len = (size_t)num;
+    if (!ps_array_string_to_index(prop, &index)) return;
+    size_t new_len = index + 1;
+    PSArray *arr = ps_array_from_object(obj);
+    size_t len = arr ? arr->length : 0;
+    if (new_len > len) {
+        if (arr) {
+            arr->length = new_len;
+            return;
         }
-    }
-    if (index + 1 > len) {
-        ps_object_put(obj,
-                      ps_string_from_cstr("length"),
-                      ps_value_number((double)(index + 1)));
+        (void)ps_array_set_length_internal(obj, new_len);
     }
 }
 
@@ -940,12 +3495,64 @@ static int ps_eval_args(PSVM *vm,
     if (stack_buf && argc <= stack_cap) {
         vals = stack_buf;
     } else {
-        vals = (PSValue *)calloc(argc, sizeof(PSValue));
+        vals = (PSValue *)malloc(argc * sizeof(PSValue));
         if (out_heap) *out_heap = 1;
     }
     if (!vals) return 0;
     for (size_t i = 0; i < argc; i++) {
-        vals[i] = eval_expression(vm, env, args[i], ctl);
+        PSAstNode *arg = args[i];
+        if (arg && arg->kind == AST_LITERAL) {
+            if (vm) {
+                vm->current_node = arg;
+#if PS_ENABLE_PERF
+                vm->perf.eval_expr_count++;
+                vm->perf.ast_counts[AST_LITERAL]++;
+#endif
+            }
+            vals[i] = arg->as.literal.value;
+            continue;
+        }
+        if (arg && arg->kind == AST_IDENTIFIER) {
+            if (vm) {
+                vm->current_node = arg;
+#if PS_ENABLE_PERF
+                vm->perf.eval_expr_count++;
+                vm->perf.ast_counts[AST_IDENTIFIER]++;
+#endif
+            }
+            PSString *name = ps_identifier_string(arg);
+            int found = 0;
+            PSValue v = ps_value_undefined();
+            if (!ps_identifier_cached_get(env, arg, &v, &found)) {
+                v = ps_env_get(env, name, &found);
+            }
+            if (!found) {
+                ctl->did_throw = 1;
+                const char *prefix = "Identifier not defined: ";
+                size_t prefix_len = strlen(prefix);
+                size_t name_len = name ? name->byte_len : 0;
+                char *msg = NULL;
+                if (name && name->utf8 && name_len > 0) {
+                    msg = (char *)malloc(prefix_len + name_len + 1);
+                }
+                if (msg) {
+                    memcpy(msg, prefix, prefix_len);
+                    memcpy(msg + prefix_len, name->utf8, name_len);
+                    msg[prefix_len + name_len] = '\0';
+                    ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", msg);
+                    free(msg);
+                } else {
+                    ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", "Identifier not defined");
+                }
+                if (out_heap && *out_heap) {
+                    free(vals);
+                }
+                return 0;
+            }
+            vals[i] = v;
+            continue;
+        }
+        vals[i] = eval_expression(vm, env, arg, ctl);
         if (ctl->did_throw) {
             if (out_heap && *out_heap) {
                 free(vals);
@@ -955,6 +3562,160 @@ static int ps_eval_args(PSVM *vm,
     }
     *out_args = vals;
     return 1;
+}
+
+static int ps_eval_math_intrinsic(PSVM *vm,
+                                  PSEnv *env,
+                                  PSAstNode *call,
+                                  PSEvalControl *ctl,
+                                  PSValue *out_value) {
+    if (!vm || !env || !call || call->kind != AST_CALL) return 0;
+    if (!vm->math_obj || !vm->math_intrinsics_valid) return 0;
+    PSAstNode *callee = call->as.call.callee;
+    if (!callee || callee->kind != AST_MEMBER) return 0;
+    PSAstNode *member = callee;
+    if (member->as.member.computed) return 0;
+    PSAstNode *obj_node = member->as.member.object;
+    if (!obj_node || obj_node->kind != AST_IDENTIFIER) return 0;
+    PSString *obj_name = ps_identifier_string(obj_node);
+    if (!ps_string_equals_cstr(obj_name, "Math")) return 0;
+
+    int found = 0;
+    PSValue math_val = ps_value_undefined();
+    if (!ps_identifier_cached_get(env, obj_node, &math_val, &found)) {
+        math_val = ps_env_get(env, obj_name, &found);
+    }
+    if (!found || math_val.type != PS_T_OBJECT || math_val.as.object != vm->math_obj) return 0;
+
+    PSAstNode *prop_node = member->as.member.property;
+    if (!prop_node || prop_node->kind != AST_IDENTIFIER) return 0;
+    PSString *prop = ps_identifier_string(prop_node);
+    if (!prop) return 0;
+
+    size_t argc = call->as.call.argc;
+    PSAstNode **args = call->as.call.args;
+
+    if (ps_string_equals_cstr(prop, "sqrt")) {
+        PSValue arg0 = ps_value_undefined();
+        if (argc > 0) {
+            arg0 = eval_expression(vm, env, args[0], ctl);
+            if (ctl->did_throw) return -1;
+        }
+        double x = ps_to_number_fast(vm, arg0);
+        if (ps_check_pending_throw(vm, ctl)) return -1;
+        if (out_value) *out_value = ps_value_number(sqrt(x));
+        return 1;
+    }
+    if (ps_string_equals_cstr(prop, "abs")) {
+        PSValue arg0 = ps_value_undefined();
+        if (argc > 0) {
+            arg0 = eval_expression(vm, env, args[0], ctl);
+            if (ctl->did_throw) return -1;
+        }
+        double x = ps_to_number_fast(vm, arg0);
+        if (ps_check_pending_throw(vm, ctl)) return -1;
+        if (out_value) *out_value = ps_value_number(fabs(x));
+        return 1;
+    }
+    if (ps_string_equals_cstr(prop, "min")) {
+        if (argc == 0) {
+            if (out_value) *out_value = ps_value_number(INFINITY);
+            return 1;
+        }
+        double minv = INFINITY;
+        for (size_t i = 0; i < argc; i++) {
+            PSValue v = eval_expression(vm, env, args[i], ctl);
+            if (ctl->did_throw) return -1;
+            double num = ps_to_number_fast(vm, v);
+            if (ps_check_pending_throw(vm, ctl)) return -1;
+            if (ps_value_is_nan(num)) {
+                if (out_value) *out_value = ps_value_number(0.0 / 0.0);
+                return 1;
+            }
+            if (num < minv) minv = num;
+        }
+        if (out_value) *out_value = ps_value_number(minv);
+        return 1;
+    }
+    if (ps_string_equals_cstr(prop, "max")) {
+        if (argc == 0) {
+            if (out_value) *out_value = ps_value_number(-INFINITY);
+            return 1;
+        }
+        double maxv = -INFINITY;
+        for (size_t i = 0; i < argc; i++) {
+            PSValue v = eval_expression(vm, env, args[i], ctl);
+            if (ctl->did_throw) return -1;
+            double num = ps_to_number_fast(vm, v);
+            if (ps_check_pending_throw(vm, ctl)) return -1;
+            if (ps_value_is_nan(num)) {
+                if (out_value) *out_value = ps_value_number(0.0 / 0.0);
+                return 1;
+            }
+            if (num > maxv) maxv = num;
+        }
+        if (out_value) *out_value = ps_value_number(maxv);
+        return 1;
+    }
+    if (ps_string_equals_cstr(prop, "pow")) {
+        PSValue arg0 = ps_value_undefined();
+        PSValue arg1 = ps_value_undefined();
+        if (argc > 0) {
+            arg0 = eval_expression(vm, env, args[0], ctl);
+            if (ctl->did_throw) return -1;
+        }
+        if (argc > 1) {
+            arg1 = eval_expression(vm, env, args[1], ctl);
+            if (ctl->did_throw) return -1;
+        }
+        double x = ps_to_number_fast(vm, arg0);
+        if (ps_check_pending_throw(vm, ctl)) return -1;
+        double y = ps_to_number_fast(vm, arg1);
+        if (ps_check_pending_throw(vm, ctl)) return -1;
+        if (out_value) *out_value = ps_value_number(pow(x, y));
+        return 1;
+    }
+    if (ps_string_equals_cstr(prop, "floor")) {
+        PSValue arg0 = ps_value_undefined();
+        if (argc > 0) {
+            arg0 = eval_expression(vm, env, args[0], ctl);
+            if (ctl->did_throw) return -1;
+        }
+        double x = ps_to_number_fast(vm, arg0);
+        if (ps_check_pending_throw(vm, ctl)) return -1;
+        if (out_value) *out_value = ps_value_number(floor(x));
+        return 1;
+    }
+    if (ps_string_equals_cstr(prop, "ceil")) {
+        PSValue arg0 = ps_value_undefined();
+        if (argc > 0) {
+            arg0 = eval_expression(vm, env, args[0], ctl);
+            if (ctl->did_throw) return -1;
+        }
+        double x = ps_to_number_fast(vm, arg0);
+        if (ps_check_pending_throw(vm, ctl)) return -1;
+        if (out_value) *out_value = ps_value_number(ceil(x));
+        return 1;
+    }
+    if (ps_string_equals_cstr(prop, "round")) {
+        PSValue arg0 = ps_value_undefined();
+        if (argc > 0) {
+            arg0 = eval_expression(vm, env, args[0], ctl);
+            if (ctl->did_throw) return -1;
+        }
+        double x = ps_to_number_fast(vm, arg0);
+        if (ps_check_pending_throw(vm, ctl)) return -1;
+        if (ps_value_is_nan(x) || isinf(x)) {
+            if (out_value) *out_value = ps_value_number(x);
+            return 1;
+        }
+        double r = floor(x + 0.5);
+        if (r == 0.0 && x < 0.0) r = -0.0;
+        if (out_value) *out_value = ps_value_number(r);
+        return 1;
+    }
+
+    return 0;
 }
 
 static int ps_collect_bound_args(PSObject *obj, PSValue **out_args, size_t *out_len) {
@@ -979,6 +3740,59 @@ static int ps_collect_bound_args(PSObject *obj, PSValue **out_args, size_t *out_
         args[i] = got ? val : ps_value_undefined();
     }
     *out_args = args;
+    return 1;
+}
+
+static int ps_env_prepare_fast(PSEnv *env, PSString **names, size_t count) {
+    if (!env) return 0;
+    size_t prev_count = env->fast_count;
+    env->fast_names = names;
+    env->fast_count = count;
+    if (count == 0) {
+        free(env->fast_values);
+        env->fast_values = NULL;
+        return 1;
+    }
+    if (!env->fast_values || prev_count != count) {
+        PSValue *vals = (PSValue *)realloc(env->fast_values, sizeof(PSValue) * count);
+        if (!vals) return 0;
+        env->fast_values = vals;
+    }
+    memset(env->fast_values, 0, sizeof(PSValue) * count);
+    return 1;
+}
+
+static int ps_env_prepare_fast_partial(PSEnv *env,
+                                       PSString **names,
+                                       size_t count,
+                                       size_t *clear_idx,
+                                       size_t clear_count) {
+    if (!env) return 0;
+    size_t prev_count = env->fast_count;
+    env->fast_names = names;
+    env->fast_count = count;
+    if (count == 0) {
+        free(env->fast_values);
+        env->fast_values = NULL;
+        return 1;
+    }
+    if (!env->fast_values || prev_count != count) {
+        PSValue *vals = (PSValue *)realloc(env->fast_values, sizeof(PSValue) * count);
+        if (!vals) return 0;
+        env->fast_values = vals;
+        memset(env->fast_values, 0, sizeof(PSValue) * count);
+        return 1;
+    }
+    if (clear_idx && clear_count) {
+        for (size_t i = 0; i < clear_count; i++) {
+            size_t idx = clear_idx[i];
+            if (idx < count) {
+                env->fast_values[idx] = ps_value_undefined();
+            }
+        }
+        return 1;
+    }
+    memset(env->fast_values, 0, sizeof(PSValue) * count);
     return 1;
 }
 PSValue ps_eval_call_function(PSVM *vm,
@@ -1081,11 +3895,65 @@ PSValue ps_eval_call_function(PSVM *vm,
     }
 #endif
 
-    PSEnv *call_env = ps_env_new_object(func->env ? func->env : env);
+    ps_fast_math_prepare(func);
+    if ((func->fast_flags & PS_FAST_FLAG_MATH) && func->fast_math_expr) {
+        double out = 0.0;
+        if (ps_fast_math_eval(func, func->fast_math_expr, argc, argv, &out)) {
+            return ps_value_number(out);
+        }
+    }
+
+    ps_fast_clamp_prepare(func);
+    if (func->fast_flags & PS_FAST_FLAG_CLAMP) {
+        if (argc >= 1 && argv && argv[0].type == PS_T_NUMBER) {
+            double num = argv[0].as.number;
+            if (ps_value_is_nan(num)) {
+                return ps_value_number(0.0 / 0.0);
+            }
+            if (num < func->fast_clamp_min) return ps_value_number(func->fast_clamp_min);
+            if (num > func->fast_clamp_max) return ps_value_number(func->fast_clamp_max);
+            if (func->fast_clamp_use_floor) {
+                num = floor(num);
+            }
+            return ps_value_number(num);
+        }
+    }
+
+    ps_fast_num_prepare(func);
+    if (func->fast_flags & PS_FAST_FLAG_NUM) {
+        double out = 0.0;
+        if (ps_fast_num_eval(vm, func, argc, argv, &out)) {
+            return ps_value_number(out);
+        }
+    }
+
+    ps_fast_env_prepare(func);
+    int use_fast_env = (func->fast_flags & PS_FAST_FLAG_ENV) != 0;
+
+    PSEnv *call_env = NULL;
+    int fast_env_cached = 0;
+    if (use_fast_env) {
+        if (func->fast_env && !func->fast_env_in_use) {
+            call_env = func->fast_env;
+            func->fast_env_in_use = 1;
+            fast_env_cached = 1;
+        } else {
+            call_env = ps_env_new(func->env ? func->env : env, NULL, 0);
+            if (call_env && func->env && !func->fast_env) {
+                func->fast_env = call_env;
+                func->fast_env_in_use = 1;
+                fast_env_cached = 1;
+            }
+        }
+    }
+    if (!call_env) {
+        call_env = ps_env_new_object(func->env ? func->env : env);
+    }
     if (!call_env) return ps_value_undefined();
     if (vm && vm->object_proto && call_env->record) {
         call_env->record->prototype = vm->object_proto;
     }
+    int fast_env_active = use_fast_env && call_env->record == NULL;
 
     PSObject *prev_callee = vm ? vm->current_callee : NULL;
     size_t prev_depth = vm ? vm->stack_depth : 0;
@@ -1099,34 +3967,69 @@ PSValue ps_eval_call_function(PSVM *vm,
         vm->current_callee = fn_obj;
     }
 
-    ps_object_define(call_env->record,
-                     ps_string_from_cstr("this"),
-                     this_val,
-                     PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
+    if (fast_env_active) {
+        if (!ps_env_prepare_fast_partial(call_env,
+                                         func->fast_names,
+                                         func->fast_count,
+                                         func->fast_local_index,
+                                         func->fast_local_index_count)) {
+            if (fast_env_cached) {
+                func->fast_env_in_use = 0;
+            }
+            return ps_value_undefined();
+        }
+        if (call_env->fast_values && func->fast_this_index < call_env->fast_count) {
+            call_env->fast_values[func->fast_this_index] = this_val;
+        }
+    } else {
+        PSString **fast_names = func->fast_names ? func->fast_names : func->param_names;
+        size_t fast_count = func->fast_names ? func->fast_count : func->param_count;
+        if (!ps_env_prepare_fast(call_env, fast_names, fast_count)) {
+            if (fast_env_cached) {
+                func->fast_env_in_use = 0;
+            }
+            return ps_value_undefined();
+        }
+        ps_object_define(call_env->record,
+                         ps_string_from_cstr("this"),
+                         this_val,
+                         PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
+        if (call_env->fast_values && func->fast_names &&
+            func->fast_this_index < call_env->fast_count) {
+            call_env->fast_values[func->fast_this_index] = this_val;
+        }
+    }
 
     call_env->callee_obj = fn_obj;
     call_env->arguments_values = argv;
     call_env->arguments_count = (size_t)argc;
+    call_env->arguments_obj = NULL;
 
-    hoist_decls(vm, call_env, func->body);
-
-    call_env->fast_names = func->param_names;
-    call_env->fast_count = func->param_count;
-    if (func->param_count > 0) {
-        call_env->fast_values = (PSValue *)calloc(func->param_count, sizeof(PSValue));
+    if (!fast_env_active) {
+        ps_fast_hoist_prepare(func);
+        if (func->fast_flags & PS_FAST_FLAG_HOIST) {
+            hoist_decls(vm, call_env, func->body);
+        }
     }
 
-    for (size_t i = 0; i < func->param_count; i++) {
-        PSAstNode *param = func->params[i];
-        PSString *name = func->param_names ? func->param_names[i] : NULL;
-        if (!name && param && param->kind == AST_IDENTIFIER) {
-            name = ps_identifier_string(param);
+    if (fast_env_active) {
+        if (call_env->fast_values && func->fast_param_index) {
+            for (size_t i = 0; i < func->param_count; i++) {
+                size_t idx = func->fast_param_index[i];
+                if (idx == SIZE_MAX || idx >= call_env->fast_count) continue;
+                call_env->fast_values[idx] = ((int)i < argc) ? argv[i] : ps_value_undefined();
+            }
         }
-        if (!name) continue;
-        PSValue val = ((int)i < argc) ? argv[i] : ps_value_undefined();
-        ps_env_define(call_env, name, val);
-        if (call_env->fast_values && i < call_env->fast_count) {
-            call_env->fast_values[i] = val;
+    } else {
+        for (size_t i = 0; i < func->param_count; i++) {
+            PSAstNode *param = func->params[i];
+            PSString *name = func->param_names ? func->param_names[i] : NULL;
+            if (!name && param && param->kind == AST_IDENTIFIER) {
+                name = ps_identifier_string(param);
+            }
+            if (!name) continue;
+            PSValue val = ((int)i < argc) ? argv[i] : ps_value_undefined();
+            ps_env_define(call_env, name, val);
         }
     }
 
@@ -1142,7 +4045,7 @@ PSValue ps_eval_call_function(PSVM *vm,
         PSValue current = ((int)i < argc) ? argv[i] : ps_value_undefined();
         if (current.type != PS_T_UNDEFINED) continue;
         PSEvalControl default_ctl = {0};
-        PSValue default_val = eval_expression(vm, call_env, default_expr, &default_ctl);
+        PSValue default_val = ps_stmt_bc_eval_expr(vm, call_env, default_expr, &default_ctl);
         if (default_ctl.did_throw) {
             ps_env_free(call_env);
             if (vm) {
@@ -1150,6 +4053,9 @@ PSValue ps_eval_call_function(PSVM *vm,
                 if (pushed) {
                     ps_vm_pop_frame(vm);
                 }
+            }
+            if (fast_env_cached) {
+                func->fast_env_in_use = 0;
             }
             if (did_throw) *did_throw = 1;
             if (throw_value) *throw_value = default_ctl.throw_value;
@@ -1161,14 +4067,7 @@ PSValue ps_eval_call_function(PSVM *vm,
             name = ps_identifier_string(param);
         }
         if (!name) continue;
-        if ((int)i < argc) {
-            ps_env_set(call_env, name, default_val);
-        } else {
-            ps_object_put(call_env->record, name, default_val);
-            if (call_env->fast_values && i < call_env->fast_count) {
-                call_env->fast_values[i] = default_val;
-            }
-        }
+        ps_env_set(call_env, name, default_val);
     }
 
     PSEvalControl inner = {0};
@@ -1179,7 +4078,24 @@ PSValue ps_eval_call_function(PSVM *vm,
         root_count = 1;
     }
     if (vm) vm->env = call_env;
-    PSValue ret = eval_node(vm, call_env, func->body, &inner);
+    PSValue ret = ps_value_undefined();
+    if (func->stmt_bc_state == 0) {
+        PSStmtBC *bc = ps_stmt_bc_compile(func->body);
+        if (bc) {
+            func->stmt_bc = bc;
+            func->stmt_bc_state = 1;
+        } else {
+            func->stmt_bc_state = 2;
+        }
+    }
+    if (func->stmt_bc_state == 1 && func->stmt_bc) {
+        ret = ps_stmt_bc_execute(vm, call_env, func, func->stmt_bc, &inner);
+    } else {
+        inner.did_throw = 1;
+        inner.throw_value = ps_vm_make_error(vm, "SyntaxError",
+                                             "Statement bytecode compilation failed");
+        ret = inner.throw_value;
+    }
     if (vm) vm->env = prev_env;
     if (vm && root_count) {
         ps_gc_root_pop(vm, root_count);
@@ -1190,6 +4106,9 @@ PSValue ps_eval_call_function(PSVM *vm,
         if (pushed) {
             ps_vm_pop_frame(vm);
         }
+    }
+    if (fast_env_cached) {
+        func->fast_env_in_use = 0;
     }
     if (inner.did_throw) {
         if (did_throw) *did_throw = 1;
@@ -1228,6 +4147,73 @@ static int ps_collect_enum_name(PSString *name, PSValue value, uint8_t attrs, vo
     }
     list->items[list->count++] = name;
     return 0;
+}
+
+static PSObject *ps_for_in_collect_array(PSVM *vm, PSObject *obj) {
+    if (!vm) return NULL;
+    PSNameList list = {0};
+    for (PSObject *cur = obj; cur; cur = cur->prototype) {
+        if (ps_object_enum_own(cur, ps_collect_enum_name, &list) != 0) {
+            break;
+        }
+    }
+    PSString **ordered = list.items;
+    size_t ordered_count = list.count;
+    PSIndexName *indices = NULL;
+    PSString **others = NULL;
+    PSString **ordered_alloc = NULL;
+    if (obj && obj->kind == PS_OBJ_KIND_ARRAY && list.count > 0) {
+        indices = (PSIndexName *)calloc(list.count, sizeof(PSIndexName));
+        others = (PSString **)calloc(list.count, sizeof(PSString *));
+        if (indices && others) {
+            size_t index_count = 0;
+            size_t other_count = 0;
+            for (size_t i = 0; i < list.count; i++) {
+                PSString *name = list.items[i];
+                if (ps_string_is_length(name)) continue;
+                size_t idx = 0;
+                if (ps_array_string_to_index(name, &idx)) {
+                    indices[index_count].name = name;
+                    indices[index_count].index = idx;
+                    index_count++;
+                } else {
+                    others[other_count++] = name;
+                }
+            }
+            qsort(indices, index_count, sizeof(PSIndexName), ps_index_name_compare);
+            ordered_alloc = (PSString **)calloc(index_count + other_count, sizeof(PSString *));
+            if (ordered_alloc) {
+                ordered = ordered_alloc;
+                ordered_count = index_count + other_count;
+                for (size_t i = 0; i < index_count; i++) {
+                    ordered[i] = indices[i].name;
+                }
+                for (size_t i = 0; i < other_count; i++) {
+                    ordered[index_count + i] = others[i];
+                }
+            }
+        }
+    }
+
+    PSObject *arr = ps_object_new(vm->array_proto ? vm->array_proto : vm->object_proto);
+    if (!arr) {
+        free(ordered_alloc);
+        free(indices);
+        free(others);
+        free(list.items);
+        return NULL;
+    }
+    arr->kind = PS_OBJ_KIND_ARRAY;
+    (void)ps_array_init(arr);
+    for (size_t i = 0; i < ordered_count; i++) {
+        (void)ps_array_set_index(arr, i, ps_value_string(ordered[i]));
+    }
+    (void)ps_array_set_length_internal(arr, ordered_count);
+    free(ordered_alloc);
+    free(indices);
+    free(others);
+    free(list.items);
+    return arr;
 }
 
 static void hoist_list(PSVM *vm, PSEnv *env, PSAstNode **items, size_t count) {
@@ -1333,6 +4319,16 @@ static void hoist_decls(PSVM *vm, PSEnv *env, PSAstNode *node) {
     }
 }
 
+/*
+ * Production execution engine: peephole + control-flow superinstructions.
+ * Phase 5 and Phase 8 (v1/v2) are experimental, OFF by default, and closed
+ * as performance levers. Retained for research/reference only.
+ */
+/* --- Experimental / research paths (OFF by default) -------------------- */
+#if !PS_DISABLE_SPECIALIZATION
+static int ps_spec_collect_program_slots(PSAstNode *node, PSString ***names, size_t *count, size_t *cap);
+#endif
+
 /* --------------------------------------------------------- */
 /* Program                                                   */
 /* --------------------------------------------------------- */
@@ -1340,6 +4336,9 @@ static void hoist_decls(PSVM *vm, PSEnv *env, PSAstNode *node) {
 PSValue ps_eval(PSVM *vm, PSAstNode *program) {
     PSValue last = ps_value_undefined();
     PSEvalControl ctl = {0};
+    int split_timing = 0;
+    uint64_t compile_ms = 0;
+    uint64_t exec_ms = 0;
 
     if (vm) {
         vm->current_ast = program;
@@ -1347,20 +4346,86 @@ PSValue ps_eval(PSVM *vm, PSAstNode *program) {
     }
     hoist_decls(vm, vm->env, program);
 
-    for (size_t i = 0; i < program->as.list.count; i++) {
-        last = eval_node(vm, vm->env, program->as.list.items[i], &ctl);
-        if (ctl.did_throw) {
-            ps_print_uncaught(vm, ctl.throw_value);
-            exit(1);
+    {
+        const char *bench_split = getenv("PS_BENCH_SPLIT_TIMING");
+        if (bench_split && bench_split[0] == '1') {
+            split_timing = 1;
         }
-        if (ctl.did_return) {
-            if (vm) {
-                vm->current_ast = NULL;
-                vm->root_ast = NULL;
-                vm->current_node = NULL;
+    }
+
+    PSStmtBC *bc = NULL;
+    if (split_timing) {
+        uint64_t t0 = ps_eval_now_ms();
+        bc = ps_stmt_bc_compile(program);
+        compile_ms = ps_eval_now_ms() - t0;
+    } else {
+        bc = ps_stmt_bc_compile(program);
+    }
+    if (bc) {
+        uint64_t t1 = 0;
+        if (split_timing) t1 = ps_eval_now_ms();
+#if !PS_DISABLE_SPECIALIZATION || !PS_DISABLE_UNBOXED_SPEC
+        {
+            PSFunction program_func;
+            memset(&program_func, 0, sizeof(program_func));
+            program_func.body = program;
+            program_func.stmt_bc = bc;
+#if !PS_DISABLE_SPECIALIZATION
+            program_func.spec_hot_count = PS_HOT_THRESHOLD;
+#endif
+#if !PS_DISABLE_UNBOXED_SPEC
+/* Unboxed specialization path (experimental; compiled out by default). */
+            program_func.unboxed_hot_count = PS_HOT_THRESHOLD;
+#endif
+            PSString **slot_names = NULL;
+            size_t slot_count = 0;
+            size_t slot_cap = 0;
+            if (ps_spec_collect_program_slots(program, &slot_names, &slot_count, &slot_cap)) {
+                program_func.slot_names = slot_names;
+                program_func.slot_count = slot_count;
+            } else {
+                free(slot_names);
             }
-            return last;
+            last = ps_stmt_bc_execute(vm, vm->env, &program_func, bc, &ctl);
+            free(program_func.slot_names);
+#if !PS_DISABLE_SPECIALIZATION
+            free(program_func.spec_slot_names);
+            if (program_func.spec_bc) {
+                ps_stmt_bc_free(program_func.spec_bc);
+            }
+#endif
+#if !PS_DISABLE_UNBOXED_SPEC
+            if (program_func.unboxed_bc) {
+                ps_stmt_bc_free(program_func.unboxed_bc);
+            }
+#endif
         }
+#else
+        last = ps_stmt_bc_execute(vm, vm->env, NULL, bc, &ctl);
+#endif
+        if (split_timing) exec_ms = ps_eval_now_ms() - t1;
+        ps_stmt_bc_free(bc);
+    } else {
+        ctl.did_throw = 1;
+        ctl.throw_value = ps_vm_make_error(vm, "SyntaxError",
+                                           "Statement bytecode compilation failed");
+    }
+    if (split_timing) {
+        fprintf(stderr, "benchSplit compileMs=%llu execMs=%llu\n",
+                (unsigned long long)compile_ms,
+                (unsigned long long)exec_ms);
+    }
+    if (ctl.did_throw) {
+        ps_print_uncaught(vm, ctl.throw_value);
+        exit(1);
+    }
+    if (ctl.did_return) {
+        if (vm) {
+            vm->current_ast = NULL;
+            vm->root_ast = NULL;
+            vm->current_node = NULL;
+        }
+        return last;
     }
     if (vm) {
         vm->current_ast = NULL;
@@ -1378,7 +4443,16 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
     if (vm) {
         vm->env = env;
         vm->current_node = node;
+#if PS_ENABLE_PERF
+        vm->perf.eval_node_count++;
+        if (node && node->kind < PS_AST_KIND_COUNT) {
+            vm->perf.ast_counts[node->kind]++;
+        }
+#endif
         ps_gc_safe_point(vm);
+        if (ps_eval_trace_enabled != 0) {
+            ps_eval_trace_poll(vm, node);
+        }
     }
     switch (node->kind) {
         case AST_BLOCK:
@@ -1392,7 +4466,24 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
                 val = eval_expression(vm, env, node->as.var_decl.init, ctl);
             }
 
-            ps_env_define(env, name, val);
+            PSEnv *target_env = env;
+            while (target_env && target_env->is_with) {
+                target_env = target_env->parent;
+            }
+            if (!target_env) {
+                target_env = env;
+            }
+            if (node->as.var_decl.init) {
+                (void)ps_env_set(target_env, name, val);
+            } else {
+                int found = 0;
+                if (target_env->record) {
+                    (void)ps_object_get_own(target_env->record, name, &found);
+                }
+                if (!found) {
+                    (void)ps_env_define(target_env, name, ps_value_undefined());
+                }
+            }
             return ps_value_undefined();
         }
 
@@ -1425,6 +4516,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
             }
             PSValue last = ps_value_undefined();
             while (1) {
+                PS_PERF_POLL(vm);
                 PSValue cond = eval_expression(vm, env, node->as.while_stmt.cond, ctl);
                 if (!ps_to_boolean(vm, cond)) break;
                 last = eval_node(vm, env, node->as.while_stmt.body, ctl);
@@ -1462,6 +4554,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
             }
             PSValue last = ps_value_undefined();
             do {
+                PS_PERF_POLL(vm);
                 last = eval_node(vm, env, node->as.do_while.body, ctl);
                 if (ctl->did_throw || ctl->did_return) return last;
                 if (ctl->did_break) {
@@ -1500,6 +4593,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
                 if (ctl->did_throw || ctl->did_return) return last;
             }
             while (1) {
+                PS_PERF_POLL(vm);
                 if (node->as.for_stmt.test) {
                     PSValue cond = eval_expression(vm, env, node->as.for_stmt.test, ctl);
                     if (!ps_to_boolean(vm, cond)) break;
@@ -1564,7 +4658,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
                         PSString *name = list.items[i];
                         if (ps_string_is_length(name)) continue;
                         size_t idx = 0;
-                        if (ps_string_to_array_index(name, &idx)) {
+                        if (ps_array_string_to_index(name, &idx)) {
                             indices[index_count].name = name;
                             indices[index_count].index = idx;
                             index_count++;
@@ -1588,6 +4682,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
             }
 
             for (size_t i = 0; i < ordered_count; i++) {
+                PS_PERF_POLL(vm);
                 PSValue name_val = ps_value_string(ordered[i]);
                 if (node->as.for_in.is_var) {
                     if (node->as.for_in.target->kind == AST_IDENTIFIER) {
@@ -1662,6 +4757,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
             if (string_iter) {
                 size_t len = ps_string_length(string_iter);
                 for (size_t i = 0; i < len; i++) {
+                    PS_PERF_POLL(vm);
                     PSString *ch = ps_string_char_at(string_iter, i);
                     (void)ps_assign_for_target(vm, env, node->as.for_of.target,
                                                node->as.for_of.is_var,
@@ -1706,6 +4802,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
                     }
                 }
                 for (size_t i = 0; i < len; i++) {
+                    PS_PERF_POLL(vm);
                     char buf[32];
                     snprintf(buf, sizeof(buf), "%zu", i);
                     PSValue val = ps_object_get(obj, ps_string_from_cstr(buf), NULL);
@@ -1743,6 +4840,7 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
                 (void)ps_object_enum_own(obj, ps_collect_enum_name, &list);
             }
             for (size_t i = 0; i < list.count; i++) {
+                PS_PERF_POLL(vm);
                 int found = 0;
                 PSValue val = ps_object_get_own(obj, list.items[i], &found);
                 if (!found) continue;
@@ -1872,7 +4970,10 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
             if (ctl->did_throw) return ctl->throw_value;
             PSEnv *with_env = ps_env_new(env, obj, 0);
             if (!with_env) return ps_value_undefined();
+            with_env->is_with = 1;
+            PSEnv *prev_env = vm ? vm->env : NULL;
             PSValue last = eval_node(vm, with_env, node->as.with_stmt.body, ctl);
+            if (vm) vm->env = prev_env;
             ps_env_free(with_env);
             return last;
         }
@@ -1927,13 +5028,6221 @@ static PSValue eval_node(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *c
 }
 
 /* --------------------------------------------------------- */
+/* Expression bytecode                                       */
+/* --------------------------------------------------------- */
+
+typedef struct {
+    PSExprBCInstr *code;
+    size_t count;
+    size_t cap;
+    PSValue *consts;
+    size_t const_count;
+    size_t const_cap;
+} PSExprBCBuilder;
+
+enum {
+    PS_EXPR_BC_PUSH_CONST = 1,
+    PS_EXPR_BC_LOAD_IDENT,
+    PS_EXPR_BC_LOAD_THIS,
+    PS_EXPR_BC_UNARY_NUM,
+    PS_EXPR_BC_BINARY_NUM,
+    PS_EXPR_BC_GET_MEMBER,
+    PS_EXPR_BC_CALL_IDENT,
+    PS_EXPR_BC_CALL_MEMBER,
+    PS_EXPR_BC_STORE_IDENT,
+    PS_EXPR_BC_STORE_MEMBER,
+    PS_EXPR_BC_EVAL_AST
+};
+
+static int ps_expr_bc_push_instr(PSExprBCBuilder *b, PSExprBCInstr instr) {
+    if (!b) return 0;
+    if (b->count == b->cap) {
+        size_t new_cap = b->cap ? b->cap * 2 : 32;
+        PSExprBCInstr *next = (PSExprBCInstr *)realloc(b->code, new_cap * sizeof(PSExprBCInstr));
+        if (!next) return 0;
+        b->code = next;
+        b->cap = new_cap;
+    }
+    b->code[b->count++] = instr;
+    return 1;
+}
+
+static int ps_expr_bc_add_const(PSExprBCBuilder *b, PSValue value, int *out_index) {
+    if (!b) return 0;
+    if (b->const_count == b->const_cap) {
+        size_t new_cap = b->const_cap ? b->const_cap * 2 : 16;
+        PSValue *next = (PSValue *)realloc(b->consts, new_cap * sizeof(PSValue));
+        if (!next) return 0;
+        b->consts = next;
+        b->const_cap = new_cap;
+    }
+    int idx = (int)b->const_count;
+    b->consts[b->const_count++] = value;
+    if (out_index) *out_index = idx;
+    return 1;
+}
+
+static int ps_expr_bc_emit(PSExprBCBuilder *b, PSAstNode *expr);
+
+static int ps_expr_bc_emit_member(PSExprBCBuilder *b, PSAstNode *expr) {
+    PSAstNode *obj = expr->as.member.object;
+    PSAstNode *prop = expr->as.member.property;
+    if (!obj) return 0;
+    if (!ps_expr_bc_emit(b, obj)) return 0;
+    if (expr->as.member.computed) {
+        if (!prop) return 0;
+        if (!ps_expr_bc_emit(b, prop)) return 0;
+    } else {
+        PSValue prop_val = ps_value_undefined();
+        if (prop && prop->kind == AST_IDENTIFIER) {
+            PSString *name = ps_identifier_string(prop);
+            prop_val = ps_value_string(name);
+        } else if (prop && prop->kind == AST_LITERAL &&
+                   prop->as.literal.value.type == PS_T_STRING) {
+            prop_val = prop->as.literal.value;
+        } else {
+            return 0;
+        }
+        int cidx = 0;
+        if (!ps_expr_bc_add_const(b, prop_val, &cidx)) return 0;
+        PSExprBCInstr push = {0};
+        push.op = PS_EXPR_BC_PUSH_CONST;
+        push.a = cidx;
+        if (!ps_expr_bc_push_instr(b, push)) return 0;
+    }
+    PSExprBCInstr instr = {0};
+    instr.op = PS_EXPR_BC_GET_MEMBER;
+    instr.a = expr->as.member.computed ? 1 : 0;
+    instr.ptr = expr;
+    return ps_expr_bc_push_instr(b, instr);
+}
+
+static int ps_expr_bc_emit_call_ident(PSExprBCBuilder *b, PSAstNode *expr) {
+    if (!expr || expr->kind != AST_CALL) return 0;
+    PSAstNode *callee = expr->as.call.callee;
+    if (!callee || callee->kind != AST_IDENTIFIER) return 0;
+    if (ps_string_equals_cstr(ps_identifier_string(callee), "eval")) return 0;
+    for (size_t i = 0; i < expr->as.call.argc; i++) {
+        if (!ps_expr_bc_emit(b, expr->as.call.args[i])) return 0;
+    }
+    PSExprBCInstr instr = {0};
+    instr.op = PS_EXPR_BC_CALL_IDENT;
+    instr.a = (int)expr->as.call.argc;
+    instr.ptr = callee;
+    return ps_expr_bc_push_instr(b, instr);
+}
+
+static int ps_expr_bc_emit_call_member(PSExprBCBuilder *b, PSAstNode *expr) {
+    if (!expr || expr->kind != AST_CALL) return 0;
+    PSAstNode *callee = expr->as.call.callee;
+    if (!callee || callee->kind != AST_MEMBER) return 0;
+    PSAstNode *obj = callee->as.member.object;
+    PSAstNode *prop = callee->as.member.property;
+    if (!obj) return 0;
+    if (!ps_expr_bc_emit(b, obj)) return 0;
+    if (callee->as.member.computed) {
+        if (!prop) return 0;
+        if (!ps_expr_bc_emit(b, prop)) return 0;
+    } else {
+        PSValue prop_val = ps_value_undefined();
+        if (prop && prop->kind == AST_IDENTIFIER) {
+            PSString *name = ps_identifier_string(prop);
+            prop_val = ps_value_string(name);
+        } else if (prop && prop->kind == AST_LITERAL &&
+                   prop->as.literal.value.type == PS_T_STRING) {
+            prop_val = prop->as.literal.value;
+        } else {
+            return 0;
+        }
+        int cidx = 0;
+        if (!ps_expr_bc_add_const(b, prop_val, &cidx)) return 0;
+        PSExprBCInstr push = {0};
+        push.op = PS_EXPR_BC_PUSH_CONST;
+        push.a = cidx;
+        if (!ps_expr_bc_push_instr(b, push)) return 0;
+    }
+    for (size_t i = 0; i < expr->as.call.argc; i++) {
+        if (!ps_expr_bc_emit(b, expr->as.call.args[i])) return 0;
+    }
+    PSExprBCInstr instr = {0};
+    instr.op = PS_EXPR_BC_CALL_MEMBER;
+    instr.a = (int)expr->as.call.argc;
+    instr.ptr = callee;
+    instr.flags = callee->as.member.computed ? 1 : 0;
+    return ps_expr_bc_push_instr(b, instr);
+}
+
+static int ps_expr_bc_emit_assign(PSExprBCBuilder *b, PSAstNode *expr) {
+    if (!expr || expr->kind != AST_ASSIGN) return 0;
+    if (expr->as.assign.op != TOK_ASSIGN) return 0;
+    PSAstNode *target = expr->as.assign.target;
+    PSAstNode *value = expr->as.assign.value;
+    if (!target || !value) return 0;
+    if (!ps_expr_bc_emit(b, value)) return 0;
+    if (target->kind == AST_IDENTIFIER) {
+        PSExprBCInstr instr = {0};
+        instr.op = PS_EXPR_BC_STORE_IDENT;
+        instr.ptr = target;
+        return ps_expr_bc_push_instr(b, instr);
+    }
+    if (target->kind == AST_MEMBER) {
+        PSAstNode *member = target;
+        PSAstNode *obj = member->as.member.object;
+        PSAstNode *prop = member->as.member.property;
+        if (!obj) return 0;
+        if (!ps_expr_bc_emit(b, obj)) return 0;
+        if (member->as.member.computed) {
+            if (!prop) return 0;
+            if (!ps_expr_bc_emit(b, prop)) return 0;
+        } else {
+            PSValue prop_val = ps_value_undefined();
+            if (prop && prop->kind == AST_IDENTIFIER) {
+                PSString *name = ps_identifier_string(prop);
+                prop_val = ps_value_string(name);
+            } else if (prop && prop->kind == AST_LITERAL &&
+                       prop->as.literal.value.type == PS_T_STRING) {
+                prop_val = prop->as.literal.value;
+            } else {
+                return 0;
+            }
+            int cidx = 0;
+            if (!ps_expr_bc_add_const(b, prop_val, &cidx)) return 0;
+            PSExprBCInstr push = {0};
+            push.op = PS_EXPR_BC_PUSH_CONST;
+            push.a = cidx;
+            if (!ps_expr_bc_push_instr(b, push)) return 0;
+        }
+        PSExprBCInstr instr = {0};
+        instr.op = PS_EXPR_BC_STORE_MEMBER;
+        instr.a = member->as.member.computed ? 1 : 0;
+        instr.ptr = member;
+        return ps_expr_bc_push_instr(b, instr);
+    }
+    return 0;
+}
+
+static int ps_expr_bc_emit(PSExprBCBuilder *b, PSAstNode *expr) {
+    if (!b || !expr) return 0;
+    switch (expr->kind) {
+        case AST_LITERAL: {
+            int cidx = 0;
+            if (!ps_expr_bc_add_const(b, expr->as.literal.value, &cidx)) return 0;
+            PSExprBCInstr instr = {0};
+            instr.op = PS_EXPR_BC_PUSH_CONST;
+            instr.a = cidx;
+            return ps_expr_bc_push_instr(b, instr);
+        }
+        case AST_IDENTIFIER: {
+            PSExprBCInstr instr = {0};
+            instr.op = PS_EXPR_BC_LOAD_IDENT;
+            instr.ptr = expr;
+            return ps_expr_bc_push_instr(b, instr);
+        }
+        case AST_THIS: {
+            PSExprBCInstr instr = {0};
+            instr.op = PS_EXPR_BC_LOAD_THIS;
+            return ps_expr_bc_push_instr(b, instr);
+        }
+        case AST_UNARY: {
+            if (expr->as.unary.op != TOK_PLUS && expr->as.unary.op != TOK_MINUS) return 0;
+            if (!ps_expr_bc_emit(b, expr->as.unary.expr)) return 0;
+            PSExprBCInstr instr = {0};
+            instr.op = PS_EXPR_BC_UNARY_NUM;
+            instr.a = expr->as.unary.op;
+            return ps_expr_bc_push_instr(b, instr);
+        }
+        case AST_BINARY: {
+            int op = expr->as.binary.op;
+            if (op == TOK_AND_AND || op == TOK_OR_OR || op == TOK_COMMA) return 0;
+            if (!ps_expr_bc_emit(b, expr->as.binary.left)) return 0;
+            if (!ps_expr_bc_emit(b, expr->as.binary.right)) return 0;
+            PSExprBCInstr instr = {0};
+            instr.op = PS_EXPR_BC_BINARY_NUM;
+            instr.a = op;
+            return ps_expr_bc_push_instr(b, instr);
+        }
+        case AST_MEMBER:
+            return ps_expr_bc_emit_member(b, expr);
+        case AST_CALL: {
+            if (ps_expr_bc_emit_call_ident(b, expr)) return 1;
+            if (ps_expr_bc_emit_call_member(b, expr)) return 1;
+            break;
+        }
+        case AST_ASSIGN:
+            return ps_expr_bc_emit_assign(b, expr);
+        default:
+            break;
+    }
+    return 0;
+}
+
+#if PS_ENABLE_EXPR_BC
+static PSExprBC *ps_expr_bc_compile(PSAstNode *expr) {
+    if (!expr) return NULL;
+    PSExprBCBuilder builder = {0};
+    if (!ps_expr_bc_emit(&builder, expr)) {
+        free(builder.code);
+        free(builder.consts);
+        return NULL;
+    }
+    PSExprBC *bc = (PSExprBC *)calloc(1, sizeof(PSExprBC));
+    if (!bc) {
+        free(builder.code);
+        free(builder.consts);
+        return NULL;
+    }
+    bc->code = builder.code;
+    bc->count = builder.count;
+    bc->consts = builder.consts;
+    bc->const_count = builder.const_count;
+    return bc;
+}
+
+static PSValue ps_expr_bc_execute(PSVM *vm,
+                                  PSEnv *env,
+                                  PSAstNode *root,
+                                  PSExprBC *bc,
+                                  PSEvalControl *ctl,
+                                  int *out_ok) {
+    if (out_ok) *out_ok = 0;
+    if (!bc || !bc->code || bc->count == 0) return ps_value_undefined();
+    PSValue stack_buf[64];
+    PSValue *stack = stack_buf;
+    size_t sp = 0;
+    if (bc->count > 64) {
+        stack = (PSValue *)calloc(bc->count, sizeof(PSValue));
+        if (!stack) return ps_value_undefined();
+    }
+    if (vm) vm->current_node = root;
+    for (size_t ip = 0; ip < bc->count; ip++) {
+        PSExprBCInstr *ins = &bc->code[ip];
+        switch (ins->op) {
+            case PS_EXPR_BC_PUSH_CONST:
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                stack[sp++] = bc->consts[ins->a];
+                break;
+            case PS_EXPR_BC_LOAD_IDENT: {
+                PSAstNode *id = (PSAstNode *)ins->ptr;
+                int found = 0;
+                PSValue v = ps_value_undefined();
+                if (!ps_identifier_cached_get(env, id, &v, &found)) {
+                    PSString *name = ps_identifier_string(id);
+                    v = ps_env_get(env, name, &found);
+                }
+                if (!found) {
+                    ctl->did_throw = 1;
+                    const char *prefix = "Identifier not defined: ";
+                    PSString *name = ps_identifier_string(id);
+                    size_t prefix_len = strlen(prefix);
+                    size_t name_len = name ? name->byte_len : 0;
+                    char *msg = NULL;
+                    if (name && name->utf8 && name_len > 0) {
+                        msg = (char *)malloc(prefix_len + name_len + 1);
+                    }
+                    if (msg) {
+                        memcpy(msg, prefix, prefix_len);
+                        memcpy(msg + prefix_len, name->utf8, name_len);
+                        msg[prefix_len + name_len] = '\0';
+                        ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", msg);
+                        free(msg);
+                    } else {
+                        ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", "Identifier not defined");
+                    }
+                    goto fail;
+                }
+                stack[sp++] = v;
+                break;
+            }
+            case PS_EXPR_BC_LOAD_THIS: {
+                PSString *name = ps_string_from_cstr("this");
+                int found = 0;
+                PSValue v = ps_env_get(env, name, &found);
+                if (found) {
+                    stack[sp++] = v;
+                } else if (vm && vm->global) {
+                    stack[sp++] = ps_value_object(vm->global);
+                } else {
+                    stack[sp++] = ps_value_undefined();
+                }
+                break;
+            }
+            case PS_EXPR_BC_UNARY_NUM: {
+                if (sp == 0) goto fail;
+                PSValue v = stack[sp - 1];
+                if (v.type != PS_T_NUMBER) goto fallback;
+                if (ins->a == TOK_MINUS) {
+                    v.as.number = -v.as.number;
+                }
+                stack[sp - 1] = v;
+                break;
+            }
+            case PS_EXPR_BC_BINARY_NUM: {
+                if (sp < 2) goto fail;
+                PSValue right = stack[--sp];
+                PSValue left = stack[--sp];
+                if (ins->a == TOK_AND_AND || ins->a == TOK_OR_OR || ins->a == TOK_COMMA) {
+                    goto fallback;
+                }
+                PSValue out = ps_eval_binary_values(vm, ins->a, left, right, ctl);
+                if (ctl->did_throw) goto fail;
+                stack[sp++] = out;
+                break;
+            }
+            case PS_EXPR_BC_GET_MEMBER: {
+                if (sp < 2) goto fail;
+                PSValue key_val = stack[--sp];
+                PSValue obj_val = stack[--sp];
+                PSAstNode *member = (PSAstNode *)ins->ptr;
+                PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                if (ctl->did_throw) goto fail;
+                if (obj && obj->kind == PS_OBJ_KIND_BUFFER && ins->a) {
+                    PSValue out = ps_value_undefined();
+                    int handled = ps_buffer_read_index_value(vm, obj, key_val, &out, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        break;
+                    }
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto fail;
+                    handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        break;
+                    }
+                    int found;
+                    stack[sp++] = ps_object_get(obj, prop, &found);
+                    break;
+                } else if (obj && obj->kind == PS_OBJ_KIND_BUFFER32 && ins->a) {
+                    PSValue out = ps_value_undefined();
+                    int handled = ps_buffer32_read_index_value(vm, obj, key_val, &out, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        break;
+                    }
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto fail;
+                    handled = ps_buffer32_read_index(vm, obj, prop, &out, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        break;
+                    }
+                    int found;
+                    stack[sp++] = ps_object_get(obj, prop, &found);
+                    break;
+                } else if (obj && obj->kind == PS_OBJ_KIND_ARRAY && ins->a) {
+                    PSValue out = ps_value_undefined();
+                    size_t index = 0;
+                    int handled = ps_array_read_index_fast_value(obj, key_val, &out, &index);
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        break;
+                    }
+                    if (handled < 0) {
+                        PSString *prop = ps_array_index_string(vm, index);
+                        int found;
+                        stack[sp++] = ps_object_get(obj, prop, &found);
+                        break;
+                    }
+                    handled = ps_array_read_index_value(vm, obj, key_val, &out, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        break;
+                    }
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto fail;
+                    int found;
+                    stack[sp++] = ps_object_get(obj, prop, &found);
+                    break;
+                } else if (obj && obj->kind == PS_OBJ_KIND_PLAIN && ins->a) {
+                    size_t index = 0;
+                    int idx = ps_value_to_index(vm, key_val, &index, ctl);
+                    if (idx < 0) goto fail;
+                    if (idx > 0 && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                        PSValue out = ps_value_undefined();
+                        if (ps_num_map_get(obj, index, &out)) {
+                            stack[sp++] = out;
+                        } else {
+                            stack[sp++] = ps_value_undefined();
+                        }
+                        break;
+                    }
+                    if (key_val.type == PS_T_STRING && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                        uint32_t kindex = 0;
+                        if (ps_string_to_k_index(key_val.as.string, &kindex)) {
+                            PSValue out = ps_value_undefined();
+                            if (ps_num_map_k_get(obj, kindex, &out)) {
+                                stack[sp++] = out;
+                                break;
+                            }
+                        }
+                    }
+                    PSString *prop = (key_val.type == PS_T_STRING) ? key_val.as.string
+                                                                   : ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto fail;
+                    int found;
+                    stack[sp++] = ps_object_get(obj, prop, &found);
+                    break;
+                }
+                PSString tmp_prop;
+                char tmp_buf[96];
+                PSString *prop = NULL;
+                if (ins->a) {
+                    prop = ps_member_key_read(vm, env, member, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
+                } else if (key_val.type == PS_T_STRING) {
+                    prop = key_val.as.string;
+                } else {
+                    prop = ps_to_string(vm, key_val);
+                }
+                if (ctl->did_throw || ps_check_pending_throw(vm, ctl)) goto fail;
+                PSValue out = ps_value_undefined();
+                int handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                if (handled < 0) goto fail;
+                if (handled > 0) {
+                    stack[sp++] = out;
+                    break;
+                }
+                if (ps_member_cached_get(obj, member, prop, &out)) {
+                    stack[sp++] = out;
+                    break;
+                }
+                {
+                    int found;
+                    stack[sp++] = ps_object_get(obj, prop, &found);
+                }
+                break;
+            }
+            case PS_EXPR_BC_CALL_IDENT: {
+                int argc = ins->a;
+                PSAstNode *id = (PSAstNode *)ins->ptr;
+                PSValue callee = ps_value_undefined();
+                int found = 0;
+                if (!ps_identifier_cached_get(env, id, &callee, &found)) {
+                    PSString *name = ps_identifier_string(id);
+                    callee = ps_env_get(env, name, &found);
+                }
+                if (!found) {
+                    ctl->did_throw = 1;
+                    ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", "Identifier not defined");
+                    goto fail;
+                }
+                if (callee.type != PS_T_OBJECT) {
+                    ctl->did_throw = 1;
+                    ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Call of non-object");
+                    goto fail;
+                }
+                PSValue *args = NULL;
+                PSValue stack_args[8];
+                int args_heap = 0;
+                if (argc < 0 || (size_t)argc > sp) goto fail;
+                if (argc <= 8) {
+                    args = stack_args;
+                } else {
+                    args = (PSValue *)malloc(sizeof(PSValue) * (size_t)argc);
+                    args_heap = 1;
+                }
+                if (!args) goto fail;
+                for (int i = argc - 1; i >= 0; i--) {
+                    args[i] = stack[--sp];
+                }
+                int did_throw = 0;
+                PSValue throw_value = ps_value_undefined();
+                PSValue result = ps_eval_call_function(vm, env, callee.as.object,
+                                                       ps_value_object(vm->global),
+                                                       argc, args, &did_throw, &throw_value);
+                if (args_heap) free(args);
+                if (did_throw) {
+                    ctl->did_throw = 1;
+                    ctl->throw_value = throw_value;
+                    goto fail;
+                }
+                stack[sp++] = result;
+                break;
+            }
+            case PS_EXPR_BC_CALL_MEMBER: {
+                int argc = ins->a;
+                PSAstNode *member = (PSAstNode *)ins->ptr;
+                if (!member || member->kind != AST_MEMBER) goto fail;
+                PSValue *args = NULL;
+                PSValue stack_args[8];
+                int args_heap = 0;
+                if (argc < 0 || (size_t)argc > sp) goto fail;
+                if (argc <= 8) {
+                    args = stack_args;
+                } else {
+                    args = (PSValue *)malloc(sizeof(PSValue) * (size_t)argc);
+                    args_heap = 1;
+                }
+                if (!args) goto fail;
+                for (int i = argc - 1; i >= 0; i--) {
+                    args[i] = stack[--sp];
+                }
+                if (sp < 2) {
+                    if (args_heap) free(args);
+                    goto fail;
+                }
+                PSValue key_val = stack[--sp];
+                PSValue obj_val = stack[--sp];
+                PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                if (ctl->did_throw) {
+                    if (args_heap) free(args);
+                    goto fail;
+                }
+                PSValue callee = ps_value_undefined();
+                int found = 0;
+                if (obj && obj->kind == PS_OBJ_KIND_BUFFER && ins->flags) {
+                    PSValue out = ps_value_undefined();
+                    int handled = ps_buffer_read_index_value(vm, obj, key_val, &out, ctl);
+                    if (handled < 0) {
+                        if (args_heap) free(args);
+                        goto fail;
+                    }
+                    if (handled > 0) {
+                        callee = out;
+                    } else {
+                        PSString *prop = ps_to_string(vm, key_val);
+                        if (ps_check_pending_throw(vm, ctl)) {
+                            if (args_heap) free(args);
+                            goto fail;
+                        }
+                        handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                        if (handled < 0) {
+                            if (args_heap) free(args);
+                            goto fail;
+                        }
+                        if (handled > 0) {
+                            callee = out;
+                        } else {
+                            callee = ps_object_get(obj, prop, &found);
+                        }
+                    }
+                } else {
+                    PSString tmp_prop;
+                    char tmp_buf[96];
+                    PSString *prop = NULL;
+                    if (ins->flags) {
+                        prop = ps_member_key_read(vm, env, member, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
+                    } else if (key_val.type == PS_T_STRING) {
+                        prop = key_val.as.string;
+                    } else {
+                        prop = ps_to_string(vm, key_val);
+                    }
+                    if (ctl->did_throw || ps_check_pending_throw(vm, ctl)) {
+                        if (args_heap) free(args);
+                        goto fail;
+                    }
+                    PSValue out = ps_value_undefined();
+                    int handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                    if (handled < 0) {
+                        if (args_heap) free(args);
+                        goto fail;
+                    }
+                    if (handled > 0) {
+                        callee = out;
+                    } else {
+                        callee = ps_object_get(obj, prop, &found);
+                    }
+                }
+                if (callee.type != PS_T_OBJECT) {
+                    if (args_heap) free(args);
+                    ctl->did_throw = 1;
+                    ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Call of non-object");
+                    goto fail;
+                }
+                int did_throw = 0;
+                PSValue throw_value = ps_value_undefined();
+                PSValue result = ps_eval_call_function(vm, env, callee.as.object,
+                                                       obj_val, argc, args,
+                                                       &did_throw, &throw_value);
+                if (args_heap) free(args);
+                if (did_throw) {
+                    ctl->did_throw = 1;
+                    ctl->throw_value = throw_value;
+                    goto fail;
+                }
+                stack[sp++] = result;
+                break;
+            }
+            case PS_EXPR_BC_STORE_IDENT: {
+                if (sp == 0) goto fail;
+                PSAstNode *id = (PSAstNode *)ins->ptr;
+                PSValue value = stack[sp - 1];
+                if (!ps_identifier_cached_set(env, id, value)) {
+                    PSString *name = ps_identifier_string(id);
+                    ps_env_set(env, name, value);
+                }
+                stack[sp - 1] = value;
+                break;
+            }
+            case PS_EXPR_BC_STORE_MEMBER: {
+                if (sp < 3) goto fail;
+                PSValue key_val = stack[--sp];
+                PSValue obj_val = stack[--sp];
+                PSValue value = stack[--sp];
+                PSAstNode *member = (PSAstNode *)ins->ptr;
+                PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                if (ctl->did_throw) goto fail;
+                if (obj && obj->kind == PS_OBJ_KIND_BUFFER && ins->a) {
+                    int handled = ps_buffer_write_index_value(vm, obj, key_val, value, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = value;
+                        break;
+                    }
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto fail;
+                    handled = ps_buffer_write_index(vm, obj, prop, value, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = value;
+                        break;
+                    }
+                    ps_object_put(obj, prop, value);
+                    stack[sp++] = value;
+                    break;
+                } else if (obj && obj->kind == PS_OBJ_KIND_BUFFER32 && ins->a) {
+                    int handled = ps_buffer32_write_index_value(vm, obj, key_val, value, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = value;
+                        break;
+                    }
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto fail;
+                    handled = ps_buffer32_write_index(vm, obj, prop, value, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = value;
+                        break;
+                    }
+                    ps_object_put(obj, prop, value);
+                    stack[sp++] = value;
+                    break;
+                } else if (obj && obj->kind == PS_OBJ_KIND_ARRAY && ins->a) {
+                    size_t index = 0;
+                    int handled = ps_array_write_index_fast_value(obj, key_val, value, &index);
+                    if (handled > 0) {
+                        stack[sp++] = value;
+                        break;
+                    }
+                    handled = ps_array_write_index_value(vm, obj, key_val, value, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = value;
+                        break;
+                    }
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto fail;
+                    ps_object_put(obj, prop, value);
+                    ps_array_update_length(obj, prop);
+                    stack[sp++] = value;
+                    break;
+                } else if (obj && obj->kind == PS_OBJ_KIND_PLAIN && ins->a) {
+                    size_t index = 0;
+                    int idx = ps_value_to_index(vm, key_val, &index, ctl);
+                    if (idx < 0) goto fail;
+                    if (idx > 0 && (obj->internal_kind == PS_INTERNAL_NUMMAP || obj->internal == NULL)) {
+                        int is_new = 0;
+                        if (!ps_num_map_set(obj, index, value, &is_new)) goto fail;
+                        if (is_new) ps_object_bump_shape(obj);
+                        if (env && env->arguments_obj == obj) {
+                            PSString *prop = ps_array_index_string(vm, index);
+                            (void)ps_env_update_arguments(env, obj, prop, value);
+                        }
+                        stack[sp++] = value;
+                        break;
+                    }
+                    if (key_val.type == PS_T_STRING &&
+                        (obj->internal_kind == PS_INTERNAL_NUMMAP || obj->internal == NULL)) {
+                        uint32_t kindex = 0;
+                        if (ps_string_to_k_index(key_val.as.string, &kindex)) {
+                            int is_new = 0;
+                            if (!ps_num_map_k_set(obj, kindex, value, &is_new)) goto fail;
+                            if (is_new) ps_object_bump_shape(obj);
+                            if (env && env->arguments_obj == obj) {
+                                (void)ps_env_update_arguments(env, obj, key_val.as.string, value);
+                            }
+                            stack[sp++] = value;
+                            break;
+                        }
+                    }
+                    PSString *prop = (key_val.type == PS_T_STRING) ? key_val.as.string
+                                                                   : ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto fail;
+                    ps_object_put(obj, prop, value);
+                    (void)ps_env_update_arguments(env, obj, prop, value);
+                    stack[sp++] = value;
+                    break;
+                }
+                PSString *prop = NULL;
+                if (ins->a) {
+                    prop = ps_member_key(vm, env, member, ctl);
+                } else if (key_val.type == PS_T_STRING) {
+                    prop = key_val.as.string;
+                } else {
+                    prop = ps_to_string(vm, key_val);
+                }
+                if (ctl->did_throw || ps_check_pending_throw(vm, ctl)) goto fail;
+                int handled = ps_buffer_write_index(vm, obj, prop, value, ctl);
+                if (handled < 0) goto fail;
+                if (handled > 0) {
+                    stack[sp++] = value;
+                    break;
+                }
+                if (obj->kind == PS_OBJ_KIND_ARRAY && ps_string_is_length(prop)) {
+                    int ok = ps_array_set_length(vm, obj, value, ctl);
+                    if (ok < 0) goto fail;
+                    stack[sp++] = value;
+                    break;
+                }
+                ps_object_put(obj, prop, value);
+                ps_array_update_length(obj, prop);
+                (void)ps_env_update_arguments(env, obj, prop, value);
+                stack[sp++] = value;
+                break;
+            }
+            case PS_EXPR_BC_EVAL_AST: {
+                ctl->did_throw = 1;
+                ctl->throw_value = ps_vm_make_error(vm, "SyntaxError",
+                                                    "Expression bytecode fallback is forbidden");
+                goto fail;
+            }
+            default:
+                goto fail;
+        }
+        continue;
+    }
+    PSValue result = ps_value_undefined();
+    if (sp > 0) result = stack[sp - 1];
+    if (stack != stack_buf) free(stack);
+    if (out_ok) *out_ok = 1;
+    return result;
+fallback:
+    if (stack != stack_buf) free(stack);
+    if (out_ok) *out_ok = 0;
+    return ps_value_undefined();
+fail:
+    if (stack != stack_buf) free(stack);
+    if (out_ok) *out_ok = ctl->did_throw ? 1 : 0;
+    return ctl->did_throw ? ctl->throw_value : ps_value_undefined();
+}
+#endif
+
+/* --------------------------------------------------------- */
+/* Statement bytecode                                        */
+/* --------------------------------------------------------- */
+
+typedef struct {
+    PSStmtBCInstr *code;
+    size_t count;
+    size_t cap;
+    PSValue *consts;
+    size_t const_count;
+    size_t const_cap;
+} PSStmtBCBuilder;
+
+typedef struct {
+    size_t *breaks;
+    size_t break_count;
+    size_t break_cap;
+    size_t *continues;
+    size_t continue_count;
+    size_t continue_cap;
+    size_t continue_target;
+    int allow_continue;
+    PSString *label;
+} PSStmtLoop;
+
+typedef struct {
+    size_t catch_ip;
+    size_t finally_ip;
+    PSAstNode *catch_param;
+} PSTryHandler;
+
+enum {
+    STMT_BC_EXPR_PUSH_CONST = 1,
+    STMT_BC_EXPR_LOAD_IDENT,
+    STMT_BC_EXPR_LOAD_THIS,
+    STMT_BC_EXPR_UNARY_NUM,
+    STMT_BC_EXPR_BINARY_NUM,
+    STMT_BC_EXPR_ADD_INT,
+    STMT_BC_EXPR_ADD_DOUBLE,
+    STMT_BC_EXPR_ADD_IDENT_CONST,
+    STMT_BC_EXPR_ADD_IDENT_IDENT,
+    STMT_BC_EXPR_SUB_INT,
+    STMT_BC_EXPR_SUB_DOUBLE,
+    STMT_BC_EXPR_MUL_INT,
+    STMT_BC_EXPR_MUL_DOUBLE,
+    STMT_BC_EXPR_DIV_DOUBLE,
+    STMT_BC_EXPR_NEW_OBJECT,
+    STMT_BC_EXPR_OBJ_PUT_CONST,
+    STMT_BC_EXPR_GET_MEMBER,
+    STMT_BC_EXPR_CALL_IDENT,
+    STMT_BC_EXPR_CALL_MEMBER,
+    STMT_BC_EXPR_NEW,
+    STMT_BC_EXPR_STORE_IDENT,
+    STMT_BC_EXPR_STORE_MEMBER,
+    STMT_BC_EXPR_NOT,
+    STMT_BC_EXPR_BIT_NOT,
+    STMT_BC_EXPR_DELETE,
+    STMT_BC_EXPR_TYPEOF,
+    STMT_BC_EXPR_EVAL_AST,
+    STMT_BC_EXPR_DUP,
+    STMT_BC_EXPR_POP,
+    STMT_BC_STMT_EVAL_AST,
+    STMT_BC_FOR_IN_INIT,
+    STMT_BC_FOR_IN_NEXT,
+    STMT_BC_FOR_IN_ASSIGN,
+    STMT_BC_WITH_ENTER,
+    STMT_BC_WITH_EXIT,
+    STMT_BC_TRY_PUSH,
+    STMT_BC_TRY_POP,
+    STMT_BC_CATCH_ENTER,
+    STMT_BC_CATCH_EXIT,
+    STMT_BC_THROW,
+    STMT_BC_FINALLY_EXIT,
+    STMT_BC_JUMP,
+    STMT_BC_JUMP_IF_FALSE,
+    STMT_BC_JUMP_IF_TRUE,
+    STMT_BC_JLT_IDENT_CONST,
+    STMT_BC_JBITAND_EQZ_IDENT_CONST,
+    STMT_BC_JUMP_ADD_IDENT_CONST,
+    STMT_BC_RETURN_VALUE,
+    STMT_BC_RETURN_VOID,
+    STMT_BC_EXPR_LOAD_SLOT_NUM,
+    STMT_BC_EXPR_STORE_SLOT_NUM,
+    STMT_BC_EXPR_ADD_NUM,
+    STMT_BC_UNBOX_LOAD_SLOT_D,
+    STMT_BC_UNBOX_STORE_SLOT_D,
+    STMT_BC_UNBOX_ADD_SLOT_D_SLOT_D,
+    STMT_BC_UNBOX_ADD_SLOT_D_CONST,
+    STMT_BC_UNBOX_JLT_SLOT_D_CONST,
+    STMT_BC_UNBOX_JBITAND_EQZ_SLOT_D_CONST,
+    STMT_BC_UNBOX_JUMP_ADD_SLOT_D_CONST
+};
+
+static int ps_stmt_bc_push_instr(PSStmtBCBuilder *b, PSStmtBCInstr instr) {
+    if (!b) return 0;
+    if (b->count == b->cap) {
+        size_t new_cap = b->cap ? b->cap * 2 : 64;
+        PSStmtBCInstr *next = (PSStmtBCInstr *)realloc(b->code, new_cap * sizeof(PSStmtBCInstr));
+        if (!next) return 0;
+        b->code = next;
+        b->cap = new_cap;
+    }
+    b->code[b->count++] = instr;
+    return 1;
+}
+
+static int ps_stmt_bc_add_const(PSStmtBCBuilder *b, PSValue value, int *out_index) {
+    if (!b) return 0;
+    if (b->const_count == b->const_cap) {
+        size_t new_cap = b->const_cap ? b->const_cap * 2 : 16;
+        PSValue *next = (PSValue *)realloc(b->consts, new_cap * sizeof(PSValue));
+        if (!next) return 0;
+        b->consts = next;
+        b->const_cap = new_cap;
+    }
+    int idx = (int)b->const_count;
+    b->consts[b->const_count++] = value;
+    if (out_index) *out_index = idx;
+    return 1;
+}
+
+static int ps_stmt_bc_emit_expr(PSStmtBCBuilder *b, PSAstNode *expr);
+
+static int ps_stmt_bc_emit_member(PSStmtBCBuilder *b, PSAstNode *expr) {
+    PSAstNode *obj = expr->as.member.object;
+    PSAstNode *prop = expr->as.member.property;
+    if (!obj) return 0;
+    if (!ps_stmt_bc_emit_expr(b, obj)) return 0;
+    if (expr->as.member.computed) {
+        if (!prop) return 0;
+        if (!ps_stmt_bc_emit_expr(b, prop)) return 0;
+    } else {
+        PSValue prop_val = ps_value_undefined();
+        if (prop && prop->kind == AST_IDENTIFIER) {
+            PSString *name = ps_identifier_string(prop);
+            prop_val = ps_value_string(name);
+        } else if (prop && prop->kind == AST_LITERAL &&
+                   prop->as.literal.value.type == PS_T_STRING) {
+            prop_val = prop->as.literal.value;
+        } else {
+            return 0;
+        }
+        int cidx = 0;
+        if (!ps_stmt_bc_add_const(b, prop_val, &cidx)) return 0;
+        PSStmtBCInstr push = {0};
+        push.op = STMT_BC_EXPR_PUSH_CONST;
+        push.a = cidx;
+        if (!ps_stmt_bc_push_instr(b, push)) return 0;
+    }
+    PSStmtBCInstr instr = {0};
+    instr.op = STMT_BC_EXPR_GET_MEMBER;
+    instr.a = expr->as.member.computed ? 1 : 0;
+    instr.ptr = expr;
+    return ps_stmt_bc_push_instr(b, instr);
+}
+
+static int ps_stmt_bc_emit_call_ident(PSStmtBCBuilder *b, PSAstNode *expr) {
+    if (!expr || expr->kind != AST_CALL) return 0;
+    PSAstNode *callee = expr->as.call.callee;
+    if (!callee || callee->kind != AST_IDENTIFIER) return 0;
+    for (size_t i = 0; i < expr->as.call.argc; i++) {
+        if (!ps_stmt_bc_emit_expr(b, expr->as.call.args[i])) return 0;
+    }
+    PSStmtBCInstr instr = {0};
+    instr.op = STMT_BC_EXPR_CALL_IDENT;
+    instr.a = (int)expr->as.call.argc;
+    instr.ptr = callee;
+    return ps_stmt_bc_push_instr(b, instr);
+}
+
+static int ps_stmt_bc_emit_call_member(PSStmtBCBuilder *b, PSAstNode *expr) {
+    if (!expr || expr->kind != AST_CALL) return 0;
+    PSAstNode *callee = expr->as.call.callee;
+    if (!callee || callee->kind != AST_MEMBER) return 0;
+    PSAstNode *obj = callee->as.member.object;
+    PSAstNode *prop = callee->as.member.property;
+    if (!obj) return 0;
+    if (!ps_stmt_bc_emit_expr(b, obj)) return 0;
+    if (callee->as.member.computed) {
+        if (!prop) return 0;
+        if (!ps_stmt_bc_emit_expr(b, prop)) return 0;
+    } else {
+        PSValue prop_val = ps_value_undefined();
+        if (prop && prop->kind == AST_IDENTIFIER) {
+            PSString *name = ps_identifier_string(prop);
+            prop_val = ps_value_string(name);
+        } else if (prop && prop->kind == AST_LITERAL &&
+                   prop->as.literal.value.type == PS_T_STRING) {
+            prop_val = prop->as.literal.value;
+        } else {
+            return 0;
+        }
+        int cidx = 0;
+        if (!ps_stmt_bc_add_const(b, prop_val, &cidx)) return 0;
+        PSStmtBCInstr push = {0};
+        push.op = STMT_BC_EXPR_PUSH_CONST;
+        push.a = cidx;
+        if (!ps_stmt_bc_push_instr(b, push)) return 0;
+    }
+    for (size_t i = 0; i < expr->as.call.argc; i++) {
+        if (!ps_stmt_bc_emit_expr(b, expr->as.call.args[i])) return 0;
+    }
+    PSStmtBCInstr instr = {0};
+    instr.op = STMT_BC_EXPR_CALL_MEMBER;
+    instr.a = (int)expr->as.call.argc;
+    instr.ptr = callee;
+    instr.flags = callee->as.member.computed ? 1 : 0;
+    return ps_stmt_bc_push_instr(b, instr);
+}
+
+static int ps_stmt_bc_emit_assign(PSStmtBCBuilder *b, PSAstNode *expr) {
+    if (!expr || expr->kind != AST_ASSIGN) return 0;
+    if (expr->as.assign.op != TOK_ASSIGN) return 0;
+    PSAstNode *target = expr->as.assign.target;
+    PSAstNode *value = expr->as.assign.value;
+    if (!target || !value) return 0;
+    if (!ps_stmt_bc_emit_expr(b, value)) return 0;
+    if (target->kind == AST_IDENTIFIER) {
+        PSStmtBCInstr instr = {0};
+        instr.op = STMT_BC_EXPR_STORE_IDENT;
+        instr.ptr = target;
+        return ps_stmt_bc_push_instr(b, instr);
+    }
+    if (target->kind == AST_MEMBER) {
+        PSAstNode *member = target;
+        PSAstNode *obj = member->as.member.object;
+        PSAstNode *prop = member->as.member.property;
+        if (!obj) return 0;
+        if (!ps_stmt_bc_emit_expr(b, obj)) return 0;
+        if (member->as.member.computed) {
+            if (!prop) return 0;
+            if (!ps_stmt_bc_emit_expr(b, prop)) return 0;
+        } else {
+            PSValue prop_val = ps_value_undefined();
+            if (prop && prop->kind == AST_IDENTIFIER) {
+                PSString *name = ps_identifier_string(prop);
+                prop_val = ps_value_string(name);
+            } else if (prop && prop->kind == AST_LITERAL &&
+                       prop->as.literal.value.type == PS_T_STRING) {
+                prop_val = prop->as.literal.value;
+            } else {
+                return 0;
+            }
+            int cidx = 0;
+            if (!ps_stmt_bc_add_const(b, prop_val, &cidx)) return 0;
+            PSStmtBCInstr push = {0};
+            push.op = STMT_BC_EXPR_PUSH_CONST;
+            push.a = cidx;
+            if (!ps_stmt_bc_push_instr(b, push)) return 0;
+        }
+        PSStmtBCInstr instr = {0};
+        instr.op = STMT_BC_EXPR_STORE_MEMBER;
+        instr.a = member->as.member.computed ? 1 : 0;
+        instr.ptr = member;
+        return ps_stmt_bc_push_instr(b, instr);
+    }
+    return 0;
+}
+
+static int ps_stmt_bc_emit_expr(PSStmtBCBuilder *b, PSAstNode *expr) {
+    if (!b || !expr) return 0;
+    switch (expr->kind) {
+        case AST_LITERAL: {
+            int cidx = 0;
+            if (!ps_stmt_bc_add_const(b, expr->as.literal.value, &cidx)) return 0;
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_EXPR_PUSH_CONST;
+            instr.a = cidx;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        case AST_IDENTIFIER: {
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_EXPR_LOAD_IDENT;
+            instr.ptr = expr;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        case AST_THIS: {
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_EXPR_LOAD_THIS;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        case AST_UNARY: {
+            if (expr->as.unary.op != TOK_PLUS &&
+                expr->as.unary.op != TOK_MINUS &&
+                expr->as.unary.op != TOK_NOT &&
+                expr->as.unary.op != TOK_BIT_NOT &&
+                expr->as.unary.op != TOK_VOID &&
+                expr->as.unary.op != TOK_DELETE &&
+                expr->as.unary.op != TOK_TYPEOF) return 0;
+            if (expr->as.unary.op == TOK_DELETE) {
+                if (expr->as.unary.expr && expr->as.unary.expr->kind == AST_MEMBER) {
+                    PSStmtBCInstr instr = {0};
+                    instr.op = STMT_BC_EXPR_DELETE;
+                    instr.ptr = expr->as.unary.expr;
+                    return ps_stmt_bc_push_instr(b, instr);
+                }
+                PSStmtBCInstr push = {0};
+                push.op = STMT_BC_EXPR_PUSH_CONST;
+                int cidx = 0;
+                if (!ps_stmt_bc_add_const(b, ps_value_boolean(0), &cidx)) return 0;
+                push.a = cidx;
+                return ps_stmt_bc_push_instr(b, push);
+            }
+            if (expr->as.unary.op == TOK_TYPEOF) {
+                PSStmtBCInstr instr = {0};
+                instr.op = STMT_BC_EXPR_TYPEOF;
+                instr.ptr = expr->as.unary.expr;
+                return ps_stmt_bc_push_instr(b, instr);
+            }
+            if (expr->as.unary.op == TOK_VOID) {
+                if (!ps_stmt_bc_emit_expr(b, expr->as.unary.expr)) return 0;
+                PSStmtBCInstr pop = {0};
+                pop.op = STMT_BC_EXPR_POP;
+                if (!ps_stmt_bc_push_instr(b, pop)) return 0;
+                int cidx = 0;
+                if (!ps_stmt_bc_add_const(b, ps_value_undefined(), &cidx)) return 0;
+                PSStmtBCInstr push = {0};
+                push.op = STMT_BC_EXPR_PUSH_CONST;
+                push.a = cidx;
+                return ps_stmt_bc_push_instr(b, push);
+            }
+            if (!ps_stmt_bc_emit_expr(b, expr->as.unary.expr)) return 0;
+            PSStmtBCInstr instr = {0};
+            if (expr->as.unary.op == TOK_NOT) {
+                instr.op = STMT_BC_EXPR_NOT;
+            } else if (expr->as.unary.op == TOK_BIT_NOT) {
+                instr.op = STMT_BC_EXPR_BIT_NOT;
+            } else {
+                instr.op = STMT_BC_EXPR_UNARY_NUM;
+                instr.a = expr->as.unary.op;
+            }
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        case AST_BINARY: {
+            int op = expr->as.binary.op;
+            if (op == TOK_COMMA) {
+                if (!ps_stmt_bc_emit_expr(b, expr->as.binary.left)) return 0;
+                PSStmtBCInstr pop = {0};
+                pop.op = STMT_BC_EXPR_POP;
+                if (!ps_stmt_bc_push_instr(b, pop)) return 0;
+                return ps_stmt_bc_emit_expr(b, expr->as.binary.right);
+            }
+            if (op == TOK_AND_AND || op == TOK_OR_OR) {
+                if (!ps_stmt_bc_emit_expr(b, expr->as.binary.left)) return 0;
+                PSStmtBCInstr dup = {0};
+                dup.op = STMT_BC_EXPR_DUP;
+                if (!ps_stmt_bc_push_instr(b, dup)) return 0;
+                PSStmtBCInstr jmp = {0};
+                jmp.op = (op == TOK_AND_AND) ? STMT_BC_JUMP_IF_FALSE : STMT_BC_JUMP_IF_TRUE;
+                size_t jmp_ip = b->count;
+                if (!ps_stmt_bc_push_instr(b, jmp)) return 0;
+                PSStmtBCInstr pop = {0};
+                pop.op = STMT_BC_EXPR_POP;
+                if (!ps_stmt_bc_push_instr(b, pop)) return 0;
+                if (!ps_stmt_bc_emit_expr(b, expr->as.binary.right)) return 0;
+                b->code[jmp_ip].a = (int32_t)b->count;
+                return 1;
+            }
+            if (!ps_stmt_bc_emit_expr(b, expr->as.binary.left)) return 0;
+            if (!ps_stmt_bc_emit_expr(b, expr->as.binary.right)) return 0;
+            PSStmtBCInstr instr = {0};
+            if (op == TOK_PLUS || op == TOK_MINUS || op == TOK_STAR) {
+                int use_double = 0;
+                double lit = 0.0;
+                if (expr->as.binary.left &&
+                    expr->as.binary.left->kind == AST_LITERAL &&
+                    expr->as.binary.left->as.literal.value.type == PS_T_NUMBER) {
+                    lit = expr->as.binary.left->as.literal.value.as.number;
+                    if (!ps_number_to_int32_strict(lit, NULL)) use_double = 1;
+                }
+                if (expr->as.binary.right &&
+                    expr->as.binary.right->kind == AST_LITERAL &&
+                    expr->as.binary.right->as.literal.value.type == PS_T_NUMBER) {
+                    lit = expr->as.binary.right->as.literal.value.as.number;
+                    if (!ps_number_to_int32_strict(lit, NULL)) use_double = 1;
+                }
+                if (op == TOK_PLUS) {
+                    instr.op = use_double ? STMT_BC_EXPR_ADD_DOUBLE : STMT_BC_EXPR_ADD_INT;
+                } else if (op == TOK_MINUS) {
+                    instr.op = use_double ? STMT_BC_EXPR_SUB_DOUBLE : STMT_BC_EXPR_SUB_INT;
+                } else {
+                    instr.op = use_double ? STMT_BC_EXPR_MUL_DOUBLE : STMT_BC_EXPR_MUL_INT;
+                }
+            } else if (op == TOK_SLASH) {
+                instr.op = STMT_BC_EXPR_DIV_DOUBLE;
+            } else {
+                instr.op = STMT_BC_EXPR_BINARY_NUM;
+                instr.a = op;
+            }
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        case AST_CONDITIONAL: {
+            if (!ps_stmt_bc_emit_expr(b, expr->as.conditional.cond)) return 0;
+            PSStmtBCInstr jmp_false = {0};
+            jmp_false.op = STMT_BC_JUMP_IF_FALSE;
+            size_t jmp_false_ip = b->count;
+            if (!ps_stmt_bc_push_instr(b, jmp_false)) return 0;
+            if (!ps_stmt_bc_emit_expr(b, expr->as.conditional.then_expr)) return 0;
+            PSStmtBCInstr jmp_end = {0};
+            jmp_end.op = STMT_BC_JUMP;
+            size_t jmp_end_ip = b->count;
+            if (!ps_stmt_bc_push_instr(b, jmp_end)) return 0;
+            b->code[jmp_false_ip].a = (int32_t)b->count;
+            if (!ps_stmt_bc_emit_expr(b, expr->as.conditional.else_expr)) return 0;
+            b->code[jmp_end_ip].a = (int32_t)b->count;
+            return 1;
+        }
+        case AST_MEMBER:
+            return ps_stmt_bc_emit_member(b, expr);
+        case AST_CALL: {
+            if (ps_stmt_bc_emit_call_ident(b, expr)) return 1;
+            if (ps_stmt_bc_emit_call_member(b, expr)) return 1;
+            break;
+        }
+        case AST_UPDATE: {
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_EXPR_EVAL_AST;
+            instr.ptr = expr;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        case AST_FUNCTION_EXPR: {
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_EXPR_EVAL_AST;
+            instr.ptr = expr;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        case AST_NEW: {
+            if (!ps_stmt_bc_emit_expr(b, expr->as.new_expr.callee)) return 0;
+            for (size_t i = 0; i < expr->as.new_expr.argc; i++) {
+                if (!ps_stmt_bc_emit_expr(b, expr->as.new_expr.args[i])) return 0;
+            }
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_EXPR_NEW;
+            instr.a = (int)expr->as.new_expr.argc;
+            instr.ptr = expr;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        case AST_ASSIGN:
+            if (expr->as.assign.op != TOK_ASSIGN) {
+                PSStmtBCInstr instr = {0};
+                instr.op = STMT_BC_EXPR_EVAL_AST;
+                instr.ptr = expr;
+                return ps_stmt_bc_push_instr(b, instr);
+            }
+            return ps_stmt_bc_emit_assign(b, expr);
+        case AST_OBJECT_LITERAL: {
+            PSStmtBCInstr obj = {0};
+            obj.op = STMT_BC_EXPR_NEW_OBJECT;
+            if (!ps_stmt_bc_push_instr(b, obj)) return 0;
+            for (size_t i = 0; i < expr->as.object_literal.count; i++) {
+                PSAstProperty *prop = &expr->as.object_literal.props[i];
+                if (!prop || !prop->key || !prop->value) return 0;
+                if (!ps_stmt_bc_emit_expr(b, prop->value)) return 0;
+                int cidx = 0;
+                if (!ps_stmt_bc_add_const(b, ps_value_string(prop->key), &cidx)) return 0;
+                PSStmtBCInstr put = {0};
+                put.op = STMT_BC_EXPR_OBJ_PUT_CONST;
+                put.a = cidx;
+                if (!ps_stmt_bc_push_instr(b, put)) return 0;
+            }
+            return 1;
+        }
+        case AST_ARRAY_LITERAL: {
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_EXPR_EVAL_AST;
+            instr.ptr = expr;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        default: {
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_EXPR_EVAL_AST;
+            instr.ptr = expr;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+    }
+    return 0;
+}
+
+static PSValue ps_stmt_bc_eval_expr(PSVM *vm, PSEnv *env, PSAstNode *expr, PSEvalControl *ctl) {
+    if (!expr) return ps_value_undefined();
+    PSStmtBCBuilder b = {0};
+    if (!ps_stmt_bc_emit_expr(&b, expr)) {
+        free(b.code);
+        free(b.consts);
+        if (ctl) {
+            ctl->did_throw = 1;
+            ctl->throw_value = ps_vm_make_error(vm, "SyntaxError",
+                                                "Expression bytecode compilation failed");
+        }
+        return ctl ? ctl->throw_value : ps_value_undefined();
+    }
+    PSStmtBCInstr ret = {0};
+    ret.op = STMT_BC_RETURN_VALUE;
+    if (!ps_stmt_bc_push_instr(&b, ret)) {
+        free(b.code);
+        free(b.consts);
+        if (ctl) {
+            ctl->did_throw = 1;
+            ctl->throw_value = ps_vm_make_error(vm, "SyntaxError",
+                                                "Expression bytecode compilation failed");
+        }
+        return ctl ? ctl->throw_value : ps_value_undefined();
+    }
+    PSStmtBC *bc = (PSStmtBC *)calloc(1, sizeof(PSStmtBC));
+    if (!bc) {
+        free(b.code);
+        free(b.consts);
+        if (ctl) {
+            ctl->did_throw = 1;
+            ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Out of memory");
+        }
+        return ctl ? ctl->throw_value : ps_value_undefined();
+    }
+    bc->code = b.code;
+    bc->count = b.count;
+    bc->consts = b.consts;
+    bc->const_count = b.const_count;
+    PSValue v = ps_stmt_bc_execute(vm, env, NULL, bc, ctl);
+    ps_stmt_bc_free(bc);
+    return v;
+}
+
+static PSValue ps_stmt_bc_binary_slow(PSVM *vm,
+                                      int op,
+                                      PSValue left,
+                                      PSValue right,
+                                      PSEvalControl *ctl) {
+    return ps_eval_binary_values(vm, op, left, right, ctl);
+}
+
+static int ps_stmt_loop_add(size_t **list, size_t *count, size_t *cap, size_t ip) {
+    if (!list || !count || !cap) return 0;
+    if (*count == *cap) {
+        size_t new_cap = *cap ? (*cap * 2) : 8;
+        size_t *next = (size_t *)realloc(*list, sizeof(size_t) * new_cap);
+        if (!next) return 0;
+        *list = next;
+        *cap = new_cap;
+    }
+    (*list)[(*count)++] = ip;
+    return 1;
+}
+
+static void ps_stmt_loop_free(PSStmtLoop *loop) {
+    if (!loop) return;
+    free(loop->breaks);
+    free(loop->continues);
+    loop->breaks = NULL;
+    loop->continues = NULL;
+    loop->break_count = 0;
+    loop->continue_count = 0;
+    loop->break_cap = 0;
+    loop->continue_cap = 0;
+    loop->continue_target = 0;
+}
+
+static int ps_stmt_bc_emit_stmt(PSStmtBCBuilder *b,
+                               PSAstNode *stmt,
+                               PSStmtLoop **loops,
+                               size_t *loop_depth,
+                               size_t *loop_cap);
+
+static int ps_stmt_bc_ident_same(PSAstNode *a, PSAstNode *b) {
+    if (!a || !b) return 0;
+    if (a->kind != AST_IDENTIFIER || b->kind != AST_IDENTIFIER) return 0;
+    PSString *aname = ps_identifier_string(a);
+    PSString *bname = ps_identifier_string(b);
+    if (!aname || !bname) return 0;
+    return ps_string_equals(aname, bname);
+}
+
+static int ps_stmt_bc_peephole(PSStmtBCBuilder *b) {
+    if (!b || b->count < 4) return 1;
+    size_t old_count = b->count;
+    PSStmtBCInstr *out = (PSStmtBCInstr *)malloc(sizeof(PSStmtBCInstr) * b->count);
+    if (!out) return 0;
+    size_t *map = (size_t *)malloc(sizeof(size_t) * b->count);
+    if (!map) {
+        free(out);
+        return 0;
+    }
+    size_t out_count = 0;
+    size_t i = 0;
+    while (i < b->count) {
+        if (i + 3 < b->count) {
+            PSStmtBCInstr *i0 = &b->code[i];
+            PSStmtBCInstr *i1 = &b->code[i + 1];
+            PSStmtBCInstr *i2 = &b->code[i + 2];
+            PSStmtBCInstr *i3 = &b->code[i + 3];
+#if !PS_DISABLE_CF_FUSIONS
+            if (i0->op == STMT_BC_EXPR_LOAD_IDENT &&
+                i1->op == STMT_BC_EXPR_PUSH_CONST &&
+                i2->op == STMT_BC_EXPR_BINARY_NUM &&
+                i2->a == TOK_LT &&
+                i3->op == STMT_BC_JUMP_IF_FALSE) {
+                PSStmtBCInstr fused = {0};
+                fused.op = STMT_BC_JLT_IDENT_CONST;
+                fused.a = i1->a;
+                fused.ptr = i0->ptr;
+                fused.ptr2 = (void *)(intptr_t)i3->a;
+                map[i] = out_count;
+                map[i + 1] = out_count;
+                map[i + 2] = out_count;
+                map[i + 3] = out_count;
+                out[out_count++] = fused;
+                i += 4;
+                continue;
+            }
+#endif
+            int is_add = (i2->op == STMT_BC_EXPR_ADD_INT || i2->op == STMT_BC_EXPR_ADD_DOUBLE);
+            if (is_add &&
+                i0->op == STMT_BC_EXPR_LOAD_IDENT &&
+                i1->op == STMT_BC_EXPR_PUSH_CONST &&
+                i3->op == STMT_BC_EXPR_STORE_IDENT &&
+                i1->a >= 0 && (size_t)i1->a < b->const_count &&
+                b->consts[i1->a].type == PS_T_NUMBER &&
+                ps_stmt_bc_ident_same((PSAstNode *)i0->ptr, (PSAstNode *)i3->ptr)) {
+                PSStmtBCInstr fused = {0};
+                fused.op = STMT_BC_EXPR_ADD_IDENT_CONST;
+                fused.a = i1->a;
+                fused.ptr = i3->ptr;
+                map[i] = out_count;
+                map[i + 1] = out_count;
+                map[i + 2] = out_count;
+                map[i + 3] = out_count;
+                out[out_count++] = fused;
+                i += 4;
+                continue;
+            }
+            if (is_add &&
+                i0->op == STMT_BC_EXPR_LOAD_IDENT &&
+                i1->op == STMT_BC_EXPR_LOAD_IDENT &&
+                i3->op == STMT_BC_EXPR_STORE_IDENT &&
+                ps_stmt_bc_ident_same((PSAstNode *)i0->ptr, (PSAstNode *)i3->ptr)) {
+                PSStmtBCInstr fused = {0};
+                fused.op = STMT_BC_EXPR_ADD_IDENT_IDENT;
+                fused.ptr = i3->ptr;
+                fused.ptr2 = i1->ptr;
+                map[i] = out_count;
+                map[i + 1] = out_count;
+                map[i + 2] = out_count;
+                map[i + 3] = out_count;
+                out[out_count++] = fused;
+                i += 4;
+                continue;
+            }
+        }
+#if !PS_DISABLE_CF_FUSIONS
+        if (i + 5 < b->count) {
+            PSStmtBCInstr *i0 = &b->code[i];
+            PSStmtBCInstr *i1 = &b->code[i + 1];
+            PSStmtBCInstr *i2 = &b->code[i + 2];
+            PSStmtBCInstr *i3 = &b->code[i + 3];
+            PSStmtBCInstr *i4 = &b->code[i + 4];
+            PSStmtBCInstr *i5 = &b->code[i + 5];
+            if (i0->op == STMT_BC_EXPR_LOAD_IDENT &&
+                i1->op == STMT_BC_EXPR_PUSH_CONST &&
+                i2->op == STMT_BC_EXPR_BINARY_NUM &&
+                i2->a == TOK_AND &&
+                i3->op == STMT_BC_EXPR_PUSH_CONST &&
+                i4->op == STMT_BC_EXPR_BINARY_NUM &&
+                i4->a == TOK_STRICT_EQ &&
+                i5->op == STMT_BC_JUMP_IF_FALSE &&
+                i1->a >= 0 && (size_t)i1->a < b->const_count &&
+                i3->a >= 0 && (size_t)i3->a < b->const_count) {
+                PSValue v_and = b->consts[i1->a];
+                PSValue v_zero = b->consts[i3->a];
+                if (v_and.type == PS_T_NUMBER && v_zero.type == PS_T_NUMBER &&
+                    v_and.as.number == 1.0 && v_zero.as.number == 0.0) {
+                    PSStmtBCInstr fused = {0};
+                    fused.op = STMT_BC_JBITAND_EQZ_IDENT_CONST;
+                    fused.a = i1->a;
+                    fused.ptr = i0->ptr;
+                    fused.ptr2 = (void *)(intptr_t)i5->a;
+                    map[i] = out_count;
+                    map[i + 1] = out_count;
+                    map[i + 2] = out_count;
+                    map[i + 3] = out_count;
+                    map[i + 4] = out_count;
+                    map[i + 5] = out_count;
+                    out[out_count++] = fused;
+                    i += 6;
+                    continue;
+                }
+            }
+        }
+#endif
+#if !PS_DISABLE_CF_FUSIONS
+        if (i + 2 < b->count) {
+            PSStmtBCInstr *i0 = &b->code[i];
+            PSStmtBCInstr *i1 = &b->code[i + 1];
+            PSStmtBCInstr *i2 = &b->code[i + 2];
+            if (i0->op == STMT_BC_EXPR_ADD_IDENT_CONST &&
+                i1->op == STMT_BC_EXPR_POP &&
+                i2->op == STMT_BC_JUMP) {
+                PSStmtBCInstr fused = {0};
+                fused.op = STMT_BC_JUMP_ADD_IDENT_CONST;
+                fused.a = i0->a;
+                fused.ptr = i0->ptr;
+                fused.ptr2 = (void *)(intptr_t)i2->a;
+                map[i] = out_count;
+                map[i + 1] = out_count;
+                map[i + 2] = out_count;
+                out[out_count++] = fused;
+                i += 3;
+                continue;
+            }
+        }
+#endif
+        map[i] = out_count;
+        out[out_count++] = b->code[i++];
+    }
+    for (size_t j = 0; j < out_count; j++) {
+        PSStmtBCInstr *ins = &out[j];
+        if (ins->op == STMT_BC_JUMP ||
+            ins->op == STMT_BC_JUMP_IF_FALSE ||
+            ins->op == STMT_BC_JUMP_IF_TRUE) {
+            if (ins->a >= 0 && (size_t)ins->a < old_count) {
+                ins->a = (int32_t)map[ins->a];
+            }
+        } else if (ins->op == STMT_BC_JLT_IDENT_CONST ||
+                   ins->op == STMT_BC_JBITAND_EQZ_IDENT_CONST ||
+                   ins->op == STMT_BC_JUMP_ADD_IDENT_CONST) {
+            intptr_t target = (intptr_t)ins->ptr2;
+            if (target >= 0 && (size_t)target < old_count) {
+                ins->ptr2 = (void *)(intptr_t)map[target];
+            }
+        } else if (ins->op == STMT_BC_TRY_PUSH) {
+            if (ins->a >= 0 && (size_t)ins->a < old_count) {
+                ins->a = (int32_t)map[ins->a];
+            }
+            intptr_t finally_ip = (intptr_t)ins->ptr;
+            if (finally_ip >= 0 && (size_t)finally_ip < old_count) {
+                ins->ptr = (void *)(intptr_t)map[finally_ip];
+            }
+        }
+    }
+    free(map);
+    free(b->code);
+    b->code = out;
+    b->count = out_count;
+    return 1;
+}
+
+static const char *ps_stmt_bc_op_name(uint8_t op) {
+    switch (op) {
+        case STMT_BC_EXPR_PUSH_CONST: return "PUSH_CONST";
+        case STMT_BC_EXPR_LOAD_IDENT: return "LOAD_IDENT";
+        case STMT_BC_EXPR_LOAD_THIS: return "LOAD_THIS";
+        case STMT_BC_EXPR_UNARY_NUM: return "UNARY_NUM";
+        case STMT_BC_EXPR_BINARY_NUM: return "BINARY_NUM";
+        case STMT_BC_EXPR_ADD_INT: return "ADD_INT";
+        case STMT_BC_EXPR_ADD_DOUBLE: return "ADD_DOUBLE";
+        case STMT_BC_EXPR_ADD_IDENT_CONST: return "ADD_IDENT_CONST";
+        case STMT_BC_EXPR_ADD_IDENT_IDENT: return "ADD_IDENT_IDENT";
+        case STMT_BC_EXPR_SUB_INT: return "SUB_INT";
+        case STMT_BC_EXPR_SUB_DOUBLE: return "SUB_DOUBLE";
+        case STMT_BC_EXPR_MUL_INT: return "MUL_INT";
+        case STMT_BC_EXPR_MUL_DOUBLE: return "MUL_DOUBLE";
+        case STMT_BC_EXPR_DIV_DOUBLE: return "DIV_DOUBLE";
+        case STMT_BC_EXPR_NEW_OBJECT: return "NEW_OBJECT";
+        case STMT_BC_EXPR_OBJ_PUT_CONST: return "OBJ_PUT_CONST";
+        case STMT_BC_EXPR_GET_MEMBER: return "GET_MEMBER";
+        case STMT_BC_EXPR_CALL_IDENT: return "CALL_IDENT";
+        case STMT_BC_EXPR_CALL_MEMBER: return "CALL_MEMBER";
+        case STMT_BC_EXPR_NEW: return "NEW";
+        case STMT_BC_EXPR_STORE_IDENT: return "STORE_IDENT";
+        case STMT_BC_EXPR_STORE_MEMBER: return "STORE_MEMBER";
+        case STMT_BC_EXPR_NOT: return "NOT";
+        case STMT_BC_EXPR_BIT_NOT: return "BIT_NOT";
+        case STMT_BC_EXPR_DELETE: return "DELETE";
+        case STMT_BC_EXPR_TYPEOF: return "TYPEOF";
+        case STMT_BC_EXPR_EVAL_AST: return "EVAL_AST";
+        case STMT_BC_EXPR_DUP: return "DUP";
+        case STMT_BC_EXPR_POP: return "POP";
+        case STMT_BC_STMT_EVAL_AST: return "STMT_EVAL_AST";
+        case STMT_BC_FOR_IN_INIT: return "FOR_IN_INIT";
+        case STMT_BC_FOR_IN_NEXT: return "FOR_IN_NEXT";
+        case STMT_BC_FOR_IN_ASSIGN: return "FOR_IN_ASSIGN";
+        case STMT_BC_WITH_ENTER: return "WITH_ENTER";
+        case STMT_BC_WITH_EXIT: return "WITH_EXIT";
+        case STMT_BC_TRY_PUSH: return "TRY_PUSH";
+        case STMT_BC_TRY_POP: return "TRY_POP";
+        case STMT_BC_CATCH_ENTER: return "CATCH_ENTER";
+        case STMT_BC_CATCH_EXIT: return "CATCH_EXIT";
+        case STMT_BC_THROW: return "THROW";
+        case STMT_BC_FINALLY_EXIT: return "FINALLY_EXIT";
+        case STMT_BC_JUMP: return "JUMP";
+        case STMT_BC_JUMP_IF_FALSE: return "JUMP_IF_FALSE";
+        case STMT_BC_JUMP_IF_TRUE: return "JUMP_IF_TRUE";
+        case STMT_BC_JLT_IDENT_CONST: return "JLT_IDENT_CONST";
+        case STMT_BC_JBITAND_EQZ_IDENT_CONST: return "JBITAND_EQZ_IDENT_CONST";
+        case STMT_BC_JUMP_ADD_IDENT_CONST: return "JUMP_ADD_IDENT_CONST";
+        case STMT_BC_RETURN_VALUE: return "RETURN_VALUE";
+        case STMT_BC_RETURN_VOID: return "RETURN_VOID";
+        case STMT_BC_EXPR_LOAD_SLOT_NUM: return "LOAD_SLOT_NUM";
+        case STMT_BC_EXPR_STORE_SLOT_NUM: return "STORE_SLOT_NUM";
+        case STMT_BC_EXPR_ADD_NUM: return "ADD_NUM";
+        case STMT_BC_UNBOX_LOAD_SLOT_D: return "UNBOX_LOAD_SLOT_D";
+        case STMT_BC_UNBOX_STORE_SLOT_D: return "UNBOX_STORE_SLOT_D";
+        case STMT_BC_UNBOX_ADD_SLOT_D_SLOT_D: return "UNBOX_ADD_SLOT_D_SLOT_D";
+        case STMT_BC_UNBOX_ADD_SLOT_D_CONST: return "UNBOX_ADD_SLOT_D_CONST";
+        case STMT_BC_UNBOX_JLT_SLOT_D_CONST: return "UNBOX_JLT_SLOT_D_CONST";
+        case STMT_BC_UNBOX_JBITAND_EQZ_SLOT_D_CONST: return "UNBOX_JBITAND_EQZ_SLOT_D_CONST";
+        case STMT_BC_UNBOX_JUMP_ADD_SLOT_D_CONST: return "UNBOX_JUMP_ADD_SLOT_D_CONST";
+        default: return "UNKNOWN";
+    }
+}
+
+static const char *ps_token_name_short(int tok) {
+    switch (tok) {
+        case TOK_PLUS: return "+";
+        case TOK_MINUS: return "-";
+        case TOK_STAR: return "*";
+        case TOK_SLASH: return "/";
+        case TOK_PERCENT: return "%";
+        case TOK_LT: return "<";
+        case TOK_LTE: return "<=";
+        case TOK_GT: return ">";
+        case TOK_GTE: return ">=";
+        case TOK_EQ: return "==";
+        case TOK_NEQ: return "!=";
+        case TOK_STRICT_EQ: return "===";
+        case TOK_STRICT_NEQ: return "!==";
+        case TOK_AND: return "&";
+        case TOK_OR: return "|";
+        case TOK_XOR: return "^";
+        case TOK_SHL: return "<<";
+        case TOK_SHR: return ">>";
+        case TOK_USHR: return ">>>";
+        case TOK_AND_AND: return "&&";
+        case TOK_OR_OR: return "||";
+        case TOK_NOT: return "!";
+        case TOK_BIT_NOT: return "~";
+        default: return "?";
+    }
+}
+
+static const char *ps_ident_name(PSAstNode *node) {
+    if (!node || node->kind != AST_IDENTIFIER) return NULL;
+    return node->as.identifier.name;
+}
+
+static void ps_format_value(const PSValue *v, char *buf, size_t cap) {
+    if (!buf || cap == 0) return;
+    if (!v) {
+        snprintf(buf, cap, "null");
+        return;
+    }
+    switch (v->type) {
+        case PS_T_UNDEFINED:
+            snprintf(buf, cap, "undefined");
+            break;
+        case PS_T_NULL:
+            snprintf(buf, cap, "null");
+            break;
+        case PS_T_BOOLEAN:
+            snprintf(buf, cap, v->as.boolean ? "true" : "false");
+            break;
+        case PS_T_NUMBER:
+            snprintf(buf, cap, "%.15g", v->as.number);
+            break;
+        case PS_T_STRING: {
+            const PSString *s = v->as.string;
+            if (!s || !s->utf8) {
+                snprintf(buf, cap, "\"\"");
+            } else {
+                size_t n = s->byte_len < cap - 3 ? s->byte_len : cap - 3;
+                buf[0] = '"';
+                memcpy(buf + 1, s->utf8, n);
+                buf[1 + n] = '"';
+                buf[2 + n] = '\0';
+            }
+            break;
+        }
+        default:
+            snprintf(buf, cap, "<obj>");
+            break;
+    }
+}
+
+static void ps_stmt_bc_dump(const PSStmtBC *bc, const char *label) {
+    if (!bc || !bc->code) return;
+    printf("=== STMT_BC %s ===\n", label ? label : "<unknown>");
+    for (size_t i = 0; i < bc->count; i++) {
+        const PSStmtBCInstr *ins = &bc->code[i];
+        const char *op = ps_stmt_bc_op_name(ins->op);
+        printf("%04zu: %-16s", i, op);
+        switch (ins->op) {
+            case STMT_BC_EXPR_PUSH_CONST: {
+                char tmp[96];
+                PSValue v = (ins->a >= 0 && (size_t)ins->a < bc->const_count)
+                    ? bc->consts[ins->a] : ps_value_undefined();
+                ps_format_value(&v, tmp, sizeof(tmp));
+                printf(" %d (%s)", ins->a, tmp);
+                break;
+            }
+            case STMT_BC_EXPR_LOAD_IDENT:
+            case STMT_BC_EXPR_STORE_IDENT: {
+                const char *name = ps_ident_name((PSAstNode *)ins->ptr);
+                printf(" %s", name ? name : "<ident>");
+                break;
+            }
+            case STMT_BC_EXPR_LOAD_SLOT_NUM:
+            case STMT_BC_EXPR_STORE_SLOT_NUM:
+                printf(" slot=%d", ins->a);
+                break;
+            case STMT_BC_UNBOX_LOAD_SLOT_D:
+            case STMT_BC_UNBOX_STORE_SLOT_D:
+                printf(" slot=%d", ins->a);
+                break;
+            case STMT_BC_EXPR_ADD_IDENT_CONST: {
+                const char *name = ps_ident_name((PSAstNode *)ins->ptr);
+                char tmp[96];
+                PSValue v = (ins->a >= 0 && (size_t)ins->a < bc->const_count)
+                    ? bc->consts[ins->a] : ps_value_undefined();
+                ps_format_value(&v, tmp, sizeof(tmp));
+                printf(" %s, %s", name ? name : "<ident>", tmp);
+                break;
+            }
+            case STMT_BC_EXPR_ADD_IDENT_IDENT: {
+                const char *lhs = ps_ident_name((PSAstNode *)ins->ptr);
+                const char *rhs = ps_ident_name((PSAstNode *)ins->ptr2);
+                printf(" %s, %s", lhs ? lhs : "<ident>", rhs ? rhs : "<ident>");
+                break;
+            }
+            case STMT_BC_EXPR_ADD_NUM:
+                printf(" dst=%d", ins->a);
+                break;
+            case STMT_BC_UNBOX_ADD_SLOT_D_SLOT_D:
+                printf(" dst=%d", ins->a);
+                break;
+            case STMT_BC_UNBOX_ADD_SLOT_D_CONST: {
+                char tmp[96];
+                int const_idx = (int)(intptr_t)ins->ptr2;
+                PSValue v = (const_idx >= 0 && (size_t)const_idx < bc->const_count)
+                    ? bc->consts[const_idx] : ps_value_undefined();
+                ps_format_value(&v, tmp, sizeof(tmp));
+                printf(" slot=%d, %s", (int)(intptr_t)ins->ptr, tmp);
+                break;
+            }
+            case STMT_BC_EXPR_UNARY_NUM:
+            case STMT_BC_EXPR_BINARY_NUM:
+                printf(" %s", ps_token_name_short(ins->a));
+                break;
+            case STMT_BC_EXPR_CALL_IDENT:
+                printf(" %s, argc=%d", ps_ident_name((PSAstNode *)ins->ptr), ins->a);
+                break;
+            case STMT_BC_EXPR_CALL_MEMBER:
+            case STMT_BC_EXPR_GET_MEMBER:
+            case STMT_BC_EXPR_STORE_MEMBER: {
+                PSAstNode *member = (PSAstNode *)ins->ptr;
+                const char *obj = NULL;
+                const char *prop = NULL;
+                if (member && member->kind == AST_MEMBER) {
+                    obj = ps_ident_name(member->as.member.object);
+                    if (!member->as.member.computed) {
+                        if (member->as.member.property &&
+                            member->as.member.property->kind == AST_IDENTIFIER) {
+                            prop = ps_ident_name(member->as.member.property);
+                        } else if (member->as.member.property &&
+                                   member->as.member.property->kind == AST_LITERAL &&
+                                   member->as.member.property->as.literal.value.type == PS_T_STRING) {
+                            PSString *s = member->as.member.property->as.literal.value.as.string;
+                            prop = s ? s->utf8 : NULL;
+                        }
+                    }
+                }
+                if (ins->op == STMT_BC_EXPR_CALL_MEMBER) {
+                    printf(" %s.%s, argc=%d", obj ? obj : "<obj>",
+                           prop ? prop : (ins->flags ? "<computed>" : "<prop>"),
+                           ins->a);
+                } else {
+                    printf(" %s.%s", obj ? obj : "<obj>",
+                           prop ? prop : (ins->a ? "<computed>" : "<prop>"));
+                }
+                break;
+            }
+            case STMT_BC_JUMP:
+            case STMT_BC_JUMP_IF_FALSE:
+            case STMT_BC_JUMP_IF_TRUE:
+                printf(" -> %d", ins->a);
+                break;
+            case STMT_BC_JLT_IDENT_CONST: {
+                const char *name = ps_ident_name((PSAstNode *)ins->ptr);
+                char tmp[96];
+                PSValue v = (ins->a >= 0 && (size_t)ins->a < bc->const_count)
+                    ? bc->consts[ins->a] : ps_value_undefined();
+                ps_format_value(&v, tmp, sizeof(tmp));
+                printf(" %s, %s -> %ld", name ? name : "<ident>", tmp,
+                       (long)(intptr_t)ins->ptr2);
+                break;
+            }
+            case STMT_BC_JBITAND_EQZ_IDENT_CONST: {
+                const char *name = ps_ident_name((PSAstNode *)ins->ptr);
+                char tmp[96];
+                PSValue v = (ins->a >= 0 && (size_t)ins->a < bc->const_count)
+                    ? bc->consts[ins->a] : ps_value_undefined();
+                ps_format_value(&v, tmp, sizeof(tmp));
+                printf(" %s, %s -> %ld", name ? name : "<ident>", tmp,
+                       (long)(intptr_t)ins->ptr2);
+                break;
+            }
+            case STMT_BC_JUMP_ADD_IDENT_CONST: {
+                const char *name = ps_ident_name((PSAstNode *)ins->ptr);
+                char tmp[96];
+                PSValue v = (ins->a >= 0 && (size_t)ins->a < bc->const_count)
+                    ? bc->consts[ins->a] : ps_value_undefined();
+                ps_format_value(&v, tmp, sizeof(tmp));
+                printf(" %s, %s -> %ld", name ? name : "<ident>", tmp,
+                       (long)(intptr_t)ins->ptr2);
+                break;
+            }
+            case STMT_BC_UNBOX_JLT_SLOT_D_CONST: {
+                char tmp[96];
+                PSValue v = (ins->a >= 0 && (size_t)ins->a < bc->const_count)
+                    ? bc->consts[ins->a] : ps_value_undefined();
+                ps_format_value(&v, tmp, sizeof(tmp));
+                printf(" slot=%d, %s -> %ld", (int)(intptr_t)ins->ptr, tmp,
+                       (long)(intptr_t)ins->ptr2);
+                break;
+            }
+            case STMT_BC_UNBOX_JBITAND_EQZ_SLOT_D_CONST: {
+                char tmp[96];
+                PSValue v = (ins->a >= 0 && (size_t)ins->a < bc->const_count)
+                    ? bc->consts[ins->a] : ps_value_undefined();
+                ps_format_value(&v, tmp, sizeof(tmp));
+                printf(" slot=%d, %s -> %ld", (int)(intptr_t)ins->ptr, tmp,
+                       (long)(intptr_t)ins->ptr2);
+                break;
+            }
+            case STMT_BC_UNBOX_JUMP_ADD_SLOT_D_CONST: {
+                char tmp[96];
+                PSValue v = (ins->a >= 0 && (size_t)ins->a < bc->const_count)
+                    ? bc->consts[ins->a] : ps_value_undefined();
+                ps_format_value(&v, tmp, sizeof(tmp));
+                printf(" slot=%d, %s -> %ld", (int)(intptr_t)ins->ptr, tmp,
+                       (long)(intptr_t)ins->ptr2);
+                break;
+            }
+            case STMT_BC_TRY_PUSH: {
+                intptr_t finally_ip = (intptr_t)ins->ptr;
+                printf(" catch=%d finally=%ld", ins->a, (long)finally_ip);
+                break;
+            }
+            case STMT_BC_EXPR_OBJ_PUT_CONST:
+                printf(" const=%d", ins->a);
+                break;
+            case STMT_BC_EXPR_NEW:
+                printf(" argc=%d", ins->a);
+                break;
+            case STMT_BC_EXPR_TYPEOF: {
+                PSAstNode *n = (PSAstNode *)ins->ptr;
+                const char *name = ps_ident_name(n);
+                printf(" %s", name ? name : "<expr>");
+                break;
+            }
+            default:
+                break;
+        }
+        printf("\n");
+    }
+}
+
+static int ps_stmt_bc_emit_list(PSStmtBCBuilder *b,
+                                PSAstNode **items,
+                                size_t count,
+                                PSStmtLoop **loops,
+                                size_t *loop_depth,
+                                size_t *loop_cap) {
+    if (!items) return 1;
+    for (size_t i = 0; i < count; i++) {
+        if (!ps_stmt_bc_emit_stmt(b, items[i], loops, loop_depth, loop_cap)) return 0;
+    }
+    return 1;
+}
+
+static int ps_stmt_bc_push_loop(PSStmtLoop **loops, size_t *depth, size_t *cap, int allow_continue, PSString *label) {
+    if (!loops || !depth || !cap) return 0;
+    if (*depth == *cap) {
+        size_t new_cap = *cap ? (*cap * 2) : 4;
+        PSStmtLoop *next = (PSStmtLoop *)realloc(*loops, sizeof(PSStmtLoop) * new_cap);
+        if (!next) return 0;
+        *loops = next;
+        *cap = new_cap;
+    }
+    PSStmtLoop *loop = &(*loops)[(*depth)++];
+    memset(loop, 0, sizeof(*loop));
+    loop->allow_continue = allow_continue ? 1 : 0;
+    loop->label = label;
+    return 1;
+}
+
+static PSStmtLoop *ps_stmt_bc_current_break(PSStmtLoop *loops, size_t depth) {
+    if (!loops || depth == 0) return NULL;
+    return &loops[depth - 1];
+}
+
+static PSStmtLoop *ps_stmt_bc_current_continue(PSStmtLoop *loops, size_t depth) {
+    if (!loops || depth == 0) return NULL;
+    for (size_t i = depth; i > 0; i--) {
+        PSStmtLoop *loop = &loops[i - 1];
+        if (loop->allow_continue) return loop;
+    }
+    return NULL;
+}
+
+static PSStmtLoop *ps_stmt_bc_find_loop_by_label(PSStmtLoop *loops,
+                                                 size_t depth,
+                                                 PSString *label,
+                                                 int for_continue) {
+    if (!loops || depth == 0 || !label) return NULL;
+    for (size_t i = depth; i > 0; i--) {
+        PSStmtLoop *loop = &loops[i - 1];
+        if (for_continue && !loop->allow_continue) continue;
+        if (loop->label && ps_string_equals(loop->label, label)) {
+            return loop;
+        }
+    }
+    return NULL;
+}
+
+static int ps_stmt_bc_emit_stmt(PSStmtBCBuilder *b,
+                                PSAstNode *stmt,
+                                PSStmtLoop **loops,
+                                size_t *loop_depth,
+                                size_t *loop_cap) {
+    if (!stmt) return 1;
+    switch (stmt->kind) {
+        case AST_BLOCK:
+        case AST_PROGRAM:
+            return ps_stmt_bc_emit_list(b, stmt->as.list.items, stmt->as.list.count,
+                                        loops, loop_depth, loop_cap);
+        case AST_EXPR_STMT: {
+            if (!ps_stmt_bc_emit_expr(b, stmt->as.expr_stmt.expr)) return 0;
+            PSStmtBCInstr pop = {0};
+            pop.op = STMT_BC_EXPR_POP;
+            return ps_stmt_bc_push_instr(b, pop);
+        }
+        case AST_VAR_DECL: {
+            if (stmt->as.var_decl.init) {
+                if (!ps_stmt_bc_emit_expr(b, stmt->as.var_decl.init)) return 0;
+                PSStmtBCInstr store = {0};
+                store.op = STMT_BC_EXPR_STORE_IDENT;
+                store.ptr = stmt->as.var_decl.id;
+                if (!ps_stmt_bc_push_instr(b, store)) return 0;
+                PSStmtBCInstr pop = {0};
+                pop.op = STMT_BC_EXPR_POP;
+                return ps_stmt_bc_push_instr(b, pop);
+            }
+            return 1;
+        }
+        case AST_RETURN: {
+            if (stmt->as.ret.expr) {
+                if (!ps_stmt_bc_emit_expr(b, stmt->as.ret.expr)) return 0;
+                PSStmtBCInstr ins = {0};
+                ins.op = STMT_BC_RETURN_VALUE;
+                return ps_stmt_bc_push_instr(b, ins);
+            }
+            PSStmtBCInstr ins = {0};
+            ins.op = STMT_BC_RETURN_VOID;
+            return ps_stmt_bc_push_instr(b, ins);
+        }
+        case AST_IF: {
+            if (!ps_stmt_bc_emit_expr(b, stmt->as.if_stmt.cond)) return 0;
+            PSStmtBCInstr cond = {0};
+            cond.op = STMT_BC_JUMP_IF_FALSE;
+            size_t cond_ip = b->count;
+            if (!ps_stmt_bc_push_instr(b, cond)) return 0;
+            if (!ps_stmt_bc_emit_stmt(b, stmt->as.if_stmt.then_branch,
+                                      loops, loop_depth, loop_cap)) return 0;
+            if (stmt->as.if_stmt.else_branch) {
+                PSStmtBCInstr jmp = {0};
+                jmp.op = STMT_BC_JUMP;
+                size_t jmp_ip = b->count;
+                if (!ps_stmt_bc_push_instr(b, jmp)) return 0;
+                b->code[cond_ip].a = (int32_t)b->count;
+                if (!ps_stmt_bc_emit_stmt(b, stmt->as.if_stmt.else_branch,
+                                          loops, loop_depth, loop_cap)) return 0;
+                b->code[jmp_ip].a = (int32_t)b->count;
+            } else {
+                b->code[cond_ip].a = (int32_t)b->count;
+            }
+            return 1;
+        }
+        case AST_WHILE: {
+            size_t start_ip = b->count;
+            if (!ps_stmt_bc_emit_expr(b, stmt->as.while_stmt.cond)) return 0;
+            PSStmtBCInstr cond = {0};
+            cond.op = STMT_BC_JUMP_IF_FALSE;
+            size_t cond_ip = b->count;
+            if (!ps_stmt_bc_push_instr(b, cond)) return 0;
+            PSString *label = stmt->as.while_stmt.label
+                ? ps_identifier_string(stmt->as.while_stmt.label)
+                : NULL;
+            if (!ps_stmt_bc_push_loop(loops, loop_depth, loop_cap, 1, label)) return 0;
+            PSStmtLoop *loop = ps_stmt_bc_current_break(*loops, *loop_depth);
+            loop->continue_target = start_ip;
+            if (!ps_stmt_bc_emit_stmt(b, stmt->as.while_stmt.body,
+                                      loops, loop_depth, loop_cap)) return 0;
+            PSStmtBCInstr back = {0};
+            back.op = STMT_BC_JUMP;
+            back.a = (int32_t)start_ip;
+            if (!ps_stmt_bc_push_instr(b, back)) return 0;
+            size_t end_ip = b->count;
+            b->code[cond_ip].a = (int32_t)end_ip;
+            for (size_t i = 0; i < loop->break_count; i++) {
+                b->code[loop->breaks[i]].a = (int32_t)end_ip;
+            }
+            for (size_t i = 0; i < loop->continue_count; i++) {
+                b->code[loop->continues[i]].a = (int32_t)loop->continue_target;
+            }
+            ps_stmt_loop_free(loop);
+            (*loop_depth)--;
+            return 1;
+        }
+        case AST_DO_WHILE: {
+            size_t start_ip = b->count;
+            PSString *label = stmt->as.do_while.label
+                ? ps_identifier_string(stmt->as.do_while.label)
+                : NULL;
+            if (!ps_stmt_bc_push_loop(loops, loop_depth, loop_cap, 1, label)) return 0;
+            if (!ps_stmt_bc_emit_stmt(b, stmt->as.do_while.body,
+                                      loops, loop_depth, loop_cap)) return 0;
+            PSStmtLoop *loop = ps_stmt_bc_current_break(*loops, *loop_depth);
+            size_t cond_ip = b->count;
+            loop->continue_target = cond_ip;
+            if (!ps_stmt_bc_emit_expr(b, stmt->as.do_while.cond)) return 0;
+            PSStmtBCInstr cond = {0};
+            cond.op = STMT_BC_JUMP_IF_FALSE;
+            size_t cond_jump_ip = b->count;
+            if (!ps_stmt_bc_push_instr(b, cond)) return 0;
+            PSStmtBCInstr back = {0};
+            back.op = STMT_BC_JUMP;
+            back.a = (int32_t)start_ip;
+            if (!ps_stmt_bc_push_instr(b, back)) return 0;
+            size_t end_ip = b->count;
+            b->code[cond_jump_ip].a = (int32_t)end_ip;
+            for (size_t i = 0; i < loop->break_count; i++) {
+                b->code[loop->breaks[i]].a = (int32_t)end_ip;
+            }
+            for (size_t i = 0; i < loop->continue_count; i++) {
+                b->code[loop->continues[i]].a = (int32_t)loop->continue_target;
+            }
+            ps_stmt_loop_free(loop);
+            (*loop_depth)--;
+            return 1;
+        }
+        case AST_FOR: {
+            if (stmt->as.for_stmt.init) {
+                if (!ps_stmt_bc_emit_stmt(b, stmt->as.for_stmt.init,
+                                          loops, loop_depth, loop_cap)) return 0;
+            }
+            size_t test_ip = b->count;
+            size_t test_jump_ip = (size_t)-1;
+            if (stmt->as.for_stmt.test) {
+                if (!ps_stmt_bc_emit_expr(b, stmt->as.for_stmt.test)) return 0;
+                PSStmtBCInstr test = {0};
+                test.op = STMT_BC_JUMP_IF_FALSE;
+                test_jump_ip = b->count;
+                if (!ps_stmt_bc_push_instr(b, test)) return 0;
+            }
+            PSString *label = stmt->as.for_stmt.label
+                ? ps_identifier_string(stmt->as.for_stmt.label)
+                : NULL;
+            if (!ps_stmt_bc_push_loop(loops, loop_depth, loop_cap, 1, label)) return 0;
+            if (!ps_stmt_bc_emit_stmt(b, stmt->as.for_stmt.body,
+                                      loops, loop_depth, loop_cap)) return 0;
+            size_t update_ip = b->count;
+            if (stmt->as.for_stmt.update) {
+                if (!ps_stmt_bc_emit_expr(b, stmt->as.for_stmt.update)) return 0;
+                PSStmtBCInstr pop = {0};
+                pop.op = STMT_BC_EXPR_POP;
+                if (!ps_stmt_bc_push_instr(b, pop)) return 0;
+            }
+            PSStmtBCInstr back = {0};
+            back.op = STMT_BC_JUMP;
+            back.a = (int32_t)test_ip;
+            if (!ps_stmt_bc_push_instr(b, back)) return 0;
+            size_t end_ip = b->count;
+            if (test_jump_ip != (size_t)-1) {
+                b->code[test_jump_ip].a = (int32_t)end_ip;
+            }
+            PSStmtLoop *loop = ps_stmt_bc_current_break(*loops, *loop_depth);
+            loop->continue_target = stmt->as.for_stmt.update ? update_ip : test_ip;
+            for (size_t i = 0; i < loop->break_count; i++) {
+                b->code[loop->breaks[i]].a = (int32_t)end_ip;
+            }
+            for (size_t i = 0; i < loop->continue_count; i++) {
+                b->code[loop->continues[i]].a = (int32_t)loop->continue_target;
+            }
+            ps_stmt_loop_free(loop);
+            (*loop_depth)--;
+            return 1;
+        }
+        case AST_FOR_IN: {
+            if (!ps_stmt_bc_emit_expr(b, stmt->as.for_in.object)) return 0;
+            PSStmtBCInstr init = {0};
+            init.op = STMT_BC_FOR_IN_INIT;
+            if (!ps_stmt_bc_push_instr(b, init)) return 0;
+            size_t loop_start = b->count;
+            PSStmtBCInstr next = {0};
+            next.op = STMT_BC_FOR_IN_NEXT;
+            if (!ps_stmt_bc_push_instr(b, next)) return 0;
+            PSStmtBCInstr cond = {0};
+            cond.op = STMT_BC_JUMP_IF_FALSE;
+            size_t cond_ip = b->count;
+            if (!ps_stmt_bc_push_instr(b, cond)) return 0;
+            PSString *label = stmt->as.for_in.label
+                ? ps_identifier_string(stmt->as.for_in.label)
+                : NULL;
+            if (!ps_stmt_bc_push_loop(loops, loop_depth, loop_cap, 1, label)) return 0;
+            PSStmtLoop *loop = ps_stmt_bc_current_break(*loops, *loop_depth);
+            loop->continue_target = loop_start;
+            PSStmtBCInstr assign = {0};
+            assign.op = STMT_BC_FOR_IN_ASSIGN;
+            assign.ptr = stmt->as.for_in.target;
+            assign.a = stmt->as.for_in.is_var ? 1 : 0;
+            if (!ps_stmt_bc_push_instr(b, assign)) return 0;
+            if (!ps_stmt_bc_emit_stmt(b, stmt->as.for_in.body,
+                                      loops, loop_depth, loop_cap)) return 0;
+            PSStmtBCInstr back = {0};
+            back.op = STMT_BC_JUMP;
+            back.a = (int32_t)loop_start;
+            if (!ps_stmt_bc_push_instr(b, back)) return 0;
+            size_t cleanup_ip = b->count;
+            PSStmtBCInstr pop = {0};
+            pop.op = STMT_BC_EXPR_POP;
+            if (!ps_stmt_bc_push_instr(b, pop)) return 0;
+            if (!ps_stmt_bc_push_instr(b, pop)) return 0;
+            size_t end_ip = b->count;
+            b->code[cond_ip].a = (int32_t)cleanup_ip;
+            for (size_t i = 0; i < loop->break_count; i++) {
+                b->code[loop->breaks[i]].a = (int32_t)cleanup_ip;
+            }
+            for (size_t i = 0; i < loop->continue_count; i++) {
+                b->code[loop->continues[i]].a = (int32_t)loop->continue_target;
+            }
+            (void)end_ip;
+            ps_stmt_loop_free(loop);
+            (*loop_depth)--;
+            return 1;
+        }
+        case AST_FOR_OF: {
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_STMT_EVAL_AST;
+            instr.ptr = stmt;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        case AST_SWITCH: {
+            PSAstNode *sw = stmt;
+            size_t case_count = sw->as.switch_stmt.case_count;
+            if (!ps_stmt_bc_emit_expr(b, sw->as.switch_stmt.expr)) return 0;
+            PSString *label = sw->as.switch_stmt.label
+                ? ps_identifier_string(sw->as.switch_stmt.label)
+                : NULL;
+            if (!ps_stmt_bc_push_loop(loops, loop_depth, loop_cap, 0, label)) return 0;
+            PSStmtLoop *loop = ps_stmt_bc_current_break(*loops, *loop_depth);
+
+            size_t *match_jumps = NULL;
+            size_t *match_labels = NULL;
+            size_t *entry_jumps = NULL;
+            size_t *body_labels = NULL;
+            if (case_count > 0) {
+                match_jumps = (size_t *)calloc(case_count, sizeof(size_t));
+                match_labels = (size_t *)calloc(case_count, sizeof(size_t));
+                entry_jumps = (size_t *)calloc(case_count, sizeof(size_t));
+                body_labels = (size_t *)calloc(case_count, sizeof(size_t));
+                if (!match_jumps || !match_labels || !entry_jumps || !body_labels) {
+                    free(match_jumps);
+                    free(match_labels);
+                    free(entry_jumps);
+                    free(body_labels);
+                    return 0;
+                }
+            }
+
+            int default_index = -1;
+            for (size_t i = 0; i < case_count; i++) {
+                PSAstNode *case_node = sw->as.switch_stmt.cases[i];
+                if (!case_node->as.case_stmt.test) {
+                    default_index = (int)i;
+                    continue;
+                }
+                PSStmtBCInstr dup = {0};
+                dup.op = STMT_BC_EXPR_DUP;
+                if (!ps_stmt_bc_push_instr(b, dup)) return 0;
+                if (!ps_stmt_bc_emit_expr(b, case_node->as.case_stmt.test)) return 0;
+                PSStmtBCInstr eq = {0};
+                eq.op = STMT_BC_EXPR_BINARY_NUM;
+                eq.a = TOK_STRICT_EQ;
+                if (!ps_stmt_bc_push_instr(b, eq)) return 0;
+                PSStmtBCInstr jmp = {0};
+                jmp.op = STMT_BC_JUMP_IF_TRUE;
+                size_t jmp_ip = b->count;
+                if (!ps_stmt_bc_push_instr(b, jmp)) return 0;
+                if (match_jumps) match_jumps[i] = jmp_ip;
+            }
+
+            PSStmtBCInstr pop = {0};
+            pop.op = STMT_BC_EXPR_POP;
+            if (!ps_stmt_bc_push_instr(b, pop)) return 0;
+            PSStmtBCInstr jmp_default = {0};
+            jmp_default.op = STMT_BC_JUMP;
+            size_t jmp_default_ip = b->count;
+            if (!ps_stmt_bc_push_instr(b, jmp_default)) return 0;
+
+            for (size_t i = 0; i < case_count; i++) {
+                PSAstNode *case_node = sw->as.switch_stmt.cases[i];
+                if (!case_node->as.case_stmt.test) continue;
+                match_labels[i] = b->count;
+                PSStmtBCInstr pop_disc = {0};
+                pop_disc.op = STMT_BC_EXPR_POP;
+                if (!ps_stmt_bc_push_instr(b, pop_disc)) return 0;
+                PSStmtBCInstr jump_body = {0};
+                jump_body.op = STMT_BC_JUMP;
+                size_t jump_body_ip = b->count;
+                if (!ps_stmt_bc_push_instr(b, jump_body)) return 0;
+                entry_jumps[i] = jump_body_ip;
+            }
+
+            for (size_t i = 0; i < case_count; i++) {
+                body_labels[i] = b->count;
+                PSAstNode *case_node = sw->as.switch_stmt.cases[i];
+                if (!ps_stmt_bc_emit_list(b, case_node->as.case_stmt.items,
+                                          case_node->as.case_stmt.count,
+                                          loops, loop_depth, loop_cap)) return 0;
+            }
+
+            size_t end_ip = b->count;
+            if (case_count > 0) {
+                for (size_t i = 0; i < case_count; i++) {
+                    PSAstNode *case_node = sw->as.switch_stmt.cases[i];
+                    if (!case_node->as.case_stmt.test) continue;
+                    b->code[match_jumps[i]].a = (int32_t)match_labels[i];
+                    b->code[entry_jumps[i]].a = (int32_t)body_labels[i];
+                }
+            }
+            if (default_index >= 0 && case_count > 0) {
+                b->code[jmp_default_ip].a = (int32_t)body_labels[default_index];
+            } else {
+                b->code[jmp_default_ip].a = (int32_t)end_ip;
+            }
+
+            for (size_t i = 0; i < loop->break_count; i++) {
+                b->code[loop->breaks[i]].a = (int32_t)end_ip;
+            }
+            for (size_t i = 0; i < loop->continue_count; i++) {
+                b->code[loop->continues[i]].a = (int32_t)loop->continue_target;
+            }
+            ps_stmt_loop_free(loop);
+            (*loop_depth)--;
+            free(match_jumps);
+            free(match_labels);
+            free(entry_jumps);
+            free(body_labels);
+            return 1;
+        }
+        case AST_WITH: {
+            if (!ps_stmt_bc_emit_expr(b, stmt->as.with_stmt.object)) return 0;
+            PSStmtBCInstr enter = {0};
+            enter.op = STMT_BC_WITH_ENTER;
+            if (!ps_stmt_bc_push_instr(b, enter)) return 0;
+            if (!ps_stmt_bc_emit_stmt(b, stmt->as.with_stmt.body,
+                                      loops, loop_depth, loop_cap)) return 0;
+            PSStmtBCInstr exit = {0};
+            exit.op = STMT_BC_WITH_EXIT;
+            return ps_stmt_bc_push_instr(b, exit);
+        }
+        case AST_TRY: {
+            PSAstNode *try_block = stmt->as.try_stmt.try_block;
+            PSAstNode *catch_block = stmt->as.try_stmt.catch_block;
+            PSAstNode *finally_block = stmt->as.try_stmt.finally_block;
+            PSStmtBCInstr push = {0};
+            push.op = STMT_BC_TRY_PUSH;
+            push.a = -1;
+            push.ptr = (void *)(intptr_t)-1;
+            push.ptr2 = catch_block ? stmt->as.try_stmt.catch_param : NULL;
+            size_t push_ip = b->count;
+            if (!ps_stmt_bc_push_instr(b, push)) return 0;
+            if (!ps_stmt_bc_emit_stmt(b, try_block, loops, loop_depth, loop_cap)) return 0;
+            PSStmtBCInstr jmp_after_try = {0};
+            jmp_after_try.op = STMT_BC_JUMP;
+            size_t jmp_after_try_ip = b->count;
+            if (!ps_stmt_bc_push_instr(b, jmp_after_try)) return 0;
+
+            size_t catch_ip = (size_t)-1;
+            size_t jmp_after_catch_ip = (size_t)-1;
+            if (catch_block) {
+                catch_ip = b->count;
+                PSStmtBCInstr enter = {0};
+                enter.op = STMT_BC_CATCH_ENTER;
+                if (!ps_stmt_bc_push_instr(b, enter)) return 0;
+                if (!ps_stmt_bc_emit_stmt(b, catch_block, loops, loop_depth, loop_cap)) return 0;
+                PSStmtBCInstr exit = {0};
+                exit.op = STMT_BC_CATCH_EXIT;
+                if (!ps_stmt_bc_push_instr(b, exit)) return 0;
+                PSStmtBCInstr jmp_after_catch = {0};
+                jmp_after_catch.op = STMT_BC_JUMP;
+                jmp_after_catch_ip = b->count;
+                if (!ps_stmt_bc_push_instr(b, jmp_after_catch)) return 0;
+            }
+
+            size_t finally_ip = (size_t)-1;
+            size_t cleanup_ip = (size_t)-1;
+            if (finally_block) {
+                finally_ip = b->count;
+                if (!ps_stmt_bc_emit_stmt(b, finally_block, loops, loop_depth, loop_cap)) return 0;
+                PSStmtBCInstr fin = {0};
+                fin.op = STMT_BC_FINALLY_EXIT;
+                if (!ps_stmt_bc_push_instr(b, fin)) return 0;
+            } else {
+                PSStmtBCInstr pop = {0};
+                pop.op = STMT_BC_TRY_POP;
+                cleanup_ip = b->count;
+                if (!ps_stmt_bc_push_instr(b, pop)) return 0;
+            }
+            size_t end_ip = b->count;
+            (void)end_ip;
+
+            b->code[push_ip].a = catch_block ? (int32_t)catch_ip : -1;
+            b->code[push_ip].ptr = (void *)(intptr_t)(finally_block ? (intptr_t)finally_ip : -1);
+
+            if (finally_block) {
+                b->code[jmp_after_try_ip].a = (int32_t)finally_ip;
+                if (catch_block) {
+                    b->code[jmp_after_catch_ip].a = (int32_t)finally_ip;
+                }
+            } else {
+                b->code[jmp_after_try_ip].a = (int32_t)cleanup_ip;
+                if (catch_block) {
+                    b->code[jmp_after_catch_ip].a = (int32_t)cleanup_ip;
+                }
+            }
+            return 1;
+        }
+        case AST_THROW: {
+            if (!ps_stmt_bc_emit_expr(b, stmt->as.throw_stmt.expr)) return 0;
+            PSStmtBCInstr thr = {0};
+            thr.op = STMT_BC_THROW;
+            return ps_stmt_bc_push_instr(b, thr);
+        }
+        case AST_BREAK: {
+            PSStmtLoop *loop = NULL;
+            if (stmt->as.jump_stmt.label) {
+                PSString *label = ps_identifier_string(stmt->as.jump_stmt.label);
+                loop = ps_stmt_bc_find_loop_by_label(*loops, *loop_depth, label, 0);
+            } else {
+                loop = ps_stmt_bc_current_break(*loops, *loop_depth);
+            }
+            if (!loop) return 0;
+            PSStmtBCInstr jmp = {0};
+            jmp.op = STMT_BC_JUMP;
+            size_t ip = b->count;
+            if (!ps_stmt_bc_push_instr(b, jmp)) return 0;
+            return ps_stmt_loop_add(&loop->breaks, &loop->break_count, &loop->break_cap, ip);
+        }
+        case AST_CONTINUE: {
+            PSStmtLoop *loop = NULL;
+            if (stmt->as.jump_stmt.label) {
+                PSString *label = ps_identifier_string(stmt->as.jump_stmt.label);
+                loop = ps_stmt_bc_find_loop_by_label(*loops, *loop_depth, label, 1);
+            } else {
+                loop = ps_stmt_bc_current_continue(*loops, *loop_depth);
+            }
+            if (!loop) return 0;
+            PSStmtBCInstr jmp = {0};
+            jmp.op = STMT_BC_JUMP;
+            size_t ip = b->count;
+            if (!ps_stmt_bc_push_instr(b, jmp)) return 0;
+            return ps_stmt_loop_add(&loop->continues, &loop->continue_count, &loop->continue_cap, ip);
+        }
+        case AST_FUNCTION_DECL:
+            return 1;
+        default: {
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_STMT_EVAL_AST;
+            instr.ptr = stmt;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+    }
+}
+
+static PSStmtBC *ps_stmt_bc_compile(PSAstNode *node) {
+    if (!node) return NULL;
+    PSStmtBCBuilder b = {0};
+    PSStmtLoop *loops = NULL;
+    size_t loop_depth = 0;
+    size_t loop_cap = 0;
+    if (!ps_stmt_bc_emit_stmt(&b, node, &loops, &loop_depth, &loop_cap)) {
+        free(b.code);
+        free(b.consts);
+        if (loops) {
+            for (size_t i = 0; i < loop_depth; i++) {
+                ps_stmt_loop_free(&loops[i]);
+            }
+        }
+        free(loops);
+        return NULL;
+    }
+    {
+        PSStmtBCInstr ret = {0};
+        ret.op = STMT_BC_RETURN_VOID;
+        if (!ps_stmt_bc_push_instr(&b, ret)) {
+            free(b.code);
+            free(b.consts);
+            if (loops) {
+                for (size_t i = 0; i < loop_depth; i++) {
+                    ps_stmt_loop_free(&loops[i]);
+                }
+            }
+            free(loops);
+            return NULL;
+        }
+    }
+#if !PS_DISABLE_PEEPHOLE
+    if (!ps_stmt_bc_peephole(&b)) {
+        free(b.code);
+        free(b.consts);
+        if (loops) {
+            for (size_t i = 0; i < loop_depth; i++) {
+                ps_stmt_loop_free(&loops[i]);
+            }
+        }
+        free(loops);
+        return NULL;
+    }
+#endif
+    {
+        const char *dump = getenv("PS_DUMP_STMT_BC");
+        if (dump && *dump && node->kind == AST_PROGRAM) {
+            PSStmtBC tmp = {0};
+            tmp.code = b.code;
+            tmp.count = b.count;
+            tmp.consts = b.consts;
+            tmp.const_count = b.const_count;
+            ps_stmt_bc_dump(&tmp, node->source_path ? node->source_path : "<program>");
+        }
+    }
+    if (loops) {
+        for (size_t i = 0; i < loop_depth; i++) {
+            ps_stmt_loop_free(&loops[i]);
+        }
+    }
+    free(loops);
+    PSStmtBC *bc = (PSStmtBC *)calloc(1, sizeof(PSStmtBC));
+    if (!bc) {
+        free(b.code);
+        free(b.consts);
+        return NULL;
+    }
+    bc->code = b.code;
+    bc->count = b.count;
+    bc->consts = b.consts;
+    bc->const_count = b.const_count;
+    return bc;
+}
+
+void ps_stmt_bc_free(PSStmtBC *bc) {
+    if (!bc) return;
+    free(bc->code);
+    free(bc->consts);
+    free(bc);
+}
+
+static int ps_stmt_bc_get_ident_value(PSVM *vm, PSEnv *env, PSAstNode *id, PSValue *out,
+                                      PSEvalControl *ctl) {
+    int found = 0;
+    PSValue v = ps_value_undefined();
+    if (!ps_identifier_cached_get(env, id, &v, &found)) {
+        PSString *name = ps_identifier_string(id);
+        v = ps_env_get(env, name, &found);
+    }
+    if (!found) {
+        ctl->did_throw = 1;
+        const char *prefix = "Identifier not defined: ";
+        PSString *name = ps_identifier_string(id);
+        size_t prefix_len = strlen(prefix);
+        size_t name_len = name ? name->byte_len : 0;
+        char *msg = NULL;
+        if (name && name->utf8 && name_len > 0) {
+            msg = (char *)malloc(prefix_len + name_len + 1);
+        }
+        if (msg) {
+            memcpy(msg, prefix, prefix_len);
+            memcpy(msg + prefix_len, name->utf8, name_len);
+            msg[prefix_len + name_len] = '\0';
+            ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", msg);
+            free(msg);
+        } else {
+            ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", "Identifier not defined");
+        }
+        return 0;
+    }
+    *out = v;
+    return 1;
+}
+
+#if !PS_DISABLE_SPECIALIZATION
+ #if PS_ENABLE_PERF
+static int ps_spec_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("PS_SPEC_TRACE");
+        enabled = (env && *env) ? 1 : 0;
+    }
+    return enabled;
+}
+
+static void ps_spec_trace_log_once(const char *msg, int *printed) {
+    if (!msg || !printed) return;
+    if (!ps_spec_trace_enabled()) return;
+    if (*printed) return;
+    fprintf(stderr, "[spec] %s\n", msg);
+    *printed = 1;
+}
+
+static int ps_spec_trace_exec_printed = 0;
+static int ps_spec_trace_fail_printed = 0;
+ #endif
+
+typedef struct {
+    PSStmtBCInstr *code;
+    size_t count;
+    size_t cap;
+} PSSpecBCBuilder;
+
+static int ps_spec_push(PSSpecBCBuilder *b, PSStmtBCInstr ins) {
+    if (!b) return 0;
+    if (b->count == b->cap) {
+        size_t new_cap = b->cap ? b->cap * 2 : 64;
+        PSStmtBCInstr *next = (PSStmtBCInstr *)realloc(b->code, new_cap * sizeof(PSStmtBCInstr));
+        if (!next) return 0;
+        b->code = next;
+        b->cap = new_cap;
+    }
+    b->code[b->count++] = ins;
+    return 1;
+}
+
+static int ps_spec_ast_safe(PSAstNode *node) {
+    if (!node) return 1;
+    switch (node->kind) {
+        case AST_WITH:
+        case AST_FUNCTION_DECL:
+        case AST_FUNCTION_EXPR:
+            return 0;
+        case AST_PROGRAM:
+        case AST_BLOCK:
+            for (size_t i = 0; i < node->as.list.count; i++) {
+                if (!ps_spec_ast_safe(node->as.list.items[i])) return 0;
+            }
+            return 1;
+        case AST_IF:
+            return ps_spec_ast_safe(node->as.if_stmt.then_branch) &&
+                   ps_spec_ast_safe(node->as.if_stmt.else_branch);
+        case AST_WHILE:
+            return ps_spec_ast_safe(node->as.while_stmt.body);
+        case AST_DO_WHILE:
+            return ps_spec_ast_safe(node->as.do_while.body);
+        case AST_FOR:
+            return ps_spec_ast_safe(node->as.for_stmt.init) &&
+                   ps_spec_ast_safe(node->as.for_stmt.body);
+        case AST_FOR_IN:
+            return ps_spec_ast_safe(node->as.for_in.body);
+        case AST_FOR_OF:
+            return ps_spec_ast_safe(node->as.for_of.body);
+        case AST_SWITCH:
+            for (size_t i = 0; i < node->as.switch_stmt.case_count; i++) {
+                if (!ps_spec_ast_safe(node->as.switch_stmt.cases[i])) return 0;
+            }
+            return 1;
+        case AST_CASE:
+            for (size_t i = 0; i < node->as.case_stmt.count; i++) {
+                if (!ps_spec_ast_safe(node->as.case_stmt.items[i])) return 0;
+            }
+            return 1;
+        case AST_TRY:
+            return ps_spec_ast_safe(node->as.try_stmt.try_block) &&
+                   ps_spec_ast_safe(node->as.try_stmt.catch_block) &&
+                   ps_spec_ast_safe(node->as.try_stmt.finally_block);
+        case AST_LABEL:
+            return ps_spec_ast_safe(node->as.label_stmt.stmt);
+        default:
+            return 1;
+    }
+}
+
+static int ps_spec_guard_add(uint8_t *guards, uint8_t *guard_count, int slot) {
+    if (slot < 0) return 0;
+    if (!guards || !guard_count) return 0;
+    for (uint8_t i = 0; i < *guard_count; i++) {
+        if (guards[i] == (uint8_t)slot) return 1;
+    }
+    if (*guard_count >= PS_SPECIALIZATION_GUARD_MAX) return 0;
+    guards[(*guard_count)++] = (uint8_t)slot;
+    return 1;
+}
+
+static int ps_spec_slot_list_contains(PSString **names, size_t count, PSString *name) {
+    if (!name) return 0;
+    for (size_t i = 0; i < count; i++) {
+        if (names[i] && ps_string_equals(names[i], name)) return 1;
+    }
+    return 0;
+}
+
+static int ps_spec_slot_list_push(PSString ***names, size_t *count, size_t *cap, PSString *name) {
+    if (!names || !count || !cap || !name) return 0;
+    if (ps_spec_slot_list_contains(*names, *count, name)) return 1;
+    if (*count == *cap) {
+        size_t new_cap = *cap ? (*cap * 2) : 8;
+        PSString **next = (PSString **)realloc(*names, sizeof(PSString *) * new_cap);
+        if (!next) return 0;
+        *names = next;
+        *cap = new_cap;
+    }
+    (*names)[(*count)++] = name;
+    return 1;
+}
+
+static int ps_spec_slot_list_index(PSString **names, size_t count, PSString *name) {
+    if (!name) return -1;
+    for (size_t i = 0; i < count; i++) {
+        if (names[i] && ps_string_equals(names[i], name)) return (int)i;
+    }
+    return -1;
+}
+
+static int ps_spec_collect_program_slots(PSAstNode *node, PSString ***names, size_t *count, size_t *cap) {
+    if (!node) return 1;
+    switch (node->kind) {
+        case AST_VAR_DECL: {
+            PSString *name = ps_identifier_string(node->as.var_decl.id);
+            return ps_spec_slot_list_push(names, count, cap, name);
+        }
+        case AST_FUNCTION_DECL: {
+            PSString *name = ps_identifier_string(node->as.func_decl.id);
+            return ps_spec_slot_list_push(names, count, cap, name);
+        }
+        case AST_PROGRAM:
+        case AST_BLOCK:
+            for (size_t i = 0; i < node->as.list.count; i++) {
+                if (!ps_spec_collect_program_slots(node->as.list.items[i], names, count, cap)) {
+                    return 0;
+                }
+            }
+            return 1;
+        case AST_IF:
+            return ps_spec_collect_program_slots(node->as.if_stmt.then_branch, names, count, cap) &&
+                   ps_spec_collect_program_slots(node->as.if_stmt.else_branch, names, count, cap);
+        case AST_WHILE:
+            return ps_spec_collect_program_slots(node->as.while_stmt.body, names, count, cap);
+        case AST_DO_WHILE:
+            return ps_spec_collect_program_slots(node->as.do_while.body, names, count, cap);
+        case AST_FOR:
+            return ps_spec_collect_program_slots(node->as.for_stmt.init, names, count, cap) &&
+                   ps_spec_collect_program_slots(node->as.for_stmt.body, names, count, cap);
+        case AST_FOR_IN:
+            if (node->as.for_in.is_var &&
+                node->as.for_in.target &&
+                node->as.for_in.target->kind == AST_IDENTIFIER) {
+                PSString *name = ps_identifier_string(node->as.for_in.target);
+                if (!ps_spec_slot_list_push(names, count, cap, name)) return 0;
+            }
+            return ps_spec_collect_program_slots(node->as.for_in.body, names, count, cap);
+        case AST_FOR_OF:
+            if (node->as.for_of.is_var &&
+                node->as.for_of.target &&
+                node->as.for_of.target->kind == AST_IDENTIFIER) {
+                PSString *name = ps_identifier_string(node->as.for_of.target);
+                if (!ps_spec_slot_list_push(names, count, cap, name)) return 0;
+            }
+            return ps_spec_collect_program_slots(node->as.for_of.body, names, count, cap);
+        case AST_SWITCH:
+            for (size_t i = 0; i < node->as.switch_stmt.case_count; i++) {
+                if (!ps_spec_collect_program_slots(node->as.switch_stmt.cases[i], names, count, cap)) {
+                    return 0;
+                }
+            }
+            return 1;
+        case AST_CASE:
+            for (size_t i = 0; i < node->as.case_stmt.count; i++) {
+                if (!ps_spec_collect_program_slots(node->as.case_stmt.items[i], names, count, cap)) {
+                    return 0;
+                }
+            }
+            return 1;
+        case AST_WITH:
+            return ps_spec_collect_program_slots(node->as.with_stmt.body, names, count, cap);
+        case AST_TRY:
+            return ps_spec_collect_program_slots(node->as.try_stmt.try_block, names, count, cap) &&
+                   ps_spec_collect_program_slots(node->as.try_stmt.catch_block, names, count, cap) &&
+                   ps_spec_collect_program_slots(node->as.try_stmt.finally_block, names, count, cap);
+        case AST_LABEL:
+            return ps_spec_collect_program_slots(node->as.label_stmt.stmt, names, count, cap);
+        default:
+            return 1;
+    }
+}
+
+static PSStmtBC *ps_stmt_bc_build_spec(PSFunction *func, PSStmtBC *bc,
+                                       uint8_t *guard_slots, uint8_t *guard_count) {
+    if (!func || !bc || !guard_slots || !guard_count) return NULL;
+    if (!func->slot_names || func->slot_count == 0) return NULL;
+    if (func->slot_count > PS_SPECIALIZATION_SLOT_MAX) return NULL;
+    if (!ps_spec_ast_safe(func->body)) return NULL;
+
+    size_t old_count = bc->count;
+    size_t *map = (size_t *)malloc(sizeof(size_t) * old_count);
+    if (!map) return NULL;
+    PSSpecBCBuilder out = {0};
+    *guard_count = 0;
+    PSString **spec_names = NULL;
+    size_t spec_count = 0;
+    size_t spec_cap = 0;
+    uint8_t slot_init[PS_SPECIALIZATION_SLOT_MAX] = {0};
+    for (size_t i = 0; i < func->slot_count; i++) {
+        if (!ps_spec_slot_list_push(&spec_names, &spec_count, &spec_cap, func->slot_names[i])) {
+            goto fail;
+        }
+    }
+    if (spec_count > PS_SPECIALIZATION_SLOT_MAX) goto fail;
+
+    for (size_t i = 0; i < old_count; i++) {
+        PSStmtBCInstr *ins = &bc->code[i];
+        map[i] = out.count;
+        switch (ins->op) {
+            case STMT_BC_EXPR_PUSH_CONST: {
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                if (!ps_spec_push(&out, *ins)) goto fail;
+                break;
+            }
+            case STMT_BC_EXPR_LOAD_IDENT: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int local_slot = ps_spec_slot_list_index(func->slot_names, func->slot_count, name);
+                if (local_slot < 0) {
+                    if (!ps_spec_push(&out, *ins)) goto fail;
+                    break;
+                }
+                int slot = ps_spec_slot_list_index(spec_names, spec_count, name);
+                if (slot < 0) goto fail;
+                PSStmtBCInstr load = {0};
+                load.op = STMT_BC_EXPR_LOAD_SLOT_NUM;
+                load.a = slot;
+                if (!ps_spec_push(&out, load)) goto fail;
+                break;
+            }
+            case STMT_BC_EXPR_STORE_IDENT: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int local_slot = ps_spec_slot_list_index(func->slot_names, func->slot_count, name);
+                if (local_slot < 0) goto fail;
+                int slot = ps_spec_slot_list_index(spec_names, spec_count, name);
+                if (slot < 0) goto fail;
+                PSStmtBCInstr store = {0};
+                store.op = STMT_BC_EXPR_STORE_SLOT_NUM;
+                store.a = slot;
+                if (!ps_spec_push(&out, store)) goto fail;
+                if (slot >= 0 && (size_t)slot < PS_SPECIALIZATION_SLOT_MAX) {
+                    slot_init[slot] = 1;
+                }
+                break;
+            }
+            case STMT_BC_EXPR_ADD_INT:
+            case STMT_BC_EXPR_ADD_DOUBLE:
+                goto fail;
+            case STMT_BC_EXPR_ADD_IDENT_CONST: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int local_slot = ps_spec_slot_list_index(func->slot_names, func->slot_count, name);
+                if (local_slot < 0) goto fail;
+                int slot = ps_spec_slot_list_index(spec_names, spec_count, name);
+                if (slot < 0) goto fail;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue v = bc->consts[ins->a];
+                if (v.type != PS_T_NUMBER) goto fail;
+                if (slot >= 0 && (size_t)slot < PS_SPECIALIZATION_SLOT_MAX && !slot_init[slot]) {
+                    if (!ps_spec_guard_add(guard_slots, guard_count, slot)) goto fail;
+                }
+                PSStmtBCInstr add = {0};
+                add.op = STMT_BC_EXPR_ADD_NUM;
+                add.a = slot;
+                add.ptr = (void *)(intptr_t)slot;
+                add.ptr2 = (void *)(intptr_t)ins->a;
+                add.flags = 1;
+                if (!ps_spec_push(&out, add)) goto fail;
+                if (slot >= 0 && (size_t)slot < PS_SPECIALIZATION_SLOT_MAX) {
+                    slot_init[slot] = 1;
+                }
+                break;
+            }
+            case STMT_BC_EXPR_ADD_IDENT_IDENT: {
+                PSString *name_l = ps_identifier_string((PSAstNode *)ins->ptr);
+                PSString *name_r = ps_identifier_string((PSAstNode *)ins->ptr2);
+                int local_l = ps_spec_slot_list_index(func->slot_names, func->slot_count, name_l);
+                int local_r = ps_spec_slot_list_index(func->slot_names, func->slot_count, name_r);
+                if (local_l < 0 || local_r < 0) goto fail;
+                int slot_l = ps_spec_slot_list_index(spec_names, spec_count, name_l);
+                int slot_r = ps_spec_slot_list_index(spec_names, spec_count, name_r);
+                if (slot_l < 0 || slot_r < 0) goto fail;
+                if (slot_l >= 0 && (size_t)slot_l < PS_SPECIALIZATION_SLOT_MAX && !slot_init[slot_l]) {
+                    if (!ps_spec_guard_add(guard_slots, guard_count, slot_l)) goto fail;
+                }
+                if (slot_r >= 0 && (size_t)slot_r < PS_SPECIALIZATION_SLOT_MAX && !slot_init[slot_r]) {
+                    if (!ps_spec_guard_add(guard_slots, guard_count, slot_r)) goto fail;
+                }
+                PSStmtBCInstr add = {0};
+                add.op = STMT_BC_EXPR_ADD_NUM;
+                add.a = slot_l;
+                add.ptr = (void *)(intptr_t)slot_l;
+                add.ptr2 = (void *)(intptr_t)slot_r;
+                add.flags = 0;
+                if (!ps_spec_push(&out, add)) goto fail;
+                if (slot_l >= 0 && (size_t)slot_l < PS_SPECIALIZATION_SLOT_MAX) {
+                    slot_init[slot_l] = 1;
+                }
+                break;
+            }
+            case STMT_BC_JLT_IDENT_CONST: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int local_slot = ps_spec_slot_list_index(func->slot_names, func->slot_count, name);
+                if (local_slot < 0) goto fail;
+                int slot = ps_spec_slot_list_index(spec_names, spec_count, name);
+                if (slot < 0) goto fail;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue v = bc->consts[ins->a];
+                if (v.type != PS_T_NUMBER) goto fail;
+                PSStmtBCInstr load = {0};
+                load.op = STMT_BC_EXPR_LOAD_SLOT_NUM;
+                load.a = slot;
+                if (slot >= 0 && (size_t)slot < PS_SPECIALIZATION_SLOT_MAX && !slot_init[slot]) {
+                    if (!ps_spec_guard_add(guard_slots, guard_count, slot)) goto fail;
+                }
+                if (!ps_spec_push(&out, load)) goto fail;
+                if (!ps_spec_push(&out, (PSStmtBCInstr){ .op = STMT_BC_EXPR_PUSH_CONST, .a = ins->a })) goto fail;
+                if (!ps_spec_push(&out, (PSStmtBCInstr){ .op = STMT_BC_EXPR_BINARY_NUM, .a = TOK_LT })) goto fail;
+                if (!ps_spec_push(&out, (PSStmtBCInstr){ .op = STMT_BC_JUMP_IF_FALSE, .a = (int32_t)(intptr_t)ins->ptr2 })) goto fail;
+                break;
+            }
+            case STMT_BC_JUMP_ADD_IDENT_CONST: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int local_slot = ps_spec_slot_list_index(func->slot_names, func->slot_count, name);
+                if (local_slot < 0) goto fail;
+                int slot = ps_spec_slot_list_index(spec_names, spec_count, name);
+                if (slot < 0) goto fail;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue v = bc->consts[ins->a];
+                if (v.type != PS_T_NUMBER) goto fail;
+                if (slot >= 0 && (size_t)slot < PS_SPECIALIZATION_SLOT_MAX && !slot_init[slot]) {
+                    if (!ps_spec_guard_add(guard_slots, guard_count, slot)) goto fail;
+                }
+                PSStmtBCInstr add = {0};
+                add.op = STMT_BC_EXPR_ADD_NUM;
+                add.a = slot;
+                add.ptr = (void *)(intptr_t)slot;
+                add.ptr2 = (void *)(intptr_t)ins->a;
+                add.flags = 1;
+                if (!ps_spec_push(&out, add)) goto fail;
+                if (slot >= 0 && (size_t)slot < PS_SPECIALIZATION_SLOT_MAX) {
+                    slot_init[slot] = 1;
+                }
+                if (!ps_spec_push(&out, (PSStmtBCInstr){ .op = STMT_BC_JUMP, .a = (int32_t)(intptr_t)ins->ptr2 })) goto fail;
+                break;
+            }
+            case STMT_BC_EXPR_BINARY_NUM:
+                if (ins->a != TOK_LT) goto fail;
+                if (!ps_spec_push(&out, *ins)) goto fail;
+                break;
+            case STMT_BC_EXPR_CALL_IDENT:
+            case STMT_BC_EXPR_CALL_MEMBER:
+                if (!ps_spec_push(&out, *ins)) goto fail;
+                break;
+            case STMT_BC_EXPR_POP:
+            case STMT_BC_JUMP:
+            case STMT_BC_JUMP_IF_FALSE:
+            case STMT_BC_JUMP_IF_TRUE:
+            case STMT_BC_RETURN_VALUE:
+            case STMT_BC_RETURN_VOID:
+                if (!ps_spec_push(&out, *ins)) goto fail;
+                break;
+            default:
+                goto fail;
+        }
+    }
+
+    for (size_t j = 0; j < out.count; j++) {
+        PSStmtBCInstr *ins = &out.code[j];
+        if (ins->op == STMT_BC_JUMP ||
+            ins->op == STMT_BC_JUMP_IF_FALSE ||
+            ins->op == STMT_BC_JUMP_IF_TRUE) {
+            if (ins->a >= 0 && (size_t)ins->a < old_count) {
+                ins->a = (int32_t)map[ins->a];
+            } else {
+                goto fail;
+            }
+        }
+    }
+
+    PSStmtBC *spec = (PSStmtBC *)calloc(1, sizeof(PSStmtBC));
+    if (!spec) goto fail;
+    spec->code = out.code;
+    spec->count = out.count;
+    spec->const_count = bc->const_count;
+    if (bc->const_count > 0) {
+        spec->consts = (PSValue *)malloc(sizeof(PSValue) * bc->const_count);
+        if (!spec->consts) {
+            free(spec);
+            goto fail;
+        }
+        memcpy(spec->consts, bc->consts, sizeof(PSValue) * bc->const_count);
+    } else {
+        spec->consts = NULL;
+    }
+    func->spec_slot_names = spec_names;
+    func->spec_slot_count = spec_count;
+    free(map);
+    return spec;
+
+fail:
+    free(map);
+    free(out.code);
+    free(spec_names);
+    return NULL;
+}
+#endif
+
+#if !PS_DISABLE_UNBOXED_SPEC
+ #if PS_ENABLE_PERF
+static int ps_unboxed_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("PS_UNBOXED_TRACE");
+        enabled = (env && *env) ? 1 : 0;
+    }
+    return enabled;
+}
+
+static int ps_unboxed_dump_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("PS_UNBOXED_DUMP");
+        enabled = (env && *env) ? 1 : 0;
+    }
+    return enabled;
+}
+
+static void ps_unboxed_trace_log_once(const char *msg, int *printed) {
+    if (!msg || !printed) return;
+    if (!ps_unboxed_trace_enabled()) return;
+    if (*printed) return;
+    printf("[unboxed] %s\n", msg);
+    fflush(stdout);
+    *printed = 1;
+}
+
+static int ps_unboxed_trace_exec_printed = 0;
+static int ps_unboxed_trace_fail_printed = 0;
+ #endif
+
+typedef struct {
+    PSStmtBCInstr *code;
+    size_t count;
+    size_t cap;
+} PSUnboxedBCBuilder;
+
+static int __attribute__((unused)) ps_unboxed_push(PSUnboxedBCBuilder *b, PSStmtBCInstr ins) {
+    if (!b) return 0;
+    if (b->count == b->cap) {
+        size_t new_cap = b->cap ? b->cap * 2 : 64;
+        PSStmtBCInstr *next = (PSStmtBCInstr *)realloc(b->code, new_cap * sizeof(PSStmtBCInstr));
+        if (!next) return 0;
+        b->code = next;
+        b->cap = new_cap;
+    }
+    b->code[b->count++] = ins;
+    return 1;
+}
+
+static int __attribute__((unused)) ps_unboxed_slot_index(PSString **names, size_t count, PSString *name) {
+    if (!name) return -1;
+    for (size_t i = 0; i < count; i++) {
+        if (names[i] && ps_string_equals(names[i], name)) return (int)i;
+    }
+    return -1;
+}
+
+static int __attribute__((unused)) ps_unboxed_mark_used(uint8_t *used,
+                                                        uint8_t *list,
+                                                        uint8_t *count,
+                                                        int slot) {
+    if (slot < 0 || slot >= PS_SPECIALIZATION_SLOT_MAX) return 0;
+    if (used[slot]) return 1;
+    if (*count >= PS_SPECIALIZATION_GUARD_MAX) return 0;
+    used[slot] = 1;
+    list[(*count)++] = (uint8_t)slot;
+    return 1;
+}
+
+static void __attribute__((unused)) ps_unboxed_write_mark(uint32_t *bits, int slot) {
+    if (slot < 0 || slot >= PS_SPECIALIZATION_SLOT_MAX) return;
+    size_t idx = (size_t)slot / 32;
+    uint32_t mask = 1u << (slot & 31);
+    bits[idx] |= mask;
+}
+
+static PSStmtBC *__attribute__((unused)) ps_stmt_bc_build_unboxed_spec(PSFunction *func, PSStmtBC *bc) {
+    if (!func || !bc) return NULL;
+    if (!func->slot_names || func->slot_count == 0) return NULL;
+    if (func->slot_count > PS_SPECIALIZATION_SLOT_MAX) return NULL;
+
+    size_t old_count = bc->count;
+    size_t *map = (size_t *)malloc(sizeof(size_t) * old_count);
+    if (!map) return NULL;
+    PSUnboxedBCBuilder out = {0};
+    uint8_t used[PS_SPECIALIZATION_SLOT_MAX];
+    uint8_t written[PS_SPECIALIZATION_SLOT_MAX];
+    uint8_t used_list[PS_SPECIALIZATION_GUARD_MAX];
+    uint8_t used_count = 0;
+    uint32_t write_bits[(PS_SPECIALIZATION_SLOT_MAX + 31) / 32];
+    for (size_t i = 0; i < PS_SPECIALIZATION_SLOT_MAX; i++) {
+        used[i] = 0;
+        written[i] = 0;
+    }
+    for (size_t i = 0; i < PS_SPECIALIZATION_GUARD_MAX; i++) used_list[i] = 0;
+    for (size_t i = 0; i < (PS_SPECIALIZATION_SLOT_MAX + 31) / 32; i++) write_bits[i] = 0;
+    int last_unboxed_no_stack = 0;
+    int last_stack_numeric = 0;
+
+    for (size_t i = 0; i < old_count; i++) {
+        PSStmtBCInstr *ins = &bc->code[i];
+        map[i] = out.count;
+        switch (ins->op) {
+            case STMT_BC_EXPR_PUSH_CONST:
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                last_stack_numeric = (bc->consts[ins->a].type == PS_T_NUMBER);
+                if (!ps_unboxed_push(&out, *ins)) goto fail;
+                last_unboxed_no_stack = 0;
+                break;
+            case STMT_BC_EXPR_POP:
+            case STMT_BC_EXPR_CALL_IDENT:
+            case STMT_BC_EXPR_CALL_MEMBER:
+            case STMT_BC_RETURN_VALUE:
+            case STMT_BC_RETURN_VOID:
+            case STMT_BC_JUMP:
+            case STMT_BC_JUMP_IF_FALSE:
+            case STMT_BC_JUMP_IF_TRUE:
+                if (ins->op == STMT_BC_EXPR_POP && last_unboxed_no_stack) {
+                    last_unboxed_no_stack = 0;
+                    break;
+                }
+                if (!ps_unboxed_push(&out, *ins)) goto fail;
+                last_unboxed_no_stack = 0;
+                last_stack_numeric = 0;
+                break;
+            case STMT_BC_EXPR_LOAD_IDENT: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int slot = ps_unboxed_slot_index(func->slot_names, func->slot_count, name);
+                if (slot < 0) {
+                    if (!ps_unboxed_push(&out, *ins)) goto fail;
+                    last_unboxed_no_stack = 0;
+                    last_stack_numeric = 0;
+                    break;
+                }
+                if (!written[slot]) {
+                    if (!ps_unboxed_mark_used(used, used_list, &used_count, slot)) goto fail;
+                }
+                PSStmtBCInstr load = {0};
+                load.op = STMT_BC_UNBOX_LOAD_SLOT_D;
+                load.a = slot;
+                if (!ps_unboxed_push(&out, load)) goto fail;
+                last_unboxed_no_stack = 0;
+                last_stack_numeric = 1;
+                break;
+            }
+            case STMT_BC_EXPR_STORE_IDENT: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int slot = ps_unboxed_slot_index(func->slot_names, func->slot_count, name);
+                if (slot < 0) goto fail;
+                if (!last_stack_numeric) goto fail;
+                if (!written[slot]) {
+                    if (!ps_unboxed_mark_used(used, used_list, &used_count, slot)) goto fail;
+                }
+                PSStmtBCInstr store = {0};
+                store.op = STMT_BC_UNBOX_STORE_SLOT_D;
+                store.a = slot;
+                if (!ps_unboxed_push(&out, store)) goto fail;
+                ps_unboxed_write_mark(write_bits, slot);
+                written[slot] = 1;
+                last_unboxed_no_stack = 0;
+                last_stack_numeric = 0;
+                break;
+            }
+            case STMT_BC_EXPR_ADD_IDENT_CONST: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int slot = ps_unboxed_slot_index(func->slot_names, func->slot_count, name);
+                if (slot < 0) goto fail;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue v = bc->consts[ins->a];
+                if (v.type != PS_T_NUMBER) goto fail;
+                if (!written[slot]) {
+                    if (!ps_unboxed_mark_used(used, used_list, &used_count, slot)) goto fail;
+                }
+                PSStmtBCInstr add = {0};
+                add.op = STMT_BC_UNBOX_ADD_SLOT_D_CONST;
+                add.a = slot;
+                add.ptr = (void *)(intptr_t)slot;
+                add.ptr2 = (void *)(intptr_t)ins->a;
+                if (!ps_unboxed_push(&out, add)) goto fail;
+                ps_unboxed_write_mark(write_bits, slot);
+                written[slot] = 1;
+                last_unboxed_no_stack = 1;
+                last_stack_numeric = 0;
+                break;
+            }
+            case STMT_BC_EXPR_ADD_IDENT_IDENT: {
+                PSString *name_l = ps_identifier_string((PSAstNode *)ins->ptr);
+                PSString *name_r = ps_identifier_string((PSAstNode *)ins->ptr2);
+                int slot_l = ps_unboxed_slot_index(func->slot_names, func->slot_count, name_l);
+                int slot_r = ps_unboxed_slot_index(func->slot_names, func->slot_count, name_r);
+                if (slot_l < 0 || slot_r < 0) goto fail;
+                if (!written[slot_l]) {
+                    if (!ps_unboxed_mark_used(used, used_list, &used_count, slot_l)) goto fail;
+                }
+                if (!written[slot_r]) {
+                    if (!ps_unboxed_mark_used(used, used_list, &used_count, slot_r)) goto fail;
+                }
+                PSStmtBCInstr add = {0};
+                add.op = STMT_BC_UNBOX_ADD_SLOT_D_SLOT_D;
+                add.a = slot_l;
+                add.ptr = (void *)(intptr_t)slot_l;
+                add.ptr2 = (void *)(intptr_t)slot_r;
+                if (!ps_unboxed_push(&out, add)) goto fail;
+                ps_unboxed_write_mark(write_bits, slot_l);
+                written[slot_l] = 1;
+                last_unboxed_no_stack = 1;
+                last_stack_numeric = 0;
+                break;
+            }
+            case STMT_BC_JLT_IDENT_CONST: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int slot = ps_unboxed_slot_index(func->slot_names, func->slot_count, name);
+                if (slot < 0) goto fail;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue v = bc->consts[ins->a];
+                if (v.type != PS_T_NUMBER) goto fail;
+                if (!written[slot]) {
+                    if (!ps_unboxed_mark_used(used, used_list, &used_count, slot)) goto fail;
+                }
+                PSStmtBCInstr jlt = {0};
+                jlt.op = STMT_BC_UNBOX_JLT_SLOT_D_CONST;
+                jlt.a = ins->a;
+                jlt.ptr = (void *)(intptr_t)slot;
+                jlt.ptr2 = ins->ptr2;
+                if (!ps_unboxed_push(&out, jlt)) goto fail;
+                last_unboxed_no_stack = 1;
+                last_stack_numeric = 0;
+                break;
+            }
+            case STMT_BC_JBITAND_EQZ_IDENT_CONST: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int slot = ps_unboxed_slot_index(func->slot_names, func->slot_count, name);
+                if (slot < 0) goto fail;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue v = bc->consts[ins->a];
+                if (v.type != PS_T_NUMBER) goto fail;
+                if (!written[slot]) {
+                    if (!ps_unboxed_mark_used(used, used_list, &used_count, slot)) goto fail;
+                }
+                PSStmtBCInstr jbt = {0};
+                jbt.op = STMT_BC_UNBOX_JBITAND_EQZ_SLOT_D_CONST;
+                jbt.a = ins->a;
+                jbt.ptr = (void *)(intptr_t)slot;
+                jbt.ptr2 = ins->ptr2;
+                if (!ps_unboxed_push(&out, jbt)) goto fail;
+                last_unboxed_no_stack = 1;
+                last_stack_numeric = 0;
+                break;
+            }
+            case STMT_BC_JUMP_ADD_IDENT_CONST: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int slot = ps_unboxed_slot_index(func->slot_names, func->slot_count, name);
+                if (slot < 0) goto fail;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue v = bc->consts[ins->a];
+                if (v.type != PS_T_NUMBER) goto fail;
+                if (!written[slot]) {
+                    if (!ps_unboxed_mark_used(used, used_list, &used_count, slot)) goto fail;
+                }
+                PSStmtBCInstr add = {0};
+                add.op = STMT_BC_UNBOX_JUMP_ADD_SLOT_D_CONST;
+                add.a = ins->a;
+                add.ptr = (void *)(intptr_t)slot;
+                add.ptr2 = ins->ptr2;
+                if (!ps_unboxed_push(&out, add)) goto fail;
+                ps_unboxed_write_mark(write_bits, slot);
+                written[slot] = 1;
+                last_unboxed_no_stack = 1;
+                last_stack_numeric = 0;
+                break;
+            }
+            default:
+                goto fail;
+        }
+    }
+
+    for (size_t j = 0; j < out.count; j++) {
+        PSStmtBCInstr *ins = &out.code[j];
+        if (ins->op == STMT_BC_JUMP ||
+            ins->op == STMT_BC_JUMP_IF_FALSE ||
+            ins->op == STMT_BC_JUMP_IF_TRUE) {
+            if (ins->a >= 0 && (size_t)ins->a < old_count) {
+                ins->a = (int32_t)map[ins->a];
+            } else {
+                goto fail;
+            }
+        }
+        if (ins->op == STMT_BC_UNBOX_JLT_SLOT_D_CONST ||
+            ins->op == STMT_BC_UNBOX_JBITAND_EQZ_SLOT_D_CONST ||
+            ins->op == STMT_BC_UNBOX_JUMP_ADD_SLOT_D_CONST) {
+            int target = (int)(intptr_t)ins->ptr2;
+            if (target >= 0 && (size_t)target < old_count) {
+                ins->ptr2 = (void *)(intptr_t)map[target];
+            } else {
+                goto fail;
+            }
+        }
+    }
+
+    PSStmtBC *spec = (PSStmtBC *)calloc(1, sizeof(PSStmtBC));
+    if (!spec) goto fail;
+    spec->code = out.code;
+    spec->count = out.count;
+    spec->const_count = bc->const_count;
+    if (bc->const_count > 0) {
+        spec->consts = (PSValue *)malloc(sizeof(PSValue) * bc->const_count);
+        if (!spec->consts) {
+            free(spec);
+            goto fail;
+        }
+        memcpy(spec->consts, bc->consts, sizeof(PSValue) * bc->const_count);
+    } else {
+        spec->consts = NULL;
+    }
+    func->unboxed_used_count = used_count;
+    func->unboxed_guard_count = used_count;
+    for (size_t i = 0; i < PS_SPECIALIZATION_GUARD_MAX; i++) {
+        func->unboxed_guard_slots[i] = (i < used_count) ? used_list[i] : 0;
+        func->unboxed_used_slots[i] = (i < used_count) ? used_list[i] : 0;
+    }
+    for (size_t i = 0; i < (PS_SPECIALIZATION_SLOT_MAX + 31) / 32; i++) {
+        func->unboxed_write_bits[i] = write_bits[i];
+    }
+    free(map);
+    return spec;
+
+fail:
+    free(map);
+    free(out.code);
+    return NULL;
+}
+
+static void __attribute__((unused)) ps_unboxed_writeback(PSEnv *env, PSFunction *func, double *unboxed_d) {
+    if (!env || !func || !unboxed_d) return;
+    for (size_t i = 0; i < (PS_SPECIALIZATION_SLOT_MAX + 31) / 32; i++) {
+        uint32_t bits = func->unboxed_write_bits[i];
+        if (!bits) continue;
+        for (size_t b = 0; b < 32; b++) {
+            if ((bits & (1u << b)) == 0) continue;
+            int slot = (int)(i * 32 + b);
+            if (slot < 0 || slot >= (int)func->slot_count) continue;
+            PSString *name = func->slot_names[slot];
+            if (!name) continue;
+            PSValue v = ps_value_number(unboxed_d[slot]);
+            ps_env_set(env, name, v);
+        }
+    }
+}
+#endif
+
+/* --- Core execution engine (production path) -------------------------- */
+static PSValue ps_stmt_bc_execute(PSVM *vm, PSEnv *env, PSFunction *func, PSStmtBC *bc, PSEvalControl *ctl) {
+    (void)func;
+    if (!bc || !bc->code || bc->count == 0) return ps_value_undefined();
+    PSValue stack_buf[64];
+    PSValue *stack = stack_buf;
+    size_t sp = 0;
+    if (bc->count > 64) {
+        stack = (PSValue *)calloc(bc->count, sizeof(PSValue));
+        if (!stack) return ps_value_undefined();
+    }
+    PSEnv *env_stack_buf[8];
+    PSEnv **env_stack = env_stack_buf;
+    size_t env_sp = 0;
+    size_t env_cap = 8;
+    PSTryHandler handler_stack_buf[8];
+    PSTryHandler *handler_stack = handler_stack_buf;
+    size_t handler_sp = 0;
+    size_t handler_cap = 8;
+    int pending_throw = 0;
+    PSValue pending_throw_value = ps_value_undefined();
+#if !PS_DISABLE_UNBOXED_SPEC
+    double unboxed_d[PS_SPECIALIZATION_SLOT_MAX];
+    PSValue unboxed_slot_values[PS_SPECIALIZATION_SLOT_MAX];
+    int unboxed_mode = 0;
+#endif
+#if !PS_DISABLE_UNBOXED_SPEC
+    if (func) {
+        func->unboxed_hot_count++;
+        if (func->unboxed_bc_state == 0 &&
+            func->unboxed_hot_count >= PS_HOT_THRESHOLD) {
+            PSStmtBC *spec = ps_stmt_bc_build_unboxed_spec(func, func->stmt_bc);
+            if (spec) {
+                func->unboxed_bc = spec;
+                func->unboxed_bc_state = 1;
+#if PS_ENABLE_PERF
+                if (ps_unboxed_dump_enabled()) {
+                    ps_stmt_bc_dump(spec, "UNBOXED_SPEC");
+                }
+#endif
+            } else {
+                func->unboxed_bc_state = 2;
+            }
+        }
+#if PS_ENABLE_PERF
+        if (func->unboxed_bc_state == 2) {
+            ps_unboxed_trace_log_once("build failed", &ps_unboxed_trace_fail_printed);
+        }
+#endif
+        if (func->unboxed_bc_state == 1 && func->unboxed_bc &&
+            func->slot_count > 0 &&
+            func->slot_count <= PS_SPECIALIZATION_SLOT_MAX) {
+            int guard_ok = 1;
+            for (uint8_t i = 0; i < func->unboxed_guard_count; i++) {
+                uint8_t slot = func->unboxed_guard_slots[i];
+                if (slot >= func->slot_count) {
+                    guard_ok = 0;
+                    break;
+                }
+                PSString *name = func->slot_names[slot];
+                int found = 0;
+                PSValue v = name ? ps_env_get(env, name, &found) : ps_value_undefined();
+                unboxed_slot_values[slot] = v;
+                if (v.type != PS_T_NUMBER) {
+                    guard_ok = 0;
+                    break;
+                }
+            }
+            if (guard_ok) {
+                for (uint8_t i = 0; i < func->unboxed_used_count; i++) {
+                    uint8_t slot = func->unboxed_used_slots[i];
+                    if (slot >= func->slot_count) continue;
+                    unboxed_d[slot] = unboxed_slot_values[slot].as.number;
+                }
+                unboxed_mode = 1;
+                bc = func->unboxed_bc;
+#if PS_ENABLE_PERF
+                ps_unboxed_trace_log_once("executed", &ps_unboxed_trace_exec_printed);
+#endif
+            }
+        }
+    }
+#endif
+#if !PS_DISABLE_SPECIALIZATION
+    PSValue slot_buf[PS_SPECIALIZATION_SLOT_MAX];
+    PSValue *slot_values = NULL;
+    size_t slot_count = 0;
+    int use_spec = 0;
+    if (func
+#if !PS_DISABLE_UNBOXED_SPEC
+        && !unboxed_mode
+#endif
+        ) {
+        func->spec_hot_count++;
+        if (func->spec_bc_state == 0 &&
+            func->spec_hot_count >= PS_HOT_THRESHOLD) {
+            PSStmtBC *spec = ps_stmt_bc_build_spec(func, func->stmt_bc,
+                                                  func->spec_guard_slots,
+                                                  &func->spec_guard_count);
+            if (spec) {
+                func->spec_bc = spec;
+                func->spec_bc_state = 1;
+            } else {
+                func->spec_bc_state = 2;
+            }
+        }
+#if PS_ENABLE_PERF
+        if (func->spec_bc_state == 2) {
+            ps_spec_trace_log_once("build failed", &ps_spec_trace_fail_printed);
+        }
+#endif
+        if (func->spec_bc_state == 1 && func->spec_bc &&
+            func->slot_count > 0 &&
+            func->slot_count <= PS_SPECIALIZATION_SLOT_MAX) {
+            PSString **slot_names = func->spec_slot_names ? func->spec_slot_names : func->slot_names;
+            size_t load_count = func->spec_slot_names ? func->spec_slot_count : func->slot_count;
+            if (slot_names && load_count > 0 && load_count <= PS_SPECIALIZATION_SLOT_MAX) {
+                slot_values = slot_buf;
+                slot_count = load_count;
+                for (size_t i = 0; i < slot_count; i++) {
+                    int found = 0;
+                    PSString *name = slot_names[i];
+                    slot_values[i] = name ? ps_env_get(env, name, &found) : ps_value_undefined();
+                }
+                use_spec = 1;
+                for (uint8_t i = 0; i < func->spec_guard_count; i++) {
+                    uint8_t slot = func->spec_guard_slots[i];
+                    if (slot >= slot_count || slot_values[slot].type != PS_T_NUMBER) {
+                        use_spec = 0;
+                        break;
+                    }
+                }
+                if (use_spec) {
+#if PS_ENABLE_PERF
+                    ps_spec_trace_log_once("executed", &ps_spec_trace_exec_printed);
+#endif
+                    bc = func->spec_bc;
+                }
+            }
+        }
+    }
+#endif
+    size_t ip = 0;
+#if !PS_DISABLE_UNBOXED_SPEC
+#define UNBOXED_WRITEBACK() do { \
+        if (unboxed_mode && func && env) { \
+            ps_unboxed_writeback(env, func, unboxed_d); \
+        } \
+    } while (0)
+#else
+#define UNBOXED_WRITEBACK() do { } while (0)
+#endif
+#define UNWIND_ENVS() do { \
+        while (env_sp > 0) { \
+            PSEnv *prev = env_stack[--env_sp]; \
+            if (env) ps_env_free(env); \
+            env = prev; \
+        } \
+        if (env_stack != env_stack_buf) { \
+            free(env_stack); \
+            env_stack = env_stack_buf; \
+        } \
+    } while (0)
+#define FREE_HANDLER_STACK() do { \
+        if (handler_stack != handler_stack_buf) { \
+            free(handler_stack); \
+            handler_stack = handler_stack_buf; \
+        } \
+    } while (0)
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(PS_DISABLE_THREADED_DISPATCH)
+    static void *dispatch[] = {
+        &&op_bad,
+        &&op_push_const,
+        &&op_load_ident,
+        &&op_load_this,
+        &&op_unary_num,
+        &&op_binary_num,
+        &&op_add_int,
+        &&op_add_double,
+        &&op_add_ident_const,
+        &&op_add_ident_ident,
+        &&op_sub_int,
+        &&op_sub_double,
+        &&op_mul_int,
+        &&op_mul_double,
+        &&op_div_double,
+        &&op_new_object,
+        &&op_obj_put_const,
+        &&op_get_member,
+        &&op_call_ident,
+        &&op_call_member,
+        &&op_new,
+        &&op_store_ident,
+        &&op_store_member,
+        &&op_not,
+        &&op_bit_not,
+        &&op_delete,
+        &&op_typeof,
+        &&op_eval_ast,
+        &&op_dup,
+        &&op_pop,
+        &&op_eval_stmt,
+        &&op_for_in_init,
+        &&op_for_in_next,
+        &&op_for_in_assign,
+        &&op_with_enter,
+        &&op_with_exit,
+        &&op_try_push,
+        &&op_try_pop,
+        &&op_catch_enter,
+        &&op_catch_exit,
+        &&op_throw,
+        &&op_finally_exit,
+        &&op_jump,
+        &&op_jump_if_false,
+        &&op_jump_if_true,
+#if !PS_DISABLE_CF_FUSIONS
+        &&op_jlt_ident_const,
+        &&op_jbitand_eqz_ident_const,
+        &&op_jump_add_ident_const,
+#else
+        &&op_bad,
+        &&op_bad,
+        &&op_bad,
+#endif
+        &&op_return_value,
+        &&op_return_void,
+#if !PS_DISABLE_SPECIALIZATION
+        &&op_load_slot_num,
+        &&op_store_slot_num,
+        &&op_add_num
+#else
+        &&op_bad,
+        &&op_bad,
+        &&op_bad
+#endif
+#if !PS_DISABLE_UNBOXED_SPEC
+        ,
+        &&op_unbox_load_slot_d,
+        &&op_unbox_store_slot_d,
+        &&op_unbox_add_slot_d_slot_d,
+        &&op_unbox_add_slot_d_const,
+        &&op_unbox_jlt_slot_d_const,
+        &&op_unbox_jbitand_eqz_slot_d_const,
+        &&op_unbox_jump_add_slot_d_const
+#else
+        ,
+        &&op_bad,
+        &&op_bad,
+        &&op_bad,
+        &&op_bad,
+        &&op_bad,
+        &&op_bad,
+        &&op_bad
+#endif
+    };
+    PSStmtBCInstr *ins = NULL;
+    #define DISPATCH() do { \
+        if (ip >= bc->count) goto fail; \
+        ins = &bc->code[ip]; \
+        if (ins->op >= (int)(sizeof(dispatch) / sizeof(dispatch[0]))) goto fail; \
+        goto *dispatch[ins->op]; \
+    } while (0)
+    DISPATCH();
+    while (1) {
+        op_bad:
+            goto fail;
+        op_push_const:
+            if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+            stack[sp++] = bc->consts[ins->a];
+            ip++;
+            DISPATCH();
+        op_load_ident: {
+            PSAstNode *id = (PSAstNode *)ins->ptr;
+            int found = 0;
+            PSValue v = ps_value_undefined();
+            if (!ps_identifier_cached_get(env, id, &v, &found)) {
+                PSString *name = ps_identifier_string(id);
+                v = ps_env_get(env, name, &found);
+            }
+            if (!found) {
+                ctl->did_throw = 1;
+                const char *prefix = "Identifier not defined: ";
+                PSString *name = ps_identifier_string(id);
+                size_t prefix_len = strlen(prefix);
+                size_t name_len = name ? name->byte_len : 0;
+                char *msg = NULL;
+                if (name && name->utf8 && name_len > 0) {
+                    msg = (char *)malloc(prefix_len + name_len + 1);
+                }
+                if (msg) {
+                    memcpy(msg, prefix, prefix_len);
+                    memcpy(msg + prefix_len, name->utf8, name_len);
+                    msg[prefix_len + name_len] = '\0';
+                    ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", msg);
+                    free(msg);
+                } else {
+                    ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", "Identifier not defined");
+                }
+                goto fail;
+            }
+            stack[sp++] = v;
+            ip++;
+            DISPATCH();
+        }
+        op_load_this: {
+            PSString *name = ps_string_from_cstr("this");
+            int found = 0;
+            PSValue v = ps_env_get(env, name, &found);
+            if (found) {
+                stack[sp++] = v;
+            } else if (vm && vm->global) {
+                stack[sp++] = ps_value_object(vm->global);
+            } else {
+                stack[sp++] = ps_value_undefined();
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_unary_num: {
+            if (sp == 0) goto fail;
+            PSValue v = stack[sp - 1];
+            if (v.type != PS_T_NUMBER) goto fail;
+            if (ins->a == TOK_MINUS) {
+                v.as.number = -v.as.number;
+            }
+            stack[sp - 1] = v;
+            ip++;
+            DISPATCH();
+        }
+        op_binary_num: {
+            if (sp < 2) goto fail;
+            PSValue right = stack[--sp];
+            PSValue left = stack[--sp];
+            PSValue out = ps_eval_binary_values(vm, ins->a, left, right, ctl);
+            if (ctl->did_throw) goto handle_throw;
+            stack[sp++] = out;
+            ip++;
+            DISPATCH();
+        }
+        op_add_int: {
+            if (sp < 2) goto fail;
+            PSValue right = stack[--sp];
+            PSValue left = stack[--sp];
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                int32_t li = 0;
+                int32_t ri = 0;
+                if (ps_number_to_int32_strict(left.as.number, &li) &&
+                    ps_number_to_int32_strict(right.as.number, &ri)) {
+                    int64_t sum = (int64_t)li + (int64_t)ri;
+                    if (sum >= INT32_MIN && sum <= INT32_MAX) {
+                        stack[sp++] = ps_value_number((double)sum);
+                    } else {
+                        stack[sp++] = ps_value_number(left.as.number + right.as.number);
+                    }
+                } else {
+                    stack[sp++] = ps_value_number(left.as.number + right.as.number);
+                }
+            } else {
+                PSValue out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = out;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_add_double: {
+            if (sp < 2) goto fail;
+            PSValue right = stack[--sp];
+            PSValue left = stack[--sp];
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                stack[sp++] = ps_value_number(left.as.number + right.as.number);
+            } else {
+                PSValue out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = out;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_add_ident_const: {
+            PSAstNode *id = (PSAstNode *)ins->ptr;
+            if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+            PSValue left = ps_value_undefined();
+            if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+            PSValue right = bc->consts[ins->a];
+            PSValue out = ps_value_undefined();
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                out = ps_value_number(left.as.number + right.as.number);
+            } else {
+                out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+            }
+            if (!ps_identifier_cached_set(env, id, out)) {
+                PSString *name = ps_identifier_string(id);
+                if (name) ps_env_set(env, name, out);
+            }
+            stack[sp++] = out;
+            ip++;
+            DISPATCH();
+        }
+        op_add_ident_ident: {
+            PSAstNode *id = (PSAstNode *)ins->ptr;
+            PSAstNode *rhs_id = (PSAstNode *)ins->ptr2;
+            PSValue left = ps_value_undefined();
+            PSValue right = ps_value_undefined();
+            if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+            if (!ps_stmt_bc_get_ident_value(vm, env, rhs_id, &right, ctl)) goto fail;
+            PSValue out = ps_value_undefined();
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                out = ps_value_number(left.as.number + right.as.number);
+            } else {
+                out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+            }
+            if (!ps_identifier_cached_set(env, id, out)) {
+                PSString *name = ps_identifier_string(id);
+                if (name) ps_env_set(env, name, out);
+            }
+            stack[sp++] = out;
+            ip++;
+            DISPATCH();
+        }
+        op_sub_int: {
+            if (sp < 2) goto fail;
+            PSValue right = stack[--sp];
+            PSValue left = stack[--sp];
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                int32_t li = 0;
+                int32_t ri = 0;
+                if (ps_number_to_int32_strict(left.as.number, &li) &&
+                    ps_number_to_int32_strict(right.as.number, &ri)) {
+                    int64_t diff = (int64_t)li - (int64_t)ri;
+                    if (diff >= INT32_MIN && diff <= INT32_MAX) {
+                        stack[sp++] = ps_value_number((double)diff);
+                    } else {
+                        stack[sp++] = ps_value_number(left.as.number - right.as.number);
+                    }
+                } else {
+                    stack[sp++] = ps_value_number(left.as.number - right.as.number);
+                }
+            } else {
+                PSValue out = ps_stmt_bc_binary_slow(vm, TOK_MINUS, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = out;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_sub_double: {
+            if (sp < 2) goto fail;
+            PSValue right = stack[--sp];
+            PSValue left = stack[--sp];
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                stack[sp++] = ps_value_number(left.as.number - right.as.number);
+            } else {
+                PSValue out = ps_stmt_bc_binary_slow(vm, TOK_MINUS, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = out;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_mul_int: {
+            if (sp < 2) goto fail;
+            PSValue right = stack[--sp];
+            PSValue left = stack[--sp];
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                int32_t li = 0;
+                int32_t ri = 0;
+                if (ps_number_to_int32_strict(left.as.number, &li) &&
+                    ps_number_to_int32_strict(right.as.number, &ri)) {
+                    int64_t prod = (int64_t)li * (int64_t)ri;
+                    if (prod >= INT32_MIN && prod <= INT32_MAX) {
+                        stack[sp++] = ps_value_number((double)prod);
+                    } else {
+                        stack[sp++] = ps_value_number(left.as.number * right.as.number);
+                    }
+                } else {
+                    stack[sp++] = ps_value_number(left.as.number * right.as.number);
+                }
+            } else {
+                PSValue out = ps_stmt_bc_binary_slow(vm, TOK_STAR, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = out;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_mul_double: {
+            if (sp < 2) goto fail;
+            PSValue right = stack[--sp];
+            PSValue left = stack[--sp];
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                stack[sp++] = ps_value_number(left.as.number * right.as.number);
+            } else {
+                PSValue out = ps_stmt_bc_binary_slow(vm, TOK_STAR, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = out;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_div_double: {
+            if (sp < 2) goto fail;
+            PSValue right = stack[--sp];
+            PSValue left = stack[--sp];
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                stack[sp++] = ps_value_number(left.as.number / right.as.number);
+            } else {
+                PSValue out = ps_stmt_bc_binary_slow(vm, TOK_SLASH, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = out;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_new_object: {
+            PSObject *obj = ps_object_new(vm ? vm->object_proto : NULL);
+            if (!obj) goto fail;
+            stack[sp++] = ps_value_object(obj);
+            ip++;
+            DISPATCH();
+        }
+        op_obj_put_const: {
+            if (sp < 2) goto fail;
+            if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+            PSValue key_val = bc->consts[ins->a];
+            if (key_val.type != PS_T_STRING) goto fail;
+            PSValue val = stack[--sp];
+            PSValue obj_val = stack[--sp];
+            if (obj_val.type != PS_T_OBJECT || !obj_val.as.object) goto fail;
+            ps_object_define(obj_val.as.object, key_val.as.string, val, PS_ATTR_NONE);
+            stack[sp++] = obj_val;
+            ip++;
+            DISPATCH();
+        }
+        op_get_member: {
+            if (sp < 2) goto fail;
+            PSValue key_val = stack[--sp];
+            PSValue obj_val = stack[--sp];
+            PSAstNode *member = (PSAstNode *)ins->ptr;
+            PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+            if (ctl->did_throw) goto handle_throw;
+            if (obj && obj->kind == PS_OBJ_KIND_BUFFER && ins->a) {
+                PSValue out = ps_value_undefined();
+                int handled = ps_buffer_read_index_value(vm, obj, key_val, &out, ctl);
+                if (handled < 0) goto handle_throw;
+                if (handled > 0) {
+                    stack[sp++] = out;
+                    ip++;
+                    DISPATCH();
+                }
+                PSString *prop = ps_to_string(vm, key_val);
+                if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                if (handled < 0) goto handle_throw;
+                if (handled > 0) {
+                    stack[sp++] = out;
+                    ip++;
+                    DISPATCH();
+                }
+                int found;
+                stack[sp++] = ps_object_get(obj, prop, &found);
+            } else if (obj && obj->kind == PS_OBJ_KIND_BUFFER32 && ins->a) {
+                PSValue out = ps_value_undefined();
+                int handled = ps_buffer32_read_index_value(vm, obj, key_val, &out, ctl);
+                if (handled < 0) goto handle_throw;
+                if (handled > 0) {
+                    stack[sp++] = out;
+                    ip++;
+                    DISPATCH();
+                }
+                PSString *prop = ps_to_string(vm, key_val);
+                if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                handled = ps_buffer32_read_index(vm, obj, prop, &out, ctl);
+                if (handled < 0) goto handle_throw;
+                if (handled > 0) {
+                    stack[sp++] = out;
+                    ip++;
+                    DISPATCH();
+                }
+                int found;
+                stack[sp++] = ps_object_get(obj, prop, &found);
+            } else if (obj && obj->kind == PS_OBJ_KIND_ARRAY && ins->a) {
+                PSValue out = ps_value_undefined();
+                size_t index = 0;
+                int handled = ps_array_read_index_fast_value(obj, key_val, &out, &index);
+                if (handled > 0) {
+                    stack[sp++] = out;
+                    ip++;
+                    DISPATCH();
+                }
+                if (handled < 0) {
+                    PSString *prop = ps_array_index_string(vm, index);
+                    int found;
+                    stack[sp++] = ps_object_get(obj, prop, &found);
+                    ip++;
+                    DISPATCH();
+                }
+                handled = ps_array_read_index_value(vm, obj, key_val, &out, ctl);
+                if (handled < 0) goto handle_throw;
+                if (handled > 0) {
+                    stack[sp++] = out;
+                    ip++;
+                    DISPATCH();
+                }
+                PSString *prop = ps_to_string(vm, key_val);
+                if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                int found;
+                stack[sp++] = ps_object_get(obj, prop, &found);
+            } else if (obj && obj->kind == PS_OBJ_KIND_PLAIN && ins->a) {
+                size_t index = 0;
+                int idx = ps_value_to_index(vm, key_val, &index, ctl);
+                if (idx < 0) goto handle_throw;
+                if (idx > 0 && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                    PSValue out = ps_value_undefined();
+                    if (ps_num_map_get(obj, index, &out)) {
+                        stack[sp++] = out;
+                    } else {
+                        stack[sp++] = ps_value_undefined();
+                    }
+                    ip++;
+                    DISPATCH();
+                }
+                if (key_val.type == PS_T_STRING && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                    uint32_t kindex = 0;
+                    if (ps_string_to_k_index(key_val.as.string, &kindex)) {
+                        PSValue out = ps_value_undefined();
+                        if (ps_num_map_k_get(obj, kindex, &out)) {
+                            stack[sp++] = out;
+                            ip++;
+                            DISPATCH();
+                        }
+                    }
+                }
+                PSString *prop = (key_val.type == PS_T_STRING) ? key_val.as.string
+                                                               : ps_to_string(vm, key_val);
+                if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                int found;
+                stack[sp++] = ps_object_get(obj, prop, &found);
+            } else {
+                PSString tmp_prop;
+                char tmp_buf[96];
+                PSString *prop = NULL;
+                if (ins->a) {
+                    prop = ps_member_key_read(vm, env, member, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
+                } else if (key_val.type == PS_T_STRING) {
+                    prop = key_val.as.string;
+                } else {
+                    prop = ps_to_string(vm, key_val);
+                }
+                if (ctl->did_throw || ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                PSValue out = ps_value_undefined();
+                int handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                if (handled < 0) goto handle_throw;
+                if (handled > 0) {
+                    stack[sp++] = out;
+                    ip++;
+                    DISPATCH();
+                }
+                if (ps_member_cached_get(obj, member, prop, &out)) {
+                    stack[sp++] = out;
+                    ip++;
+                    DISPATCH();
+                }
+                {
+                    int found;
+                    stack[sp++] = ps_object_get(obj, prop, &found);
+                }
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_call_ident: {
+            int argc = ins->a;
+            PSAstNode *id = (PSAstNode *)ins->ptr;
+            if (id && id->as.identifier.length == 4 &&
+                strncmp(id->as.identifier.name, "eval", 4) == 0) {
+#if !PS_ENABLE_EVAL
+                ctl->did_throw = 1;
+                ctl->throw_value = ps_vm_make_error(vm, "EvalError", "eval is disabled");
+                goto fail;
+#else
+                PSValue *args = NULL;
+                PSValue stack_args[8];
+                int args_heap = 0;
+                if (argc < 0 || (size_t)argc > sp) goto fail;
+                if (argc <= 8) {
+                    args = stack_args;
+                } else {
+                    args = (PSValue *)malloc(sizeof(PSValue) * (size_t)argc);
+                    args_heap = 1;
+                }
+                if (!args) goto fail;
+                for (int i = argc - 1; i >= 0; i--) {
+                    args[i] = stack[--sp];
+                }
+                PSValue result = ps_value_undefined();
+                if (argc > 0) {
+                    if (args[0].type == PS_T_STRING) {
+                        result = ps_eval_source(vm, env, args[0].as.string, ctl);
+                    } else {
+                        result = args[0];
+                    }
+                }
+                if (args_heap) free(args);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = result;
+                ip++;
+                DISPATCH();
+#endif
+            }
+            PSValue callee = ps_value_undefined();
+            int found = 0;
+            if (!ps_identifier_cached_get(env, id, &callee, &found)) {
+                PSString *name = ps_identifier_string(id);
+                callee = ps_env_get(env, name, &found);
+            }
+            if (!found) {
+                ctl->did_throw = 1;
+                ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", "Identifier not defined");
+                goto handle_throw;
+            }
+            if (callee.type != PS_T_OBJECT) {
+                ctl->did_throw = 1;
+                ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Call of non-object");
+                goto handle_throw;
+            }
+            PSValue *args = NULL;
+            PSValue stack_args[8];
+            int args_heap = 0;
+            if (argc < 0 || (size_t)argc > sp) goto fail;
+            if (argc <= 8) {
+                args = stack_args;
+            } else {
+                args = (PSValue *)malloc(sizeof(PSValue) * (size_t)argc);
+                args_heap = 1;
+            }
+            if (!args) goto fail;
+            for (int i = argc - 1; i >= 0; i--) {
+                args[i] = stack[--sp];
+            }
+            int did_throw = 0;
+            PSValue throw_value = ps_value_undefined();
+            PSValue result = ps_eval_call_function(vm, env, callee.as.object,
+                                                   ps_value_object(vm->global),
+                                                   argc, args, &did_throw, &throw_value);
+            if (args_heap) free(args);
+            if (did_throw) {
+                ctl->did_throw = 1;
+                ctl->throw_value = throw_value;
+                goto handle_throw;
+            }
+            stack[sp++] = result;
+            ip++;
+            DISPATCH();
+        }
+        op_call_member: {
+            int argc = ins->a;
+            PSAstNode *member = (PSAstNode *)ins->ptr;
+            if (!member || member->kind != AST_MEMBER) goto fail;
+            PSValue *args = NULL;
+            PSValue stack_args[8];
+            int args_heap = 0;
+            if (argc < 0 || (size_t)argc > sp) goto fail;
+            if (argc <= 8) {
+                args = stack_args;
+            } else {
+                args = (PSValue *)malloc(sizeof(PSValue) * (size_t)argc);
+                args_heap = 1;
+            }
+            if (!args) goto fail;
+            for (int i = argc - 1; i >= 0; i--) {
+                args[i] = stack[--sp];
+            }
+            if (sp < 2) {
+                if (args_heap) free(args);
+                goto fail;
+            }
+            PSValue key_val = stack[--sp];
+            PSValue obj_val = stack[--sp];
+            PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+            if (ctl->did_throw) {
+                if (args_heap) free(args);
+                goto handle_throw;
+            }
+            PSValue callee = ps_value_undefined();
+            int found = 0;
+            if (obj && obj->kind == PS_OBJ_KIND_BUFFER && ins->flags) {
+                PSValue out = ps_value_undefined();
+                int handled = ps_buffer_read_index_value(vm, obj, key_val, &out, ctl);
+                if (handled < 0) {
+                    if (args_heap) free(args);
+                    goto fail;
+                }
+                if (handled > 0) {
+                    callee = out;
+                } else {
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) {
+                        if (args_heap) free(args);
+                        goto fail;
+                    }
+                    handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                    if (handled < 0) {
+                        if (args_heap) free(args);
+                        goto fail;
+                    }
+                    if (handled > 0) {
+                        callee = out;
+                    } else {
+                        callee = ps_object_get(obj, prop, &found);
+                    }
+                }
+            } else {
+                PSString tmp_prop;
+                char tmp_buf[96];
+                PSString *prop = NULL;
+                if (ins->flags) {
+                    prop = ps_member_key_read(vm, env, member, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
+                } else if (key_val.type == PS_T_STRING) {
+                    prop = key_val.as.string;
+                } else {
+                    prop = ps_to_string(vm, key_val);
+                }
+                if (ctl->did_throw || ps_check_pending_throw(vm, ctl)) {
+                    if (args_heap) free(args);
+                    goto handle_throw;
+                }
+                PSValue out = ps_value_undefined();
+                int handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                if (handled < 0) {
+                    if (args_heap) free(args);
+                    goto fail;
+                }
+                if (handled > 0) {
+                    callee = out;
+                } else {
+                    callee = ps_object_get(obj, prop, &found);
+                }
+            }
+            if (callee.type != PS_T_OBJECT) {
+                if (args_heap) free(args);
+                ctl->did_throw = 1;
+                ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Call of non-object");
+                goto handle_throw;
+            }
+#if 0
+            if (!ps_gc_is_managed(callee.as.object)) {
+                fprintf(stderr, "bad callee in op_call_member ip=%zu sp=%zu op=%u\\n",
+                        ip, sp, (unsigned)ins->op);
+                abort();
+            }
+#endif
+            int did_throw = 0;
+            PSValue throw_value = ps_value_undefined();
+            PSValue result = ps_eval_call_function(vm, env, callee.as.object,
+                                                   obj_val, argc, args,
+                                                   &did_throw, &throw_value);
+            if (args_heap) free(args);
+                if (did_throw) {
+                    ctl->did_throw = 1;
+                    ctl->throw_value = throw_value;
+                    goto handle_throw;
+                }
+                stack[sp++] = result;
+                ip++;
+                DISPATCH();
+            }
+        op_new: {
+            PSAstNode *node = (PSAstNode *)ins->ptr;
+            int argc = ins->a;
+            if (argc < 0 || (size_t)argc + 1 > sp) goto fail;
+            sp -= (size_t)argc;
+            sp--;
+            PSValue v = eval_expression(vm, env, node, ctl);
+            if (ctl->did_throw) goto handle_throw;
+            stack[sp++] = v;
+            ip++;
+            DISPATCH();
+        }
+        op_store_ident: {
+            if (sp == 0) goto fail;
+            PSAstNode *id = (PSAstNode *)ins->ptr;
+            PSValue v = stack[sp - 1];
+            if (!ps_identifier_cached_set(env, id, v)) {
+                PSString *name = ps_identifier_string(id);
+                if (name) {
+                    ps_env_set(env, name, v);
+                }
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_store_member: {
+            if (sp < 3) goto fail;
+            PSValue key_val = stack[--sp];
+            PSValue obj_val = stack[--sp];
+            PSValue value = stack[--sp];
+            PSAstNode *member = (PSAstNode *)ins->ptr;
+            PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+            if (ctl->did_throw) goto handle_throw;
+            PSString *prop = NULL;
+            if (ins->a) {
+                if (obj && obj->kind == PS_OBJ_KIND_BUFFER) {
+                    int handled = ps_buffer_write_index_value(vm, obj, key_val, value, ctl);
+                    if (handled < 0) goto handle_throw;
+                    if (handled > 0) {
+                        stack[sp++] = value;
+                        ip++;
+                        DISPATCH();
+                    }
+                    prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                    handled = ps_buffer_write_index(vm, obj, prop, value, ctl);
+                    if (handled < 0) goto handle_throw;
+                    if (handled > 0) {
+                        stack[sp++] = value;
+                        ip++;
+                        DISPATCH();
+                    }
+                    ps_object_put(obj, prop, value);
+                    stack[sp++] = value;
+                    ip++;
+                    DISPATCH();
+                } else if (obj && obj->kind == PS_OBJ_KIND_BUFFER32) {
+                    int handled = ps_buffer32_write_index_value(vm, obj, key_val, value, ctl);
+                    if (handled < 0) goto handle_throw;
+                    if (handled > 0) {
+                        stack[sp++] = value;
+                        ip++;
+                        DISPATCH();
+                    }
+                    prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                    handled = ps_buffer32_write_index(vm, obj, prop, value, ctl);
+                    if (handled < 0) goto handle_throw;
+                    if (handled > 0) {
+                        stack[sp++] = value;
+                        ip++;
+                        DISPATCH();
+                    }
+                    ps_object_put(obj, prop, value);
+                    stack[sp++] = value;
+                    ip++;
+                    DISPATCH();
+                }
+                if (key_val.type == PS_T_STRING) {
+                    prop = key_val.as.string;
+                } else {
+                    prop = ps_to_string(vm, key_val);
+                }
+            } else {
+                PSString tmp_prop;
+                char tmp_buf[96];
+                prop = ps_member_key_read(vm, env, member, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
+            }
+            if (ctl->did_throw || ps_check_pending_throw(vm, ctl)) goto handle_throw;
+            if (obj->kind == PS_OBJ_KIND_ARRAY && ps_string_is_length(prop)) {
+                int ok = ps_array_set_length(vm, obj, value, ctl);
+                if (ok < 0) goto handle_throw;
+                stack[sp++] = value;
+                ip++;
+                DISPATCH();
+            }
+            ps_object_put(obj, prop, value);
+            ps_array_update_length(obj, prop);
+            (void)ps_env_update_arguments(env, obj, prop, value);
+            stack[sp++] = value;
+            ip++;
+            DISPATCH();
+        }
+        op_not:
+            if (sp == 0) goto fail;
+            stack[sp - 1] = ps_value_boolean(!ps_to_boolean(vm, stack[sp - 1]));
+            ip++;
+            DISPATCH();
+        op_bit_not: {
+            if (sp == 0) goto fail;
+            int32_t v = ps_to_int32_fast(vm, stack[sp - 1]);
+            if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+            stack[sp - 1] = ps_value_number((double)(~v));
+            ip++;
+            DISPATCH();
+        }
+        op_delete: {
+            PSAstNode *mem = (PSAstNode *)ins->ptr;
+            if (!mem || mem->kind != AST_MEMBER) goto fail;
+            PSValue obj_val = ps_stmt_bc_eval_expr(vm, env, mem->as.member.object, ctl);
+            if (ctl->did_throw) goto fail;
+            PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+            if (ctl->did_throw) goto fail;
+            if (obj && obj->kind == PS_OBJ_KIND_ARRAY && mem->as.member.computed) {
+                PSValue key_val = ps_stmt_bc_eval_expr(vm, env, mem->as.member.property, ctl);
+                if (ctl->did_throw) goto fail;
+                size_t index = 0;
+                int idx = ps_value_to_array_index(vm, key_val, &index, ctl);
+                if (idx < 0) goto fail;
+                if (idx > 0) {
+                    (void)ps_array_delete_index(obj, index);
+                    stack[sp++] = ps_value_boolean(1);
+                    ip++;
+                    DISPATCH();
+                }
+            }
+            PSString *prop = ps_member_key(vm, env, mem, ctl);
+            if (ctl->did_throw) goto fail;
+            int deleted = 0;
+            int ok = ps_object_delete(obj, prop, &deleted);
+            stack[sp++] = ps_value_boolean(ok ? 1 : 0);
+            ip++;
+            DISPATCH();
+        }
+        op_typeof: {
+            PSAstNode *node = (PSAstNode *)ins->ptr;
+            PSValue v = ps_value_undefined();
+            int found = 0;
+            if (node && node->kind == AST_IDENTIFIER) {
+                if (!ps_identifier_cached_get(env, node, &v, &found)) {
+                    PSString *name = ps_identifier_string(node);
+                    v = ps_env_get(env, name, &found);
+                }
+                if (!found) {
+                    stack[sp++] = ps_value_string(ps_string_from_cstr("undefined"));
+                    ip++;
+                    DISPATCH();
+                }
+            } else {
+                v = ps_stmt_bc_eval_expr(vm, env, node, ctl);
+                if (ctl->did_throw) goto fail;
+            }
+            const char *name = "undefined";
+            switch (v.type) {
+                case PS_T_UNDEFINED: name = "undefined"; break;
+                case PS_T_NULL: name = "object"; break;
+                case PS_T_BOOLEAN: name = "boolean"; break;
+                case PS_T_NUMBER: name = "number"; break;
+                case PS_T_STRING: name = "string"; break;
+                case PS_T_OBJECT:
+                    name = (v.as.object && v.as.object->kind == PS_OBJ_KIND_FUNCTION)
+                        ? "function"
+                        : "object";
+                    break;
+            }
+            stack[sp++] = ps_value_string(ps_string_from_cstr(name));
+            ip++;
+            DISPATCH();
+        }
+        op_eval_ast: {
+            PSAstNode *node = (PSAstNode *)ins->ptr;
+            PSValue v = eval_expression(vm, env, node, ctl);
+            if (ctl->did_throw) goto handle_throw;
+            stack[sp++] = v;
+            ip++;
+            DISPATCH();
+        }
+        op_dup:
+            if (sp == 0) goto fail;
+            stack[sp] = stack[sp - 1];
+            sp++;
+            ip++;
+            DISPATCH();
+        op_pop:
+            if (sp == 0) goto fail;
+            sp--;
+            ip++;
+            DISPATCH();
+        op_eval_stmt: {
+            PSAstNode *node = (PSAstNode *)ins->ptr;
+            PSValue v = eval_node(vm, env, node, ctl);
+            if (ctl->did_throw) goto handle_throw;
+            if (ctl->did_return) {
+                UNWIND_ENVS();
+                FREE_HANDLER_STACK();
+                if (stack != stack_buf) free(stack);
+                return v;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_for_in_init: {
+            if (sp == 0) goto fail;
+            PSValue obj_val = stack[--sp];
+            PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+            if (ctl->did_throw) goto fail;
+            PSObject *arr = ps_for_in_collect_array(vm, obj);
+            if (!arr) goto fail;
+            stack[sp++] = ps_value_object(arr);
+            stack[sp++] = ps_value_number(0);
+            ip++;
+            DISPATCH();
+        }
+        op_for_in_next: {
+            if (sp < 2) goto fail;
+            PSValue idx_val = stack[sp - 1];
+            PSValue arr_val = stack[sp - 2];
+            if (arr_val.type != PS_T_OBJECT || !arr_val.as.object ||
+                arr_val.as.object->kind != PS_OBJ_KIND_ARRAY) {
+                goto fail;
+            }
+            double idx_num = ps_to_number_fast(vm, idx_val);
+            if (ps_check_pending_throw(vm, ctl)) goto fail;
+            if (idx_num < 0) idx_num = 0;
+            size_t idx = (size_t)idx_num;
+            size_t len = ps_array_length(arr_val.as.object);
+            if (idx >= len) {
+                stack[sp++] = ps_value_boolean(0);
+                ip++;
+                DISPATCH();
+            }
+            PSValue key = ps_value_undefined();
+            (void)ps_array_get_index(arr_val.as.object, idx, &key);
+            stack[sp - 1] = ps_value_number((double)(idx + 1));
+            stack[sp++] = key;
+            stack[sp++] = ps_value_boolean(1);
+            ip++;
+            DISPATCH();
+        }
+        op_for_in_assign: {
+            if (sp == 0) goto fail;
+            PSValue key = stack[--sp];
+            PSAstNode *target = (PSAstNode *)ins->ptr;
+            int is_var = ins->a ? 1 : 0;
+            if (!target) goto fail;
+            if (target->kind == AST_IDENTIFIER) {
+                PSString *name = ps_identifier_string(target);
+                if (name) {
+                    if (is_var) {
+                        ps_env_define(env, name, key);
+                    } else {
+                        ps_env_set(env, name, key);
+                    }
+                }
+            } else if (target->kind == AST_MEMBER) {
+                PSValue obj_val = ps_stmt_bc_eval_expr(vm, env, target->as.member.object, ctl);
+                if (ctl->did_throw) goto fail;
+                PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                if (ctl->did_throw) goto fail;
+                PSString *prop = ps_member_key(vm, env, target, ctl);
+                if (ctl->did_throw) goto fail;
+                ps_object_put(obj, prop, key);
+                (void)ps_env_update_arguments(env, obj, prop, key);
+            } else {
+                goto fail;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_with_enter: {
+            if (sp == 0) goto fail;
+            PSValue obj_val = stack[--sp];
+            PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+            if (ctl->did_throw) goto fail;
+            PSEnv *with_env = ps_env_new(env, obj, 0);
+            if (!with_env) goto fail;
+            with_env->is_with = 1;
+            if (env_sp == env_cap) {
+                size_t new_cap = env_cap * 2;
+                PSEnv **next = (PSEnv **)malloc(sizeof(PSEnv *) * new_cap);
+                if (!next) {
+                    ps_env_free(with_env);
+                    goto fail;
+                }
+                memcpy(next, env_stack, sizeof(PSEnv *) * env_cap);
+                if (env_stack != env_stack_buf) free(env_stack);
+                env_stack = next;
+                env_cap = new_cap;
+            }
+            env_stack[env_sp++] = env;
+            env = with_env;
+            ip++;
+            DISPATCH();
+        }
+        op_with_exit: {
+            if (env_sp == 0) goto fail;
+            PSEnv *prev = env_stack[--env_sp];
+            if (env) ps_env_free(env);
+            env = prev;
+            ip++;
+            DISPATCH();
+        }
+        op_try_push: {
+            if (handler_sp == handler_cap) {
+                size_t new_cap = handler_cap * 2;
+                PSTryHandler *next = (PSTryHandler *)malloc(sizeof(PSTryHandler) * new_cap);
+                if (!next) goto fail;
+                memcpy(next, handler_stack, sizeof(PSTryHandler) * handler_cap);
+                if (handler_stack != handler_stack_buf) free(handler_stack);
+                handler_stack = next;
+                handler_cap = new_cap;
+            }
+            PSTryHandler h;
+            h.catch_ip = (size_t)ins->a;
+            h.finally_ip = (size_t)(intptr_t)ins->ptr;
+            h.catch_param = (PSAstNode *)ins->ptr2;
+            handler_stack[handler_sp++] = h;
+            ip++;
+            DISPATCH();
+        }
+        op_try_pop:
+            if (handler_sp == 0) goto fail;
+            handler_sp--;
+            ip++;
+            DISPATCH();
+        op_catch_enter: {
+            if (handler_sp == 0) goto fail;
+            PSTryHandler *h = &handler_stack[handler_sp - 1];
+            PSEnv *catch_env = ps_env_new_object(env);
+            if (!catch_env) goto fail;
+            if (h->catch_param) {
+                PSString *name = ps_identifier_string(h->catch_param);
+                if (name) {
+                    ps_env_define(catch_env, name, ctl->throw_value);
+                }
+            }
+            ctl->did_throw = 0;
+            h->catch_ip = (size_t)-1;
+            if (env_sp == env_cap) {
+                size_t new_cap = env_cap * 2;
+                PSEnv **next = (PSEnv **)malloc(sizeof(PSEnv *) * new_cap);
+                if (!next) {
+                    ps_env_free(catch_env);
+                    goto fail;
+                }
+                memcpy(next, env_stack, sizeof(PSEnv *) * env_cap);
+                if (env_stack != env_stack_buf) free(env_stack);
+                env_stack = next;
+                env_cap = new_cap;
+            }
+            env_stack[env_sp++] = env;
+            env = catch_env;
+            ip++;
+            DISPATCH();
+        }
+        op_catch_exit: {
+            if (env_sp == 0) goto fail;
+            PSEnv *prev = env_stack[--env_sp];
+            if (env) ps_env_free(env);
+            env = prev;
+            ip++;
+            DISPATCH();
+        }
+        op_throw: {
+            if (sp == 0) goto fail;
+            PSValue v = stack[--sp];
+            ctl->did_throw = 1;
+            ctl->throw_value = v;
+            goto handle_throw;
+        }
+        op_finally_exit: {
+            if (handler_sp == 0) goto fail;
+            handler_sp--;
+            if (pending_throw) {
+                ctl->did_throw = 1;
+                ctl->throw_value = pending_throw_value;
+                pending_throw = 0;
+                goto handle_throw;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_jump:
+            ip = (size_t)ins->a;
+            DISPATCH();
+        op_jump_if_false: {
+            if (sp == 0) goto fail;
+            PSValue v = stack[--sp];
+            if (!ps_to_boolean(vm, v)) {
+                ip = (size_t)ins->a;
+            } else {
+                ip++;
+            }
+            DISPATCH();
+        }
+        op_jump_if_true: {
+            if (sp == 0) goto fail;
+            PSValue v = stack[--sp];
+            if (ps_to_boolean(vm, v)) {
+                ip = (size_t)ins->a;
+            } else {
+                ip++;
+            }
+            DISPATCH();
+        }
+#if !PS_DISABLE_CF_FUSIONS
+        op_jlt_ident_const: {
+            PSAstNode *id = (PSAstNode *)ins->ptr;
+            if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+            PSValue left = ps_value_undefined();
+            if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+            PSValue right = bc->consts[ins->a];
+            int take = 0;
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                take = !(left.as.number < right.as.number);
+            } else {
+                PSValue out = ps_eval_binary_values(vm, TOK_LT, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                take = !ps_to_boolean(vm, out);
+            }
+            if (take) {
+                ip = (size_t)(intptr_t)ins->ptr2;
+            } else {
+                ip++;
+            }
+            DISPATCH();
+        }
+        op_jbitand_eqz_ident_const: {
+            PSAstNode *id = (PSAstNode *)ins->ptr;
+            if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+            PSValue left = ps_value_undefined();
+            if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+            PSValue right = bc->consts[ins->a];
+            int32_t ln = ps_to_int32_fast(vm, left);
+            if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+            int32_t rn = ps_to_int32_fast(vm, right);
+            if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+            int take = ((ln & rn) != 0);
+            if (take) {
+                ip = (size_t)(intptr_t)ins->ptr2;
+            } else {
+                ip++;
+            }
+            DISPATCH();
+        }
+        op_jump_add_ident_const: {
+            PSAstNode *id = (PSAstNode *)ins->ptr;
+            if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+            PSValue left = ps_value_undefined();
+            if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+            PSValue right = bc->consts[ins->a];
+            PSValue out = ps_value_undefined();
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                out = ps_value_number(left.as.number + right.as.number);
+            } else {
+                out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+            }
+            if (!ps_identifier_cached_set(env, id, out)) {
+                PSString *name = ps_identifier_string(id);
+                if (name) ps_env_set(env, name, out);
+            }
+            ip = (size_t)(intptr_t)ins->ptr2;
+            DISPATCH();
+        }
+#endif
+        op_return_value: {
+            if (sp == 0) goto fail;
+            PSValue v = stack[--sp];
+            ctl->did_return = 1;
+            UNBOXED_WRITEBACK();
+            UNWIND_ENVS();
+            FREE_HANDLER_STACK();
+            if (stack != stack_buf) free(stack);
+            return v;
+        }
+        op_return_void:
+            ctl->did_return = 1;
+            UNBOXED_WRITEBACK();
+            UNWIND_ENVS();
+            FREE_HANDLER_STACK();
+            if (stack != stack_buf) free(stack);
+            return ps_value_undefined();
+#if !PS_DISABLE_SPECIALIZATION
+        op_load_slot_num:
+            stack[sp++] = slot_values[ins->a];
+            ip++;
+            DISPATCH();
+        op_store_slot_num:
+            if (sp == 0) goto fail;
+            slot_values[ins->a] = stack[sp - 1];
+            ip++;
+            DISPATCH();
+        op_add_num: {
+            int lhs = (int)(intptr_t)ins->ptr;
+            PSValue left = slot_values[lhs];
+            PSValue right = ps_value_undefined();
+            if (ins->flags) {
+                int const_idx = (int)(intptr_t)ins->ptr2;
+                if (const_idx < 0 || (size_t)const_idx >= bc->const_count) goto fail;
+                right = bc->consts[const_idx];
+            } else {
+                int rhs = (int)(intptr_t)ins->ptr2;
+                right = slot_values[rhs];
+            }
+            PSValue out = ps_value_number(left.as.number + right.as.number);
+            slot_values[ins->a] = out;
+            stack[sp++] = out;
+            ip++;
+            DISPATCH();
+        }
+#endif
+#if !PS_DISABLE_UNBOXED_SPEC
+        op_unbox_load_slot_d:
+            stack[sp++] = ps_value_number(unboxed_d[ins->a]);
+            ip++;
+            DISPATCH();
+        op_unbox_store_slot_d:
+            if (sp == 0) goto fail;
+            unboxed_d[ins->a] = stack[sp - 1].as.number;
+            ip++;
+            DISPATCH();
+        op_unbox_add_slot_d_slot_d: {
+            int dst = ins->a;
+            int lhs = (int)(intptr_t)ins->ptr;
+            int rhs = (int)(intptr_t)ins->ptr2;
+            unboxed_d[dst] = unboxed_d[lhs] + unboxed_d[rhs];
+            ip++;
+            DISPATCH();
+        }
+        op_unbox_add_slot_d_const: {
+            int dst = ins->a;
+            int lhs = (int)(intptr_t)ins->ptr;
+            int const_idx = (int)(intptr_t)ins->ptr2;
+            unboxed_d[dst] = unboxed_d[lhs] + bc->consts[const_idx].as.number;
+            ip++;
+            DISPATCH();
+        }
+        op_unbox_jlt_slot_d_const: {
+            int slot = (int)(intptr_t)ins->ptr;
+            int const_idx = ins->a;
+            if (unboxed_d[slot] < bc->consts[const_idx].as.number) {
+                ip = (size_t)(intptr_t)ins->ptr2;
+            } else {
+                ip++;
+            }
+            DISPATCH();
+        }
+        op_unbox_jbitand_eqz_slot_d_const: {
+            int slot = (int)(intptr_t)ins->ptr;
+            int const_idx = ins->a;
+            int32_t ln = (int32_t)unboxed_d[slot];
+            int32_t rn = (int32_t)bc->consts[const_idx].as.number;
+            if ((ln & rn) != 0) {
+                ip = (size_t)(intptr_t)ins->ptr2;
+            } else {
+                ip++;
+            }
+            DISPATCH();
+        }
+        op_unbox_jump_add_slot_d_const: {
+            int slot = (int)(intptr_t)ins->ptr;
+            int const_idx = ins->a;
+            unboxed_d[slot] += bc->consts[const_idx].as.number;
+            ip = (size_t)(intptr_t)ins->ptr2;
+            DISPATCH();
+        }
+#endif
+    }
+handle_throw:
+    if (handler_sp == 0) goto fail;
+    {
+        PSTryHandler *h = &handler_stack[handler_sp - 1];
+        if (h->catch_ip != (size_t)-1) {
+            pending_throw = 0;
+            ip = h->catch_ip;
+            DISPATCH();
+        }
+        if (h->finally_ip != (size_t)-1) {
+            pending_throw = 1;
+            pending_throw_value = ctl->throw_value;
+            ctl->did_throw = 0;
+            ip = h->finally_ip;
+            DISPATCH();
+        }
+        handler_sp--;
+    }
+    goto fail;
+fail:
+    UNBOXED_WRITEBACK();
+    UNWIND_ENVS();
+    FREE_HANDLER_STACK();
+    if (stack != stack_buf) free(stack);
+    return ctl->did_throw ? ctl->throw_value : ps_value_undefined();
+#undef DISPATCH
+#else
+loop_top:
+    while (ip < bc->count) {
+        PSStmtBCInstr *ins = &bc->code[ip];
+        switch (ins->op) {
+            case STMT_BC_EXPR_PUSH_CONST:
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                stack[sp++] = bc->consts[ins->a];
+                ip++;
+                break;
+            case STMT_BC_EXPR_LOAD_IDENT: {
+                PSAstNode *id = (PSAstNode *)ins->ptr;
+                int found = 0;
+                PSValue v = ps_value_undefined();
+                if (!ps_identifier_cached_get(env, id, &v, &found)) {
+                    PSString *name = ps_identifier_string(id);
+                    v = ps_env_get(env, name, &found);
+                }
+                if (!found) {
+                    ctl->did_throw = 1;
+                    const char *prefix = "Identifier not defined: ";
+                    PSString *name = ps_identifier_string(id);
+                    size_t prefix_len = strlen(prefix);
+                    size_t name_len = name ? name->byte_len : 0;
+                    char *msg = NULL;
+                    if (name && name->utf8 && name_len > 0) {
+                        msg = (char *)malloc(prefix_len + name_len + 1);
+                    }
+                    if (msg) {
+                        memcpy(msg, prefix, prefix_len);
+                        memcpy(msg + prefix_len, name->utf8, name_len);
+                        msg[prefix_len + name_len] = '\0';
+                        ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", msg);
+                        free(msg);
+                    } else {
+                        ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", "Identifier not defined");
+                    }
+                    goto fail;
+                }
+                stack[sp++] = v;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_LOAD_THIS: {
+                PSString *name = ps_string_from_cstr("this");
+                int found = 0;
+                PSValue v = ps_env_get(env, name, &found);
+                if (found) {
+                    stack[sp++] = v;
+                } else if (vm && vm->global) {
+                    stack[sp++] = ps_value_object(vm->global);
+                } else {
+                    stack[sp++] = ps_value_undefined();
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_UNARY_NUM: {
+                if (sp == 0) goto fail;
+                PSValue v = stack[sp - 1];
+                if (v.type != PS_T_NUMBER) goto fail;
+                if (ins->a == TOK_MINUS) {
+                    v.as.number = -v.as.number;
+                }
+                stack[sp - 1] = v;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_BINARY_NUM: {
+                if (sp < 2) goto fail;
+                PSValue right = stack[--sp];
+                PSValue left = stack[--sp];
+                PSValue out = ps_eval_binary_values(vm, ins->a, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = out;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_ADD_INT: {
+                if (sp < 2) goto fail;
+                PSValue right = stack[--sp];
+                PSValue left = stack[--sp];
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    int32_t li = 0;
+                    int32_t ri = 0;
+                    if (ps_number_to_int32_strict(left.as.number, &li) &&
+                        ps_number_to_int32_strict(right.as.number, &ri)) {
+                        int64_t sum = (int64_t)li + (int64_t)ri;
+                        if (sum >= INT32_MIN && sum <= INT32_MAX) {
+                            stack[sp++] = ps_value_number((double)sum);
+                        } else {
+                            stack[sp++] = ps_value_number(left.as.number + right.as.number);
+                        }
+                    } else {
+                        stack[sp++] = ps_value_number(left.as.number + right.as.number);
+                    }
+                } else {
+                    PSValue out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                    stack[sp++] = out;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_ADD_DOUBLE: {
+                if (sp < 2) goto fail;
+                PSValue right = stack[--sp];
+                PSValue left = stack[--sp];
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    stack[sp++] = ps_value_number(left.as.number + right.as.number);
+                } else {
+                    PSValue out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                    stack[sp++] = out;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_ADD_IDENT_CONST: {
+                PSAstNode *id = (PSAstNode *)ins->ptr;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue left = ps_value_undefined();
+                if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+                PSValue right = bc->consts[ins->a];
+                PSValue out = ps_value_undefined();
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    out = ps_value_number(left.as.number + right.as.number);
+                } else {
+                    out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                }
+                if (!ps_identifier_cached_set(env, id, out)) {
+                    PSString *name = ps_identifier_string(id);
+                    if (name) ps_env_set(env, name, out);
+                }
+                stack[sp++] = out;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_ADD_IDENT_IDENT: {
+                PSAstNode *id = (PSAstNode *)ins->ptr;
+                PSAstNode *rhs_id = (PSAstNode *)ins->ptr2;
+                PSValue left = ps_value_undefined();
+                PSValue right = ps_value_undefined();
+                if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+                if (!ps_stmt_bc_get_ident_value(vm, env, rhs_id, &right, ctl)) goto fail;
+                PSValue out = ps_value_undefined();
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    out = ps_value_number(left.as.number + right.as.number);
+                } else {
+                    out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                }
+                if (!ps_identifier_cached_set(env, id, out)) {
+                    PSString *name = ps_identifier_string(id);
+                    if (name) ps_env_set(env, name, out);
+                }
+                stack[sp++] = out;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_SUB_INT: {
+                if (sp < 2) goto fail;
+                PSValue right = stack[--sp];
+                PSValue left = stack[--sp];
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    int32_t li = 0;
+                    int32_t ri = 0;
+                    if (ps_number_to_int32_strict(left.as.number, &li) &&
+                        ps_number_to_int32_strict(right.as.number, &ri)) {
+                        int64_t diff = (int64_t)li - (int64_t)ri;
+                        if (diff >= INT32_MIN && diff <= INT32_MAX) {
+                            stack[sp++] = ps_value_number((double)diff);
+                        } else {
+                            stack[sp++] = ps_value_number(left.as.number - right.as.number);
+                        }
+                    } else {
+                        stack[sp++] = ps_value_number(left.as.number - right.as.number);
+                    }
+                } else {
+                    PSValue out = ps_stmt_bc_binary_slow(vm, TOK_MINUS, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                    stack[sp++] = out;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_SUB_DOUBLE: {
+                if (sp < 2) goto fail;
+                PSValue right = stack[--sp];
+                PSValue left = stack[--sp];
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    stack[sp++] = ps_value_number(left.as.number - right.as.number);
+                } else {
+                    PSValue out = ps_stmt_bc_binary_slow(vm, TOK_MINUS, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                    stack[sp++] = out;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_MUL_INT: {
+                if (sp < 2) goto fail;
+                PSValue right = stack[--sp];
+                PSValue left = stack[--sp];
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    int32_t li = 0;
+                    int32_t ri = 0;
+                    if (ps_number_to_int32_strict(left.as.number, &li) &&
+                        ps_number_to_int32_strict(right.as.number, &ri)) {
+                        int64_t prod = (int64_t)li * (int64_t)ri;
+                        if (prod >= INT32_MIN && prod <= INT32_MAX) {
+                            stack[sp++] = ps_value_number((double)prod);
+                        } else {
+                            stack[sp++] = ps_value_number(left.as.number * right.as.number);
+                        }
+                    } else {
+                        stack[sp++] = ps_value_number(left.as.number * right.as.number);
+                    }
+                } else {
+                    PSValue out = ps_stmt_bc_binary_slow(vm, TOK_STAR, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                    stack[sp++] = out;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_MUL_DOUBLE: {
+                if (sp < 2) goto fail;
+                PSValue right = stack[--sp];
+                PSValue left = stack[--sp];
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    stack[sp++] = ps_value_number(left.as.number * right.as.number);
+                } else {
+                    PSValue out = ps_stmt_bc_binary_slow(vm, TOK_STAR, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                    stack[sp++] = out;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_DIV_DOUBLE: {
+                if (sp < 2) goto fail;
+                PSValue right = stack[--sp];
+                PSValue left = stack[--sp];
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    stack[sp++] = ps_value_number(left.as.number / right.as.number);
+                } else {
+                    PSValue out = ps_stmt_bc_binary_slow(vm, TOK_SLASH, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                    stack[sp++] = out;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_NEW_OBJECT: {
+                PSObject *obj = ps_object_new(vm ? vm->object_proto : NULL);
+                if (!obj) goto fail;
+                stack[sp++] = ps_value_object(obj);
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_OBJ_PUT_CONST: {
+                if (sp < 2) goto fail;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue key_val = bc->consts[ins->a];
+                if (key_val.type != PS_T_STRING) goto fail;
+                PSValue val = stack[--sp];
+                PSValue obj_val = stack[--sp];
+                if (obj_val.type != PS_T_OBJECT || !obj_val.as.object) goto fail;
+                ps_object_define(obj_val.as.object, key_val.as.string, val, PS_ATTR_NONE);
+                stack[sp++] = obj_val;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_GET_MEMBER: {
+                if (sp < 2) goto fail;
+                PSValue key_val = stack[--sp];
+                PSValue obj_val = stack[--sp];
+                PSAstNode *member = (PSAstNode *)ins->ptr;
+                PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                if (ctl->did_throw) goto fail;
+                if (obj && obj->kind == PS_OBJ_KIND_BUFFER && ins->a) {
+                    PSValue out = ps_value_undefined();
+                    int handled = ps_buffer_read_index_value(vm, obj, key_val, &out, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        ip++;
+                        break;
+                    }
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto fail;
+                    handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        ip++;
+                        break;
+                    }
+                    int found;
+                    stack[sp++] = ps_object_get(obj, prop, &found);
+                } else if (obj && obj->kind == PS_OBJ_KIND_BUFFER32 && ins->a) {
+                    PSValue out = ps_value_undefined();
+                    int handled = ps_buffer32_read_index_value(vm, obj, key_val, &out, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        ip++;
+                        break;
+                    }
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto fail;
+                    handled = ps_buffer32_read_index(vm, obj, prop, &out, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        ip++;
+                        break;
+                    }
+                    int found;
+                    stack[sp++] = ps_object_get(obj, prop, &found);
+                } else if (obj && obj->kind == PS_OBJ_KIND_ARRAY && ins->a) {
+                    PSValue out = ps_value_undefined();
+                    size_t index = 0;
+                    int handled = ps_array_read_index_fast_value(obj, key_val, &out, &index);
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        ip++;
+                        break;
+                    }
+                    if (handled < 0) {
+                        PSString *prop = ps_array_index_string(vm, index);
+                        int found;
+                        stack[sp++] = ps_object_get(obj, prop, &found);
+                        ip++;
+                        break;
+                    }
+                    handled = ps_array_read_index_value(vm, obj, key_val, &out, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        ip++;
+                        break;
+                    }
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto fail;
+                    int found;
+                    stack[sp++] = ps_object_get(obj, prop, &found);
+                } else if (obj && obj->kind == PS_OBJ_KIND_PLAIN && ins->a) {
+                    size_t index = 0;
+                    int idx = ps_value_to_index(vm, key_val, &index, ctl);
+                    if (idx < 0) goto fail;
+                    if (idx > 0 && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                        PSValue out = ps_value_undefined();
+                        if (ps_num_map_get(obj, index, &out)) {
+                            stack[sp++] = out;
+                        } else {
+                            stack[sp++] = ps_value_undefined();
+                        }
+                        ip++;
+                        break;
+                    }
+                    if (key_val.type == PS_T_STRING && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                        uint32_t kindex = 0;
+                        if (ps_string_to_k_index(key_val.as.string, &kindex)) {
+                            PSValue out = ps_value_undefined();
+                            if (ps_num_map_k_get(obj, kindex, &out)) {
+                                stack[sp++] = out;
+                                ip++;
+                                break;
+                            }
+                        }
+                    }
+                    PSString *prop = (key_val.type == PS_T_STRING) ? key_val.as.string
+                                                                   : ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto fail;
+                    int found;
+                    stack[sp++] = ps_object_get(obj, prop, &found);
+                } else {
+                    PSString tmp_prop;
+                    char tmp_buf[96];
+                    PSString *prop = NULL;
+                    if (ins->a) {
+                        prop = ps_member_key_read(vm, env, member, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
+                    } else if (key_val.type == PS_T_STRING) {
+                        prop = key_val.as.string;
+                    } else {
+                        prop = ps_to_string(vm, key_val);
+                    }
+                    if (ctl->did_throw || ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                    PSValue out = ps_value_undefined();
+                    int handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                    if (handled < 0) goto handle_throw;
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        ip++;
+                        break;
+                    }
+                    if (ps_member_cached_get(obj, member, prop, &out)) {
+                        stack[sp++] = out;
+                        ip++;
+                        break;
+                    }
+                    {
+                        int found;
+                        stack[sp++] = ps_object_get(obj, prop, &found);
+                    }
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_CALL_IDENT: {
+                int argc = ins->a;
+                PSAstNode *id = (PSAstNode *)ins->ptr;
+                if (id && id->as.identifier.length == 4 &&
+                    strncmp(id->as.identifier.name, "eval", 4) == 0) {
+#if !PS_ENABLE_EVAL
+                    ctl->did_throw = 1;
+                    ctl->throw_value = ps_vm_make_error(vm, "EvalError", "eval is disabled");
+                    goto fail;
+#else
+                    PSValue *args = NULL;
+                    PSValue stack_args[8];
+                    int args_heap = 0;
+                    if (argc < 0 || (size_t)argc > sp) goto fail;
+                    if (argc <= 8) {
+                        args = stack_args;
+                    } else {
+                        args = (PSValue *)malloc(sizeof(PSValue) * (size_t)argc);
+                        args_heap = 1;
+                    }
+                    if (!args) goto fail;
+                    for (int i = argc - 1; i >= 0; i--) {
+                        args[i] = stack[--sp];
+                    }
+                    PSValue result = ps_value_undefined();
+                    if (argc > 0) {
+                        if (args[0].type == PS_T_STRING) {
+                            result = ps_eval_source(vm, env, args[0].as.string, ctl);
+                        } else {
+                            result = args[0];
+                        }
+                    }
+                    if (args_heap) free(args);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = result;
+                ip++;
+                break;
+#endif
+                }
+                PSValue callee = ps_value_undefined();
+                int found = 0;
+                if (!ps_identifier_cached_get(env, id, &callee, &found)) {
+                    PSString *name = ps_identifier_string(id);
+                    callee = ps_env_get(env, name, &found);
+                }
+                if (!found) {
+                    ctl->did_throw = 1;
+                    ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", "Identifier not defined");
+                    goto fail;
+                }
+                if (callee.type != PS_T_OBJECT) {
+                    ctl->did_throw = 1;
+                    ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Call of non-object");
+                    goto fail;
+                }
+                PSValue *args = NULL;
+                PSValue stack_args[8];
+                int args_heap = 0;
+                if (argc < 0 || (size_t)argc > sp) goto fail;
+                if (argc <= 8) {
+                    args = stack_args;
+                } else {
+                    args = (PSValue *)malloc(sizeof(PSValue) * (size_t)argc);
+                    args_heap = 1;
+                }
+                if (!args) goto fail;
+                for (int i = argc - 1; i >= 0; i--) {
+                    args[i] = stack[--sp];
+                }
+                int did_throw = 0;
+                PSValue throw_value = ps_value_undefined();
+                PSValue result = ps_eval_call_function(vm, env, callee.as.object,
+                                                       ps_value_object(vm->global),
+                                                       argc, args, &did_throw, &throw_value);
+                if (args_heap) free(args);
+                if (did_throw) {
+                    ctl->did_throw = 1;
+                    ctl->throw_value = throw_value;
+                    goto handle_throw;
+                }
+                stack[sp++] = result;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_CALL_MEMBER: {
+                int argc = ins->a;
+                PSAstNode *member = (PSAstNode *)ins->ptr;
+                if (!member || member->kind != AST_MEMBER) goto fail;
+                PSValue *args = NULL;
+                PSValue stack_args[8];
+                int args_heap = 0;
+                if (argc < 0 || (size_t)argc > sp) goto fail;
+                if (argc <= 8) {
+                    args = stack_args;
+                } else {
+                    args = (PSValue *)malloc(sizeof(PSValue) * (size_t)argc);
+                    args_heap = 1;
+                }
+                if (!args) goto fail;
+                for (int i = argc - 1; i >= 0; i--) {
+                    args[i] = stack[--sp];
+                }
+                if (sp < 2) {
+                    if (args_heap) free(args);
+                    goto fail;
+                }
+                PSValue key_val = stack[--sp];
+                PSValue obj_val = stack[--sp];
+                PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                if (ctl->did_throw) {
+                    if (args_heap) free(args);
+                    goto handle_throw;
+                }
+                PSValue callee = ps_value_undefined();
+                int found = 0;
+                if (obj && obj->kind == PS_OBJ_KIND_BUFFER && ins->flags) {
+                    PSValue out = ps_value_undefined();
+                    int handled = ps_buffer_read_index_value(vm, obj, key_val, &out, ctl);
+                    if (handled < 0) {
+                        if (args_heap) free(args);
+                        goto fail;
+                    }
+                    if (handled > 0) {
+                        callee = out;
+                    } else {
+                        PSString *prop = ps_to_string(vm, key_val);
+                        if (ps_check_pending_throw(vm, ctl)) {
+                            if (args_heap) free(args);
+                            goto fail;
+                        }
+                        handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                        if (handled < 0) {
+                            if (args_heap) free(args);
+                            goto fail;
+                        }
+                        if (handled > 0) {
+                            callee = out;
+                        } else {
+                            callee = ps_object_get(obj, prop, &found);
+                        }
+                    }
+                } else {
+                    PSString tmp_prop;
+                    char tmp_buf[96];
+                    PSString *prop = NULL;
+                    if (ins->flags) {
+                        prop = ps_member_key_read(vm, env, member, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
+                    } else if (key_val.type == PS_T_STRING) {
+                        prop = key_val.as.string;
+                    } else {
+                        prop = ps_to_string(vm, key_val);
+                    }
+                    if (ctl->did_throw || ps_check_pending_throw(vm, ctl)) {
+                        if (args_heap) free(args);
+                        goto fail;
+                    }
+                    PSValue out = ps_value_undefined();
+                    int handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                    if (handled < 0) {
+                        if (args_heap) free(args);
+                        goto fail;
+                    }
+                    if (handled > 0) {
+                        callee = out;
+                    } else {
+                        callee = ps_object_get(obj, prop, &found);
+                    }
+                }
+                if (callee.type != PS_T_OBJECT) {
+                    if (args_heap) free(args);
+                    ctl->did_throw = 1;
+                    ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Call of non-object");
+                    goto handle_throw;
+                }
+                int did_throw = 0;
+                PSValue throw_value = ps_value_undefined();
+                PSValue result = ps_eval_call_function(vm, env, callee.as.object,
+                                                       obj_val, argc, args,
+                                                       &did_throw, &throw_value);
+                if (args_heap) free(args);
+                if (did_throw) {
+                    ctl->did_throw = 1;
+                    ctl->throw_value = throw_value;
+                    goto handle_throw;
+                }
+                stack[sp++] = result;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_NEW: {
+                PSAstNode *node = (PSAstNode *)ins->ptr;
+                int argc = ins->a;
+                if (argc < 0 || (size_t)argc + 1 > sp) goto fail;
+                sp -= (size_t)argc;
+                sp--;
+                PSValue v = eval_expression(vm, env, node, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = v;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_STORE_IDENT: {
+                if (sp == 0) goto fail;
+                PSAstNode *id = (PSAstNode *)ins->ptr;
+                PSValue v = stack[sp - 1];
+                if (!ps_identifier_cached_set(env, id, v)) {
+                    PSString *name = ps_identifier_string(id);
+                    if (name) {
+                        ps_env_set(env, name, v);
+                    }
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_STORE_MEMBER: {
+                if (sp < 3) goto fail;
+                PSValue key_val = stack[--sp];
+                PSValue obj_val = stack[--sp];
+                PSValue value = stack[--sp];
+                PSAstNode *member = (PSAstNode *)ins->ptr;
+                PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                PSString *prop = NULL;
+                if (ins->a) {
+                    if (obj && obj->kind == PS_OBJ_KIND_BUFFER) {
+                        int handled = ps_buffer_write_index_value(vm, obj, key_val, value, ctl);
+                        if (handled < 0) goto handle_throw;
+                        if (handled > 0) {
+                            stack[sp++] = value;
+                            ip++;
+                            break;
+                        }
+                        prop = ps_to_string(vm, key_val);
+                        if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                        handled = ps_buffer_write_index(vm, obj, prop, value, ctl);
+                        if (handled < 0) goto handle_throw;
+                        if (handled > 0) {
+                            stack[sp++] = value;
+                            ip++;
+                            break;
+                        }
+                        ps_object_put(obj, prop, value);
+                        stack[sp++] = value;
+                        ip++;
+                        break;
+                    } else if (obj && obj->kind == PS_OBJ_KIND_BUFFER32) {
+                        int handled = ps_buffer32_write_index_value(vm, obj, key_val, value, ctl);
+                        if (handled < 0) goto handle_throw;
+                        if (handled > 0) {
+                            stack[sp++] = value;
+                            ip++;
+                            break;
+                        }
+                        prop = ps_to_string(vm, key_val);
+                        if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                        handled = ps_buffer32_write_index(vm, obj, prop, value, ctl);
+                        if (handled < 0) goto handle_throw;
+                        if (handled > 0) {
+                            stack[sp++] = value;
+                            ip++;
+                            break;
+                        }
+                        ps_object_put(obj, prop, value);
+                        stack[sp++] = value;
+                        ip++;
+                        break;
+                    }
+                    if (key_val.type == PS_T_STRING) {
+                        prop = key_val.as.string;
+                    } else {
+                        prop = ps_to_string(vm, key_val);
+                    }
+                } else {
+                    PSString tmp_prop;
+                    char tmp_buf[96];
+                    prop = ps_member_key_read(vm, env, member, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
+                }
+                if (ctl->did_throw || ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                if (obj->kind == PS_OBJ_KIND_ARRAY && ps_string_is_length(prop)) {
+                    int ok = ps_array_set_length(vm, obj, value, ctl);
+                    if (ok < 0) goto handle_throw;
+                    stack[sp++] = value;
+                    ip++;
+                    break;
+                }
+                ps_object_put(obj, prop, value);
+                ps_array_update_length(obj, prop);
+                (void)ps_env_update_arguments(env, obj, prop, value);
+                stack[sp++] = value;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_NOT:
+                if (sp == 0) goto fail;
+                stack[sp - 1] = ps_value_boolean(!ps_to_boolean(vm, stack[sp - 1]));
+                ip++;
+                break;
+            case STMT_BC_EXPR_BIT_NOT: {
+                if (sp == 0) goto fail;
+                int32_t v = ps_to_int32_fast(vm, stack[sp - 1]);
+                if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                stack[sp - 1] = ps_value_number((double)(~v));
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_DELETE: {
+                PSAstNode *mem = (PSAstNode *)ins->ptr;
+                if (!mem || mem->kind != AST_MEMBER) goto fail;
+                PSValue obj_val = ps_stmt_bc_eval_expr(vm, env, mem->as.member.object, ctl);
+                if (ctl->did_throw) goto fail;
+                PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                if (ctl->did_throw) goto fail;
+                if (obj && obj->kind == PS_OBJ_KIND_ARRAY && mem->as.member.computed) {
+                    PSValue key_val = ps_stmt_bc_eval_expr(vm, env, mem->as.member.property, ctl);
+                    if (ctl->did_throw) goto fail;
+                    size_t index = 0;
+                    int idx = ps_value_to_array_index(vm, key_val, &index, ctl);
+                    if (idx < 0) goto fail;
+                    if (idx > 0) {
+                        (void)ps_array_delete_index(obj, index);
+                        stack[sp++] = ps_value_boolean(1);
+                        ip++;
+                        break;
+                    }
+                }
+                PSString *prop = ps_member_key(vm, env, mem, ctl);
+                if (ctl->did_throw) goto fail;
+                int deleted = 0;
+                int ok = ps_object_delete(obj, prop, &deleted);
+                stack[sp++] = ps_value_boolean(ok ? 1 : 0);
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_TYPEOF: {
+                PSAstNode *node = (PSAstNode *)ins->ptr;
+                PSValue v = ps_value_undefined();
+                int found = 0;
+                if (node && node->kind == AST_IDENTIFIER) {
+                    if (!ps_identifier_cached_get(env, node, &v, &found)) {
+                        PSString *name = ps_identifier_string(node);
+                        v = ps_env_get(env, name, &found);
+                    }
+                    if (!found) {
+                        stack[sp++] = ps_value_string(ps_string_from_cstr("undefined"));
+                        ip++;
+                        break;
+                    }
+                } else {
+                    v = ps_stmt_bc_eval_expr(vm, env, node, ctl);
+                    if (ctl->did_throw) goto fail;
+                }
+                const char *name = "undefined";
+                switch (v.type) {
+                    case PS_T_UNDEFINED: name = "undefined"; break;
+                    case PS_T_NULL: name = "object"; break;
+                    case PS_T_BOOLEAN: name = "boolean"; break;
+                    case PS_T_NUMBER: name = "number"; break;
+                    case PS_T_STRING: name = "string"; break;
+                    case PS_T_OBJECT:
+                        name = (v.as.object && v.as.object->kind == PS_OBJ_KIND_FUNCTION)
+                            ? "function"
+                            : "object";
+                        break;
+                }
+                stack[sp++] = ps_value_string(ps_string_from_cstr(name));
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_EVAL_AST: {
+                PSAstNode *node = (PSAstNode *)ins->ptr;
+                PSValue v = eval_expression(vm, env, node, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = v;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_DUP:
+                if (sp == 0) goto fail;
+                stack[sp] = stack[sp - 1];
+                sp++;
+                ip++;
+                break;
+            case STMT_BC_EXPR_POP:
+                if (sp == 0) goto fail;
+                sp--;
+                ip++;
+                break;
+            case STMT_BC_STMT_EVAL_AST: {
+                PSAstNode *node = (PSAstNode *)ins->ptr;
+                PSValue v = eval_node(vm, env, node, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                if (ctl->did_return) {
+                    UNWIND_ENVS();
+                    FREE_HANDLER_STACK();
+                    if (stack != stack_buf) free(stack);
+                    return v;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_FOR_IN_INIT: {
+                if (sp == 0) goto fail;
+                PSValue obj_val = stack[--sp];
+                PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                if (ctl->did_throw) goto fail;
+                PSObject *arr = ps_for_in_collect_array(vm, obj);
+                if (!arr) goto fail;
+                stack[sp++] = ps_value_object(arr);
+                stack[sp++] = ps_value_number(0);
+                ip++;
+                break;
+            }
+            case STMT_BC_FOR_IN_NEXT: {
+                if (sp < 2) goto fail;
+                PSValue idx_val = stack[sp - 1];
+                PSValue arr_val = stack[sp - 2];
+                if (arr_val.type != PS_T_OBJECT || !arr_val.as.object ||
+                    arr_val.as.object->kind != PS_OBJ_KIND_ARRAY) {
+                    goto fail;
+                }
+                double idx_num = ps_to_number_fast(vm, idx_val);
+                if (ps_check_pending_throw(vm, ctl)) goto fail;
+                if (idx_num < 0) idx_num = 0;
+                size_t idx = (size_t)idx_num;
+                size_t len = ps_array_length(arr_val.as.object);
+                if (idx >= len) {
+                    stack[sp++] = ps_value_boolean(0);
+                    ip++;
+                    break;
+                }
+                PSValue key = ps_value_undefined();
+                (void)ps_array_get_index(arr_val.as.object, idx, &key);
+                stack[sp - 1] = ps_value_number((double)(idx + 1));
+                stack[sp++] = key;
+                stack[sp++] = ps_value_boolean(1);
+                ip++;
+                break;
+            }
+            case STMT_BC_FOR_IN_ASSIGN: {
+                if (sp == 0) goto fail;
+                PSValue key = stack[--sp];
+                PSAstNode *target = (PSAstNode *)ins->ptr;
+                int is_var = ins->a ? 1 : 0;
+                if (!target) goto fail;
+                if (target->kind == AST_IDENTIFIER) {
+                    PSString *name = ps_identifier_string(target);
+                    if (name) {
+                        if (is_var) {
+                            ps_env_define(env, name, key);
+                        } else {
+                            ps_env_set(env, name, key);
+                        }
+                    }
+                } else if (target->kind == AST_MEMBER) {
+                    PSValue obj_val = ps_stmt_bc_eval_expr(vm, env, target->as.member.object, ctl);
+                    if (ctl->did_throw) goto fail;
+                    PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                    if (ctl->did_throw) goto fail;
+                    PSString *prop = ps_member_key(vm, env, target, ctl);
+                    if (ctl->did_throw) goto fail;
+                    ps_object_put(obj, prop, key);
+                    (void)ps_env_update_arguments(env, obj, prop, key);
+                } else {
+                    goto fail;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_WITH_ENTER: {
+                if (sp == 0) goto fail;
+                PSValue obj_val = stack[--sp];
+                PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                if (ctl->did_throw) goto fail;
+                PSEnv *with_env = ps_env_new(env, obj, 0);
+                if (!with_env) goto fail;
+                with_env->is_with = 1;
+                if (env_sp == env_cap) {
+                    size_t new_cap = env_cap * 2;
+                    PSEnv **next = (PSEnv **)malloc(sizeof(PSEnv *) * new_cap);
+                    if (!next) {
+                        ps_env_free(with_env);
+                        goto fail;
+                    }
+                    memcpy(next, env_stack, sizeof(PSEnv *) * env_cap);
+                    if (env_stack != env_stack_buf) free(env_stack);
+                    env_stack = next;
+                    env_cap = new_cap;
+                }
+                env_stack[env_sp++] = env;
+                env = with_env;
+                ip++;
+                break;
+            }
+            case STMT_BC_WITH_EXIT: {
+                if (env_sp == 0) goto fail;
+                PSEnv *prev = env_stack[--env_sp];
+                if (env) ps_env_free(env);
+                env = prev;
+                ip++;
+                break;
+            }
+            case STMT_BC_TRY_PUSH: {
+                if (handler_sp == handler_cap) {
+                    size_t new_cap = handler_cap * 2;
+                    PSTryHandler *next = (PSTryHandler *)malloc(sizeof(PSTryHandler) * new_cap);
+                    if (!next) goto fail;
+                    memcpy(next, handler_stack, sizeof(PSTryHandler) * handler_cap);
+                    if (handler_stack != handler_stack_buf) free(handler_stack);
+                    handler_stack = next;
+                    handler_cap = new_cap;
+                }
+                PSTryHandler h;
+                h.catch_ip = (size_t)ins->a;
+                h.finally_ip = (size_t)(intptr_t)ins->ptr;
+                h.catch_param = (PSAstNode *)ins->ptr2;
+                handler_stack[handler_sp++] = h;
+                ip++;
+                break;
+            }
+            case STMT_BC_TRY_POP:
+                if (handler_sp == 0) goto fail;
+                handler_sp--;
+                ip++;
+                break;
+            case STMT_BC_CATCH_ENTER: {
+                if (handler_sp == 0) goto fail;
+                PSTryHandler *h = &handler_stack[handler_sp - 1];
+                PSEnv *catch_env = ps_env_new_object(env);
+                if (!catch_env) goto fail;
+                if (h->catch_param) {
+                    PSString *name = ps_identifier_string(h->catch_param);
+                    if (name) {
+                        ps_env_define(catch_env, name, ctl->throw_value);
+                    }
+                }
+                ctl->did_throw = 0;
+                h->catch_ip = (size_t)-1;
+                if (env_sp == env_cap) {
+                    size_t new_cap = env_cap * 2;
+                    PSEnv **next = (PSEnv **)malloc(sizeof(PSEnv *) * new_cap);
+                    if (!next) {
+                        ps_env_free(catch_env);
+                        goto fail;
+                    }
+                    memcpy(next, env_stack, sizeof(PSEnv *) * env_cap);
+                    if (env_stack != env_stack_buf) free(env_stack);
+                    env_stack = next;
+                    env_cap = new_cap;
+                }
+                env_stack[env_sp++] = env;
+                env = catch_env;
+                ip++;
+                break;
+            }
+            case STMT_BC_CATCH_EXIT: {
+                if (env_sp == 0) goto fail;
+                PSEnv *prev = env_stack[--env_sp];
+                if (env) ps_env_free(env);
+                env = prev;
+                ip++;
+                break;
+            }
+            case STMT_BC_THROW: {
+                if (sp == 0) goto fail;
+                PSValue v = stack[--sp];
+                ctl->did_throw = 1;
+                ctl->throw_value = v;
+                goto handle_throw;
+            }
+            case STMT_BC_FINALLY_EXIT: {
+                if (handler_sp == 0) goto fail;
+                handler_sp--;
+                if (pending_throw) {
+                    ctl->did_throw = 1;
+                    ctl->throw_value = pending_throw_value;
+                    pending_throw = 0;
+                    goto handle_throw;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_JUMP:
+                ip = (size_t)ins->a;
+                break;
+            case STMT_BC_JUMP_IF_FALSE: {
+                if (sp == 0) goto fail;
+                PSValue v = stack[--sp];
+                if (!ps_to_boolean(vm, v)) {
+                    ip = (size_t)ins->a;
+                } else {
+                    ip++;
+                }
+                break;
+            }
+            case STMT_BC_JUMP_IF_TRUE: {
+                if (sp == 0) goto fail;
+                PSValue v = stack[--sp];
+                if (ps_to_boolean(vm, v)) {
+                    ip = (size_t)ins->a;
+                } else {
+                    ip++;
+                }
+                break;
+            }
+#if !PS_DISABLE_CF_FUSIONS
+            case STMT_BC_JLT_IDENT_CONST: {
+                PSAstNode *id = (PSAstNode *)ins->ptr;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue left = ps_value_undefined();
+                if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+                PSValue right = bc->consts[ins->a];
+                int take = 0;
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    take = !(left.as.number < right.as.number);
+                } else {
+                    PSValue out = ps_eval_binary_values(vm, TOK_LT, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                    take = !ps_to_boolean(vm, out);
+                }
+                if (take) {
+                    ip = (size_t)(intptr_t)ins->ptr2;
+                } else {
+                    ip++;
+                }
+                break;
+            }
+            case STMT_BC_JBITAND_EQZ_IDENT_CONST: {
+                PSAstNode *id = (PSAstNode *)ins->ptr;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue left = ps_value_undefined();
+                if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+                PSValue right = bc->consts[ins->a];
+                int32_t ln = ps_to_int32_fast(vm, left);
+                if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                int32_t rn = ps_to_int32_fast(vm, right);
+                if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                if ((ln & rn) != 0) {
+                    ip = (size_t)(intptr_t)ins->ptr2;
+                } else {
+                    ip++;
+                }
+                break;
+            }
+            case STMT_BC_JUMP_ADD_IDENT_CONST: {
+                PSAstNode *id = (PSAstNode *)ins->ptr;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue left = ps_value_undefined();
+                if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+                PSValue right = bc->consts[ins->a];
+                PSValue out = ps_value_undefined();
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    out = ps_value_number(left.as.number + right.as.number);
+                } else {
+                    out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                }
+                if (!ps_identifier_cached_set(env, id, out)) {
+                    PSString *name = ps_identifier_string(id);
+                    if (name) ps_env_set(env, name, out);
+                }
+                ip = (size_t)(intptr_t)ins->ptr2;
+                break;
+            }
+#endif
+            case STMT_BC_RETURN_VALUE: {
+                if (sp == 0) goto fail;
+                PSValue v = stack[--sp];
+                ctl->did_return = 1;
+                UNBOXED_WRITEBACK();
+                UNWIND_ENVS();
+                FREE_HANDLER_STACK();
+                if (stack != stack_buf) free(stack);
+                return v;
+            }
+            case STMT_BC_RETURN_VOID:
+                ctl->did_return = 1;
+                UNBOXED_WRITEBACK();
+                UNWIND_ENVS();
+                FREE_HANDLER_STACK();
+                if (stack != stack_buf) free(stack);
+                return ps_value_undefined();
+#if !PS_DISABLE_SPECIALIZATION
+            case STMT_BC_EXPR_LOAD_SLOT_NUM:
+                stack[sp++] = slot_values[ins->a];
+                ip++;
+                break;
+            case STMT_BC_EXPR_STORE_SLOT_NUM:
+                if (sp == 0) goto fail;
+                slot_values[ins->a] = stack[sp - 1];
+                ip++;
+                break;
+            case STMT_BC_EXPR_ADD_NUM: {
+                int lhs = (int)(intptr_t)ins->ptr;
+                PSValue left = slot_values[lhs];
+                PSValue right = ps_value_undefined();
+                if (ins->flags) {
+                    int const_idx = (int)(intptr_t)ins->ptr2;
+                    if (const_idx < 0 || (size_t)const_idx >= bc->const_count) goto fail;
+                    right = bc->consts[const_idx];
+                } else {
+                    int rhs = (int)(intptr_t)ins->ptr2;
+                    right = slot_values[rhs];
+                }
+                PSValue out = ps_value_number(left.as.number + right.as.number);
+                slot_values[ins->a] = out;
+                stack[sp++] = out;
+                ip++;
+                break;
+            }
+#endif
+#if !PS_DISABLE_UNBOXED_SPEC
+            case STMT_BC_UNBOX_LOAD_SLOT_D:
+                stack[sp++] = ps_value_number(unboxed_d[ins->a]);
+                ip++;
+                break;
+            case STMT_BC_UNBOX_STORE_SLOT_D:
+                if (sp == 0) goto fail;
+                unboxed_d[ins->a] = stack[sp - 1].as.number;
+                ip++;
+                break;
+            case STMT_BC_UNBOX_ADD_SLOT_D_SLOT_D: {
+                int dst = ins->a;
+                int lhs = (int)(intptr_t)ins->ptr;
+                int rhs = (int)(intptr_t)ins->ptr2;
+                unboxed_d[dst] = unboxed_d[lhs] + unboxed_d[rhs];
+                ip++;
+                break;
+            }
+            case STMT_BC_UNBOX_ADD_SLOT_D_CONST: {
+                int dst = ins->a;
+                int lhs = (int)(intptr_t)ins->ptr;
+                int const_idx = (int)(intptr_t)ins->ptr2;
+                unboxed_d[dst] = unboxed_d[lhs] + bc->consts[const_idx].as.number;
+                ip++;
+                break;
+            }
+            case STMT_BC_UNBOX_JLT_SLOT_D_CONST: {
+                int slot = (int)(intptr_t)ins->ptr;
+                int const_idx = ins->a;
+                if (unboxed_d[slot] < bc->consts[const_idx].as.number) {
+                    ip = (size_t)(intptr_t)ins->ptr2;
+                } else {
+                    ip++;
+                }
+                break;
+            }
+            case STMT_BC_UNBOX_JBITAND_EQZ_SLOT_D_CONST: {
+                int slot = (int)(intptr_t)ins->ptr;
+                int const_idx = ins->a;
+                int32_t ln = (int32_t)unboxed_d[slot];
+                int32_t rn = (int32_t)bc->consts[const_idx].as.number;
+                if ((ln & rn) != 0) {
+                    ip = (size_t)(intptr_t)ins->ptr2;
+                } else {
+                    ip++;
+                }
+                break;
+            }
+            case STMT_BC_UNBOX_JUMP_ADD_SLOT_D_CONST: {
+                int slot = (int)(intptr_t)ins->ptr;
+                int const_idx = ins->a;
+                unboxed_d[slot] += bc->consts[const_idx].as.number;
+                ip = (size_t)(intptr_t)ins->ptr2;
+                break;
+            }
+#endif
+            default:
+                goto fail;
+        }
+    }
+handle_throw:
+    if (handler_sp == 0) goto fail;
+    {
+        PSTryHandler *h = &handler_stack[handler_sp - 1];
+        if (h->catch_ip != (size_t)-1) {
+            pending_throw = 0;
+            ip = h->catch_ip;
+            goto loop_top;
+        }
+        if (h->finally_ip != (size_t)-1) {
+            pending_throw = 1;
+            pending_throw_value = ctl->throw_value;
+            ctl->did_throw = 0;
+            ip = h->finally_ip;
+            goto loop_top;
+        }
+        handler_sp--;
+    }
+    goto fail;
+    UNWIND_ENVS();
+    FREE_HANDLER_STACK();
+    if (stack != stack_buf) free(stack);
+    return ps_value_undefined();
+fail:
+    UNBOXED_WRITEBACK();
+    UNWIND_ENVS();
+    FREE_HANDLER_STACK();
+    if (stack != stack_buf) free(stack);
+    return ctl->did_throw ? ctl->throw_value : ps_value_undefined();
+#undef UNWIND_ENVS
+#undef FREE_HANDLER_STACK
+#endif
+}
+
+/* --------------------------------------------------------- */
 /* Expressions                                               */
 /* --------------------------------------------------------- */
 
+static PSValue ps_eval_binary_values(PSVM *vm,
+                                     int op,
+                                     PSValue left,
+                                     PSValue right,
+                                     PSEvalControl *ctl) {
+    switch (op) {
+        case TOK_PLUS:
+        {
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                return ps_value_number(left.as.number + right.as.number);
+            }
+            PSValue lprim = ps_to_primitive(vm, left, PS_HINT_NONE);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            PSValue rprim = ps_to_primitive(vm, right, PS_HINT_NONE);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            if (lprim.type == PS_T_STRING || rprim.type == PS_T_STRING) {
+                if (lprim.type == PS_T_STRING && rprim.type == PS_T_NUMBER) {
+                    PSString *out = ps_concat_string_number(vm, lprim.as.string, rprim.as.number, 0);
+                    return ps_value_string(out ? out : ps_string_from_cstr(""));
+                }
+                if (lprim.type == PS_T_NUMBER && rprim.type == PS_T_STRING) {
+                    PSString *out = ps_concat_string_number(vm, rprim.as.string, lprim.as.number, 1);
+                    return ps_value_string(out ? out : ps_string_from_cstr(""));
+                }
+                PSString *ls = ps_to_string(vm, lprim);
+                if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                PSString *rs = ps_to_string(vm, rprim);
+                if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                return ps_value_string(ps_string_concat(ls, rs));
+            }
+            return ps_value_number(ps_to_number(vm, lprim) + ps_to_number(vm, rprim));
+        }
+        case TOK_MINUS:
+        {
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                return ps_value_number(left.as.number - right.as.number);
+            }
+            double ln = ps_to_number_fast(vm, left);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            double rn = ps_to_number_fast(vm, right);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            return ps_value_number(ln - rn);
+        }
+        case TOK_STAR:
+        {
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                return ps_value_number(left.as.number * right.as.number);
+            }
+            double ln = ps_to_number_fast(vm, left);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            double rn = ps_to_number_fast(vm, right);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            return ps_value_number(ln * rn);
+        }
+        case TOK_SLASH:
+        {
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                return ps_value_number(left.as.number / right.as.number);
+            }
+            double ln = ps_to_number_fast(vm, left);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            double rn = ps_to_number_fast(vm, right);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            return ps_value_number(ln / rn);
+        }
+        case TOK_PERCENT:
+        {
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                return ps_value_number(fmod(left.as.number, right.as.number));
+            }
+            double ln = ps_to_number_fast(vm, left);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            double rn = ps_to_number_fast(vm, right);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            return ps_value_number(fmod(ln, rn));
+        }
+        case TOK_LT:
+        case TOK_LTE:
+        case TOK_GT:
+        case TOK_GTE: {
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                double ln = left.as.number;
+                double rn = right.as.number;
+                if (ps_value_is_nan(ln) || ps_value_is_nan(rn)) return ps_value_boolean(0);
+                if (op == TOK_LT) return ps_value_boolean(ln < rn);
+                if (op == TOK_LTE) return ps_value_boolean(ln <= rn);
+                if (op == TOK_GT) return ps_value_boolean(ln > rn);
+                return ps_value_boolean(ln >= rn);
+            }
+            PSValue lprim = ps_to_primitive(vm, left, PS_HINT_NUMBER);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            PSValue rprim = ps_to_primitive(vm, right, PS_HINT_NUMBER);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            if (lprim.type == PS_T_STRING && rprim.type == PS_T_STRING) {
+                int cmp = ps_string_compare(lprim.as.string, rprim.as.string);
+                if (op == TOK_LT) return ps_value_boolean(cmp < 0);
+                if (op == TOK_LTE) return ps_value_boolean(cmp <= 0);
+                if (op == TOK_GT) return ps_value_boolean(cmp > 0);
+                return ps_value_boolean(cmp >= 0);
+            }
+            double ln = ps_to_number(vm, lprim);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            double rn = ps_to_number(vm, rprim);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            if (ps_value_is_nan(ln) || ps_value_is_nan(rn)) return ps_value_boolean(0);
+            if (op == TOK_LT) return ps_value_boolean(ln < rn);
+            if (op == TOK_LTE) return ps_value_boolean(ln <= rn);
+            if (op == TOK_GT) return ps_value_boolean(ln > rn);
+            return ps_value_boolean(ln >= rn);
+        }
+        case TOK_INSTANCEOF: {
+            if (right.type != PS_T_OBJECT || !right.as.object ||
+                right.as.object->kind != PS_OBJ_KIND_FUNCTION) {
+                ctl->did_throw = 1;
+                ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Right-hand side of instanceof is not callable");
+                return ctl->throw_value;
+            }
+            if (left.type != PS_T_OBJECT || !left.as.object) {
+                return ps_value_boolean(0);
+            }
+            PSString *proto_key = ps_string_from_cstr("prototype");
+            int found = 0;
+            PSValue proto_val = ps_object_get(right.as.object, proto_key, &found);
+            if (!found || proto_val.type != PS_T_OBJECT || !proto_val.as.object) {
+                ctl->did_throw = 1;
+                ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Function has invalid prototype");
+                return ctl->throw_value;
+            }
+            PSObject *target = proto_val.as.object;
+            PSObject *obj = left.as.object;
+            while (obj) {
+                if (obj->prototype == target) {
+                    return ps_value_boolean(1);
+                }
+                obj = obj->prototype;
+            }
+            return ps_value_boolean(0);
+        }
+        case TOK_IN: {
+            if (right.type != PS_T_OBJECT || !right.as.object) {
+                ctl->did_throw = 1;
+                ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Right-hand side of in is not an object");
+                return ctl->throw_value;
+            }
+            PSString *key = ps_to_string(vm, left);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            if (!key) return ps_value_boolean(0);
+            return ps_value_boolean(ps_object_has(right.as.object, key));
+        }
+        case TOK_EQ:
+        {
+            int eq = ps_abstract_equals(vm, &left, &right, ctl);
+            if (ctl->did_throw) return ctl->throw_value;
+            return ps_value_boolean(eq);
+        }
+        case TOK_NEQ:
+        {
+            int eq = ps_abstract_equals(vm, &left, &right, ctl);
+            if (ctl->did_throw) return ctl->throw_value;
+            return ps_value_boolean(!eq);
+        }
+        case TOK_STRICT_EQ:
+            return ps_value_boolean(ps_strict_equals(&left, &right));
+        case TOK_STRICT_NEQ:
+            return ps_value_boolean(!ps_strict_equals(&left, &right));
+        case TOK_AND:
+        {
+            int32_t ln = ps_to_int32_fast(vm, left);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            int32_t rn = ps_to_int32_fast(vm, right);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            return ps_value_number((double)(ln & rn));
+        }
+        case TOK_OR:
+        {
+            int32_t ln = ps_to_int32_fast(vm, left);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            int32_t rn = ps_to_int32_fast(vm, right);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            return ps_value_number((double)(ln | rn));
+        }
+        case TOK_XOR:
+        {
+            int32_t ln = ps_to_int32_fast(vm, left);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            int32_t rn = ps_to_int32_fast(vm, right);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            return ps_value_number((double)(ln ^ rn));
+        }
+        case TOK_SHL:
+        {
+            int32_t ln = ps_to_int32_fast(vm, left);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            uint32_t rn = ps_to_uint32_fast(vm, right);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            return ps_value_number((double)(ln << (rn & 31)));
+        }
+        case TOK_SHR:
+        {
+            int32_t ln = ps_to_int32_fast(vm, left);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            uint32_t rn = ps_to_uint32_fast(vm, right);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            return ps_value_number((double)(ln >> (rn & 31)));
+        }
+        case TOK_USHR:
+        {
+            uint32_t ln = ps_to_uint32_fast(vm, left);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            uint32_t rn = ps_to_uint32_fast(vm, right);
+            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+            return ps_value_number((double)(ln >> (rn & 31)));
+        }
+        default:
+            fprintf(stderr, "Unsupported binary operator\n");
+            return ps_value_undefined();
+    }
+}
+
 static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *ctl) {
+    return eval_expression_inner(vm, env, node, ctl, 1);
+}
+
+static PSValue eval_expression_inner(PSVM *vm,
+                                     PSEnv *env,
+                                     PSAstNode *node,
+                                     PSEvalControl *ctl,
+                                     int allow_bc) {
     if (vm) {
         vm->current_node = node;
+#if PS_ENABLE_PERF
+        vm->perf.eval_expr_count++;
+        if (node && node->kind < PS_AST_KIND_COUNT) {
+            vm->perf.ast_counts[node->kind]++;
+        }
+#endif
     }
+    (void)allow_bc;
     switch (node->kind) {
 
         case AST_LITERAL:
@@ -1963,19 +11272,22 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             PSObject *arr = ps_object_new(vm->array_proto ? vm->array_proto : vm->object_proto);
             if (!arr) return ps_value_undefined();
             arr->kind = PS_OBJ_KIND_ARRAY;
+            (void)ps_array_init(arr);
+            for (size_t i = 0; i < node->as.array_literal.count; i++) {
+                if (!node->as.array_literal.items[i]) {
+                    PSArray *inner = ps_array_from_object(arr);
+                    if (inner) inner->dense = 0;
+                    break;
+                }
+            }
             for (size_t i = 0; i < node->as.array_literal.count; i++) {
                 if (node->as.array_literal.items[i]) {
                     PSValue v = eval_expression(vm, env, node->as.array_literal.items[i], ctl);
                     if (ctl->did_throw) return v;
-                    char buf[32];
-                    snprintf(buf, sizeof(buf), "%zu", i);
-                    ps_object_define(arr, ps_string_from_cstr(buf), v, PS_ATTR_NONE);
+                    (void)ps_array_set_index(arr, i, v);
                 }
             }
-            ps_object_define(arr,
-                             ps_string_from_cstr("length"),
-                             ps_value_number((double)node->as.array_literal.count),
-                             PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
+            (void)ps_array_set_length_internal(arr, node->as.array_literal.count);
             return ps_value_object(arr);
         }
 
@@ -1992,8 +11304,11 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
 
         case AST_IDENTIFIER: {
             PSString *name = ps_identifier_string(node);
-            int found;
-            PSValue v = ps_env_get(env, name, &found);
+            int found = 0;
+            PSValue v = ps_value_undefined();
+            if (!ps_identifier_cached_get(env, node, &v, &found)) {
+                v = ps_env_get(env, name, &found);
+            }
             if (!found) {
                 ctl->did_throw = 1;
                 const char *prefix = "Identifier not defined: ";
@@ -2036,27 +11351,123 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             if (node->as.assign.op != TOK_ASSIGN) {
                 PSValue current = ps_value_undefined();
                 if (node->as.assign.target->kind == AST_IDENTIFIER) {
-                    PSString *name = ps_identifier_string(node->as.assign.target);
-                    int found;
-                    current = ps_env_get(env, name, &found);
+                    int found = 0;
+                    if (!ps_identifier_cached_get(env, node->as.assign.target, &current, &found)) {
+                        PSString *name = ps_identifier_string(node->as.assign.target);
+                        current = ps_env_get(env, name, &found);
+                    }
                 } else if (node->as.assign.target->kind == AST_MEMBER) {
                     PSValue obj_val = eval_expression(vm, env, node->as.assign.target->as.member.object, ctl);
                     if (ctl->did_throw) return obj_val;
                     PSObject *obj = ps_to_object(vm, &obj_val, ctl);
                     if (ctl->did_throw) return ctl->throw_value;
-                    PSString *prop = ps_member_key(vm, env, node->as.assign.target, ctl);
-                    if (ctl->did_throw) return ctl->throw_value;
-                    int handled = ps_buffer_read_index(vm, obj, prop, &current, ctl);
-                    if (handled < 0) return ctl->throw_value;
-                    if (handled == 0) {
-                        int found;
-                        current = ps_object_get(obj, prop, &found);
+                    if (obj && obj->kind == PS_OBJ_KIND_BUFFER && node->as.assign.target->as.member.computed) {
+                        PSValue key_val = eval_expression(vm, env, node->as.assign.target->as.member.property, ctl);
+                        if (ctl->did_throw) return ctl->throw_value;
+                        int handled = ps_buffer_read_index_value(vm, obj, key_val, &current, ctl);
+                        if (handled < 0) return ctl->throw_value;
+                        if (handled == 0) {
+                            PSString *prop = ps_to_string(vm, key_val);
+                            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                            handled = ps_buffer_read_index(vm, obj, prop, &current, ctl);
+                            if (handled < 0) return ctl->throw_value;
+                            if (handled == 0) {
+                                int found;
+                                current = ps_object_get(obj, prop, &found);
+                            }
+                        }
+                    } else if (obj && obj->kind == PS_OBJ_KIND_BUFFER32 && node->as.assign.target->as.member.computed) {
+                        PSValue key_val = eval_expression(vm, env, node->as.assign.target->as.member.property, ctl);
+                        if (ctl->did_throw) return ctl->throw_value;
+                        int handled = ps_buffer32_read_index_value(vm, obj, key_val, &current, ctl);
+                        if (handled < 0) return ctl->throw_value;
+                        if (handled == 0) {
+                            PSString *prop = ps_to_string(vm, key_val);
+                            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                            handled = ps_buffer32_read_index(vm, obj, prop, &current, ctl);
+                            if (handled < 0) return ctl->throw_value;
+                            if (handled == 0) {
+                                int found;
+                                current = ps_object_get(obj, prop, &found);
+                            }
+                        }
+                    } else if (obj && obj->kind == PS_OBJ_KIND_ARRAY && node->as.assign.target->as.member.computed) {
+                        PSValue key_val = eval_expression(vm, env, node->as.assign.target->as.member.property, ctl);
+                        if (ctl->did_throw) return ctl->throw_value;
+                        size_t index = 0;
+                        int handled = ps_array_read_index_fast_value(obj, key_val, &current, &index);
+                        if (handled < 0) {
+                            PSString *prop = ps_array_index_string(vm, index);
+                            if (!ps_member_cached_get(obj, node->as.assign.target, prop, &current)) {
+                                int found;
+                                current = ps_object_get(obj, prop, &found);
+                            }
+                        } else if (handled == 0) {
+                            handled = ps_array_read_index_value(vm, obj, key_val, &current, ctl);
+                            if (handled < 0) return ctl->throw_value;
+                            if (handled == 0) {
+                                PSString *prop = ps_to_string(vm, key_val);
+                                if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                                if (!ps_member_cached_get(obj, node->as.assign.target, prop, &current)) {
+                                    int found;
+                                    current = ps_object_get(obj, prop, &found);
+                                }
+                            }
+                        }
+                    } else if (obj && obj->kind == PS_OBJ_KIND_PLAIN && node->as.assign.target->as.member.computed) {
+                        PSValue key_val = eval_expression(vm, env, node->as.assign.target->as.member.property, ctl);
+                        if (ctl->did_throw) return ctl->throw_value;
+                        size_t index = 0;
+                        int idx = ps_value_to_index(vm, key_val, &index, ctl);
+                        if (idx < 0) return ctl->throw_value;
+                        if (idx > 0 && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                            PSValue out = ps_value_undefined();
+                            if (ps_num_map_get(obj, index, &out)) {
+                                current = out;
+                            } else {
+                                current = ps_value_undefined();
+                            }
+                        } else {
+                            int got_k = 0;
+                            if (key_val.type == PS_T_STRING && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                                uint32_t kindex = 0;
+                                if (ps_string_to_k_index(key_val.as.string, &kindex)) {
+                                    PSValue out = ps_value_undefined();
+                                    if (ps_num_map_k_get(obj, kindex, &out)) {
+                                        current = out;
+                                        got_k = 1;
+                                    }
+                                }
+                            }
+                            if (!got_k) {
+                                PSString *prop = (key_val.type == PS_T_STRING) ? key_val.as.string
+                                                                             : ps_to_string(vm, key_val);
+                                if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                                int found;
+                                current = ps_object_get(obj, prop, &found);
+                            }
+                        }
+                    } else {
+                        PSString *prop = ps_member_key(vm, env, node->as.assign.target, ctl);
+                        if (ctl->did_throw) return ctl->throw_value;
+                        int handled = ps_buffer_read_index(vm, obj, prop, &current, ctl);
+                        if (handled < 0) return ctl->throw_value;
+                        if (handled == 0) {
+                            if (!ps_member_cached_get(obj, node->as.assign.target, prop, &current)) {
+                                int found;
+                                current = ps_object_get(obj, prop, &found);
+                            }
+                        }
                     }
                 }
 
                 switch (node->as.assign.op) {
                     case TOK_PLUS_ASSIGN:
                     {
+                        if (current.type == PS_T_NUMBER && rhs.type == PS_T_NUMBER) {
+                            new_value = ps_value_number(current.as.number + rhs.as.number);
+                            break;
+                        }
                         PSValue lprim = ps_to_primitive(vm, current, PS_HINT_NONE);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         PSValue rprim = ps_to_primitive(vm, rhs, PS_HINT_NONE);
@@ -2078,90 +11489,106 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                     }
                     case TOK_MINUS_ASSIGN:
                     {
-                        double ln = ps_to_number(vm, current);
+                        if (current.type == PS_T_NUMBER && rhs.type == PS_T_NUMBER) {
+                            new_value = ps_value_number(current.as.number - rhs.as.number);
+                            break;
+                        }
+                        double ln = ps_to_number_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        double rn = ps_to_number(vm, rhs);
+                        double rn = ps_to_number_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number(ln - rn);
                         break;
                     }
                     case TOK_STAR_ASSIGN:
                     {
-                        double ln = ps_to_number(vm, current);
+                        if (current.type == PS_T_NUMBER && rhs.type == PS_T_NUMBER) {
+                            new_value = ps_value_number(current.as.number * rhs.as.number);
+                            break;
+                        }
+                        double ln = ps_to_number_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        double rn = ps_to_number(vm, rhs);
+                        double rn = ps_to_number_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number(ln * rn);
                         break;
                     }
                     case TOK_SLASH_ASSIGN:
                     {
-                        double ln = ps_to_number(vm, current);
+                        if (current.type == PS_T_NUMBER && rhs.type == PS_T_NUMBER) {
+                            new_value = ps_value_number(current.as.number / rhs.as.number);
+                            break;
+                        }
+                        double ln = ps_to_number_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        double rn = ps_to_number(vm, rhs);
+                        double rn = ps_to_number_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number(ln / rn);
                         break;
                     }
                     case TOK_PERCENT_ASSIGN:
                     {
-                        double ln = ps_to_number(vm, current);
+                        if (current.type == PS_T_NUMBER && rhs.type == PS_T_NUMBER) {
+                            new_value = ps_value_number(fmod(current.as.number, rhs.as.number));
+                            break;
+                        }
+                        double ln = ps_to_number_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        double rn = ps_to_number(vm, rhs);
+                        double rn = ps_to_number_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number(fmod(ln, rn));
                         break;
                     }
                     case TOK_SHL_ASSIGN:
                     {
-                        int32_t ln = ps_to_int32(vm, &current);
+                        int32_t ln = ps_to_int32_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        uint32_t rn = ps_to_uint32(vm, &rhs);
+                        uint32_t rn = ps_to_uint32_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number((double)(ln << (rn & 31)));
                         break;
                     }
                     case TOK_SHR_ASSIGN:
                     {
-                        int32_t ln = ps_to_int32(vm, &current);
+                        int32_t ln = ps_to_int32_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        uint32_t rn = ps_to_uint32(vm, &rhs);
+                        uint32_t rn = ps_to_uint32_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number((double)(ln >> (rn & 31)));
                         break;
                     }
                     case TOK_USHR_ASSIGN:
                     {
-                        uint32_t ln = ps_to_uint32(vm, &current);
+                        uint32_t ln = ps_to_uint32_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        uint32_t rn = ps_to_uint32(vm, &rhs);
+                        uint32_t rn = ps_to_uint32_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number((double)(ln >> (rn & 31)));
                         break;
                     }
                     case TOK_AND_ASSIGN:
                     {
-                        int32_t ln = ps_to_int32(vm, &current);
+                        int32_t ln = ps_to_int32_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        int32_t rn = ps_to_int32(vm, &rhs);
+                        int32_t rn = ps_to_int32_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number((double)(ln & rn));
                         break;
                     }
                     case TOK_OR_ASSIGN:
                     {
-                        int32_t ln = ps_to_int32(vm, &current);
+                        int32_t ln = ps_to_int32_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        int32_t rn = ps_to_int32(vm, &rhs);
+                        int32_t rn = ps_to_int32_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number((double)(ln | rn));
                         break;
                     }
                     case TOK_XOR_ASSIGN:
                     {
-                        int32_t ln = ps_to_int32(vm, &current);
+                        int32_t ln = ps_to_int32_fast(vm, current);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        int32_t rn = ps_to_int32(vm, &rhs);
+                        int32_t rn = ps_to_int32_fast(vm, rhs);
                         if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                         new_value = ps_value_number((double)(ln ^ rn));
                         break;
@@ -2173,7 +11600,9 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
 
             if (node->as.assign.target->kind == AST_IDENTIFIER) {
                 PSString *name = ps_identifier_string(node->as.assign.target);
-                ps_env_set(env, name, new_value);
+                if (!ps_identifier_cached_set(env, node->as.assign.target, new_value)) {
+                    ps_env_set(env, name, new_value);
+                }
                 return new_value;
             }
             if (node->as.assign.target->kind == AST_MEMBER) {
@@ -2181,6 +11610,96 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                 if (ctl->did_throw) return obj_val;
                 PSObject *obj = ps_to_object(vm, &obj_val, ctl);
                 if (ctl->did_throw) return ctl->throw_value;
+                if (obj && obj->kind == PS_OBJ_KIND_BUFFER && node->as.assign.target->as.member.computed) {
+                    PSValue key_val = eval_expression(vm, env, node->as.assign.target->as.member.property, ctl);
+                    if (ctl->did_throw) return ctl->throw_value;
+                    int handled = ps_buffer_write_index_value(vm, obj, key_val, new_value, ctl);
+                    if (handled < 0) return ctl->throw_value;
+                    if (handled > 0) return new_value;
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                    handled = ps_buffer_write_index(vm, obj, prop, new_value, ctl);
+                    if (handled < 0) return ctl->throw_value;
+                    if (handled > 0) return new_value;
+                    ps_object_put(obj, prop, new_value);
+                    ps_array_update_length(obj, prop);
+                    (void)ps_env_update_arguments(env, obj, prop, new_value);
+                    return new_value;
+                } else if (obj && obj->kind == PS_OBJ_KIND_BUFFER32 && node->as.assign.target->as.member.computed) {
+                    PSValue key_val = eval_expression(vm, env, node->as.assign.target->as.member.property, ctl);
+                    if (ctl->did_throw) return ctl->throw_value;
+                    int handled = ps_buffer32_write_index_value(vm, obj, key_val, new_value, ctl);
+                    if (handled < 0) return ctl->throw_value;
+                    if (handled > 0) return new_value;
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                    handled = ps_buffer32_write_index(vm, obj, prop, new_value, ctl);
+                    if (handled < 0) return ctl->throw_value;
+                    if (handled > 0) return new_value;
+                    ps_object_put(obj, prop, new_value);
+                    (void)ps_env_update_arguments(env, obj, prop, new_value);
+                    return new_value;
+                } else if (obj && obj->kind == PS_OBJ_KIND_ARRAY && node->as.assign.target->as.member.computed) {
+                    PSValue key_val = eval_expression(vm, env, node->as.assign.target->as.member.property, ctl);
+                    if (ctl->did_throw) return ctl->throw_value;
+                    size_t index = 0;
+                    int handled = ps_array_write_index_fast_value(obj, key_val, new_value, &index);
+                    if (handled > 0) return new_value;
+                    handled = ps_array_write_index_value(vm, obj, key_val, new_value, ctl);
+                    if (handled < 0) return ctl->throw_value;
+                    if (handled > 0) return new_value;
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                    ps_object_put(obj, prop, new_value);
+                    ps_array_update_length(obj, prop);
+                    (void)ps_env_update_arguments(env, obj, prop, new_value);
+                    return new_value;
+                } else if (obj && obj->kind == PS_OBJ_KIND_PLAIN && node->as.assign.target->as.member.computed) {
+                    PSValue key_val = eval_expression(vm, env, node->as.assign.target->as.member.property, ctl);
+                    if (ctl->did_throw) return ctl->throw_value;
+                    size_t index = 0;
+                    int idx = ps_value_to_index(vm, key_val, &index, ctl);
+                    if (idx < 0) return ctl->throw_value;
+                    if (idx > 0 && (obj->internal_kind == PS_INTERNAL_NUMMAP || obj->internal == NULL)) {
+                        if (obj->props) {
+                            PSString *prop = ps_array_index_string(vm, index);
+                            PSProperty *p = ps_object_get_own_prop(obj, prop);
+                            if (p) {
+                                p->value = new_value;
+                                obj->cache_name = p->name;
+                                obj->cache_prop = p;
+                                return new_value;
+                            }
+                        }
+                        int is_new = 0;
+                        if (!ps_num_map_set(obj, index, new_value, &is_new)) return new_value;
+                        if (is_new) ps_object_bump_shape(obj);
+                        return new_value;
+                    }
+                    if (key_val.type == PS_T_STRING &&
+                        (obj->internal_kind == PS_INTERNAL_NUMMAP || obj->internal == NULL)) {
+                        uint32_t kindex = 0;
+                        if (ps_string_to_k_index(key_val.as.string, &kindex)) {
+                            if (obj->props) {
+                                PSProperty *p = ps_object_get_own_prop(obj, key_val.as.string);
+                                if (p) {
+                                    p->value = new_value;
+                                    obj->cache_name = p->name;
+                                    obj->cache_prop = p;
+                                    return new_value;
+                                }
+                            }
+                            int is_new = 0;
+                            if (!ps_num_map_k_set(obj, kindex, new_value, &is_new)) return new_value;
+                            if (is_new) ps_object_bump_shape(obj);
+                            return new_value;
+                        }
+                    }
+                    PSString *prop = (key_val.type == PS_T_STRING) ? key_val.as.string : ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                    ps_object_put(obj, prop, new_value);
+                    return new_value;
+                }
                 PSString *prop = ps_member_key(vm, env, node->as.assign.target, ctl);
                 if (ctl->did_throw) return ctl->throw_value;
                 int handled = ps_buffer_write_index(vm, obj, prop, new_value, ctl);
@@ -2245,195 +11764,7 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             if (ctl->did_throw) return left;
             PSValue right = eval_expression(vm, env, node->as.binary.right, ctl);
             if (ctl->did_throw) return right;
-
-            switch (node->as.binary.op) {
-                case TOK_PLUS:
-                {
-                    PSValue lprim = ps_to_primitive(vm, left, PS_HINT_NONE);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    PSValue rprim = ps_to_primitive(vm, right, PS_HINT_NONE);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    if (lprim.type == PS_T_STRING || rprim.type == PS_T_STRING) {
-                        if (lprim.type == PS_T_STRING && rprim.type == PS_T_NUMBER) {
-                            PSString *out = ps_concat_string_number(vm, lprim.as.string, rprim.as.number, 0);
-                            return ps_value_string(out ? out : ps_string_from_cstr(""));
-                        }
-                        if (lprim.type == PS_T_NUMBER && rprim.type == PS_T_STRING) {
-                            PSString *out = ps_concat_string_number(vm, rprim.as.string, lprim.as.number, 1);
-                            return ps_value_string(out ? out : ps_string_from_cstr(""));
-                        }
-                        PSString *ls = ps_to_string(vm, lprim);
-                        if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        PSString *rs = ps_to_string(vm, rprim);
-                        if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                        return ps_value_string(ps_string_concat(ls, rs));
-                    }
-                    return ps_value_number(ps_to_number(vm, lprim) + ps_to_number(vm, rprim));
-                }
-                case TOK_MINUS:
-                {
-                    double ln = ps_to_number(vm, left);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    double rn = ps_to_number(vm, right);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    return ps_value_number(ln - rn);
-                }
-                case TOK_STAR:
-                {
-                    double ln = ps_to_number(vm, left);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    double rn = ps_to_number(vm, right);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    return ps_value_number(ln * rn);
-                }
-                case TOK_SLASH:
-                {
-                    double ln = ps_to_number(vm, left);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    double rn = ps_to_number(vm, right);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    return ps_value_number(ln / rn);
-                }
-                case TOK_PERCENT:
-                {
-                    double ln = ps_to_number(vm, left);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    double rn = ps_to_number(vm, right);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    return ps_value_number(fmod(ln, rn));
-                }
-                case TOK_LT:
-                case TOK_LTE:
-                case TOK_GT:
-                case TOK_GTE: {
-                    PSValue lprim = ps_to_primitive(vm, left, PS_HINT_NUMBER);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    PSValue rprim = ps_to_primitive(vm, right, PS_HINT_NUMBER);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    if (lprim.type == PS_T_STRING && rprim.type == PS_T_STRING) {
-                        int cmp = ps_string_compare(lprim.as.string, rprim.as.string);
-                        if (node->as.binary.op == TOK_LT) return ps_value_boolean(cmp < 0);
-                        if (node->as.binary.op == TOK_LTE) return ps_value_boolean(cmp <= 0);
-                        if (node->as.binary.op == TOK_GT) return ps_value_boolean(cmp > 0);
-                        return ps_value_boolean(cmp >= 0);
-                    }
-                    double ln = ps_to_number(vm, lprim);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    double rn = ps_to_number(vm, rprim);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    if (ps_value_is_nan(ln) || ps_value_is_nan(rn)) return ps_value_boolean(0);
-                    if (node->as.binary.op == TOK_LT) return ps_value_boolean(ln < rn);
-                    if (node->as.binary.op == TOK_LTE) return ps_value_boolean(ln <= rn);
-                    if (node->as.binary.op == TOK_GT) return ps_value_boolean(ln > rn);
-                    return ps_value_boolean(ln >= rn);
-                }
-                case TOK_INSTANCEOF: {
-                    if (right.type != PS_T_OBJECT || !right.as.object ||
-                        right.as.object->kind != PS_OBJ_KIND_FUNCTION) {
-                        ctl->did_throw = 1;
-                        ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Right-hand side of instanceof is not callable");
-                        return ctl->throw_value;
-                    }
-                    if (left.type != PS_T_OBJECT || !left.as.object) {
-                        return ps_value_boolean(0);
-                    }
-                    PSString *proto_key = ps_string_from_cstr("prototype");
-                    int found = 0;
-                    PSValue proto_val = ps_object_get(right.as.object, proto_key, &found);
-                    if (!found || proto_val.type != PS_T_OBJECT || !proto_val.as.object) {
-                        ctl->did_throw = 1;
-                        ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Function has invalid prototype");
-                        return ctl->throw_value;
-                    }
-                    PSObject *target = proto_val.as.object;
-                    PSObject *obj = left.as.object;
-                    while (obj) {
-                        if (obj->prototype == target) {
-                            return ps_value_boolean(1);
-                        }
-                        obj = obj->prototype;
-                    }
-                    return ps_value_boolean(0);
-                }
-                case TOK_IN: {
-                    if (right.type != PS_T_OBJECT || !right.as.object) {
-                        ctl->did_throw = 1;
-                        ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Right-hand side of in is not an object");
-                        return ctl->throw_value;
-                    }
-                    PSString *key = ps_to_string(vm, left);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    if (!key) return ps_value_boolean(0);
-                    return ps_value_boolean(ps_object_has(right.as.object, key));
-                }
-                case TOK_EQ:
-                {
-                    int eq = ps_abstract_equals(vm, &left, &right, ctl);
-                    if (ctl->did_throw) return ctl->throw_value;
-                    return ps_value_boolean(eq);
-                }
-                case TOK_NEQ:
-                {
-                    int eq = ps_abstract_equals(vm, &left, &right, ctl);
-                    if (ctl->did_throw) return ctl->throw_value;
-                    return ps_value_boolean(!eq);
-                }
-                case TOK_STRICT_EQ:
-                    return ps_value_boolean(ps_strict_equals(&left, &right));
-                case TOK_STRICT_NEQ:
-                    return ps_value_boolean(!ps_strict_equals(&left, &right));
-                case TOK_AND:
-                {
-                    int32_t ln = ps_to_int32(vm, &left);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    int32_t rn = ps_to_int32(vm, &right);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    return ps_value_number((double)(ln & rn));
-                }
-                case TOK_OR:
-                {
-                    int32_t ln = ps_to_int32(vm, &left);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    int32_t rn = ps_to_int32(vm, &right);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    return ps_value_number((double)(ln | rn));
-                }
-                case TOK_XOR:
-                {
-                    int32_t ln = ps_to_int32(vm, &left);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    int32_t rn = ps_to_int32(vm, &right);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    return ps_value_number((double)(ln ^ rn));
-                }
-                case TOK_SHL:
-                {
-                    int32_t ln = ps_to_int32(vm, &left);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    uint32_t rn = ps_to_uint32(vm, &right);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    return ps_value_number((double)(ln << (rn & 31)));
-                }
-                case TOK_SHR:
-                {
-                    int32_t ln = ps_to_int32(vm, &left);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    uint32_t rn = ps_to_uint32(vm, &right);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    return ps_value_number((double)(ln >> (rn & 31)));
-                }
-                case TOK_USHR:
-                {
-                    uint32_t ln = ps_to_uint32(vm, &left);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    uint32_t rn = ps_to_uint32(vm, &right);
-                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
-                    return ps_value_number((double)(ln >> (rn & 31)));
-                }
-                default:
-                    fprintf(stderr, "Unsupported binary operator\n");
-                    return ps_value_undefined();
-            }
+            return ps_eval_binary_values(vm, node->as.binary.op, left, right, ctl);
         }
 
         case AST_UNARY: {
@@ -2442,8 +11773,10 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                 node->as.unary.expr->kind == AST_IDENTIFIER) {
                 PSAstNode *id = node->as.unary.expr;
                 PSString *name_id = ps_identifier_string(id);
-                int found;
-                v = ps_env_get(env, name_id, &found);
+                int found = 0;
+                if (!ps_identifier_cached_get(env, id, &v, &found)) {
+                    v = ps_env_get(env, name_id, &found);
+                }
                 if (!found) {
                     return ps_value_string(ps_string_from_cstr("undefined"));
                 }
@@ -2455,16 +11788,16 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                 case TOK_NOT:
                     return ps_value_boolean(!ps_to_boolean(vm, v));
                 case TOK_BIT_NOT:
-                    return ps_value_number((double)(~ps_to_int32(vm, &v)));
+                    return ps_value_number((double)(~ps_to_int32_fast(vm, v)));
                 case TOK_PLUS:
                 {
-                    double num = ps_to_number(vm, v);
+                    double num = ps_to_number_fast(vm, v);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                     return ps_value_number(num);
                 }
                 case TOK_MINUS:
                 {
-                    double num = ps_to_number(vm, v);
+                    double num = ps_to_number_fast(vm, v);
                     if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                     return ps_value_number(-num);
                 }
@@ -2493,6 +11826,17 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                         if (ctl->did_throw) return obj_val;
                         PSObject *obj = ps_to_object(vm, &obj_val, ctl);
                         if (ctl->did_throw) return ctl->throw_value;
+                        if (obj && obj->kind == PS_OBJ_KIND_ARRAY && mem->as.member.computed) {
+                            PSValue key_val = eval_expression(vm, env, mem->as.member.property, ctl);
+                            if (ctl->did_throw) return ctl->throw_value;
+                            size_t index = 0;
+                            int idx = ps_value_to_array_index(vm, key_val, &index, ctl);
+                            if (idx < 0) return ctl->throw_value;
+                            if (idx > 0) {
+                                (void)ps_array_delete_index(obj, index);
+                                return ps_value_boolean(1);
+                            }
+                        }
                         PSString *prop = ps_member_key(vm, env, mem, ctl);
                         if (ctl->did_throw) return ctl->throw_value;
                         int deleted = 0;
@@ -2510,13 +11854,17 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             PSValue current = ps_value_undefined();
             if (target->kind == AST_IDENTIFIER) {
                 PSString *name = ps_identifier_string(target);
-                int found;
-                current = ps_env_get(env, name, &found);
+                int found = 0;
+                if (!ps_identifier_cached_get(env, target, &current, &found)) {
+                    current = ps_env_get(env, name, &found);
+                }
                 double num = ps_to_number(vm, current);
                 if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                 double new_num = (node->as.update.op == TOK_PLUS_PLUS) ? num + 1 : num - 1;
                 PSValue new_val = ps_value_number(new_num);
-                ps_env_set(env, name, new_val);
+                if (!ps_identifier_cached_set(env, target, new_val)) {
+                    ps_env_set(env, name, new_val);
+                }
                 return node->as.update.is_prefix ? new_val : current;
             }
             if (target->kind == AST_MEMBER) {
@@ -2524,6 +11872,192 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                 if (ctl->did_throw) return obj_val;
                 PSObject *obj = ps_to_object(vm, &obj_val, ctl);
                 if (ctl->did_throw) return ctl->throw_value;
+                if (obj && obj->kind == PS_OBJ_KIND_BUFFER && target->as.member.computed) {
+                    PSValue key_val = eval_expression(vm, env, target->as.member.property, ctl);
+                    if (ctl->did_throw) return ctl->throw_value;
+                    int handled = ps_buffer_read_index_value(vm, obj, key_val, &current, ctl);
+                    if (handled < 0) return ctl->throw_value;
+                    if (handled > 0) {
+                        double num = ps_to_number(vm, current);
+                        if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                        double new_num = (node->as.update.op == TOK_PLUS_PLUS) ? num + 1 : num - 1;
+                        PSValue new_val = ps_value_number(new_num);
+                        int wrote = ps_buffer_write_index_value(vm, obj, key_val, new_val, ctl);
+                        if (wrote < 0) return ctl->throw_value;
+                        return node->as.update.is_prefix ? new_val : current;
+                    }
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                    handled = ps_buffer_read_index(vm, obj, prop, &current, ctl);
+                    if (handled < 0) return ctl->throw_value;
+                    if (handled > 0) {
+                        double num = ps_to_number(vm, current);
+                        if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                        double new_num = (node->as.update.op == TOK_PLUS_PLUS) ? num + 1 : num - 1;
+                        PSValue new_val = ps_value_number(new_num);
+                        int wrote = ps_buffer_write_index(vm, obj, prop, new_val, ctl);
+                        if (wrote < 0) return ctl->throw_value;
+                        return node->as.update.is_prefix ? new_val : current;
+                    }
+                    if (!ps_member_cached_get(obj, target, prop, &current)) {
+                        int found;
+                        current = ps_object_get(obj, prop, &found);
+                    }
+                    double num = ps_to_number(vm, current);
+                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                    double new_num = (node->as.update.op == TOK_PLUS_PLUS) ? num + 1 : num - 1;
+                    PSValue new_val = ps_value_number(new_num);
+                    ps_object_put(obj, prop, new_val);
+                    ps_array_update_length(obj, prop);
+                    (void)ps_env_update_arguments(env, obj, prop, new_val);
+                    return node->as.update.is_prefix ? new_val : current;
+                } else if (obj && obj->kind == PS_OBJ_KIND_BUFFER32 && target->as.member.computed) {
+                    PSValue key_val = eval_expression(vm, env, target->as.member.property, ctl);
+                    if (ctl->did_throw) return ctl->throw_value;
+                    int handled = ps_buffer32_read_index_value(vm, obj, key_val, &current, ctl);
+                    if (handled < 0) return ctl->throw_value;
+                    if (handled > 0) {
+                        double num = ps_to_number(vm, current);
+                        if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                        double new_num = (node->as.update.op == TOK_PLUS_PLUS) ? num + 1 : num - 1;
+                        PSValue new_val = ps_value_number(new_num);
+                        int wrote = ps_buffer32_write_index_value(vm, obj, key_val, new_val, ctl);
+                        if (wrote < 0) return ctl->throw_value;
+                        return node->as.update.is_prefix ? new_val : current;
+                    }
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                    handled = ps_buffer32_read_index(vm, obj, prop, &current, ctl);
+                    if (handled < 0) return ctl->throw_value;
+                    if (handled > 0) {
+                        double num = ps_to_number(vm, current);
+                        if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                        double new_num = (node->as.update.op == TOK_PLUS_PLUS) ? num + 1 : num - 1;
+                        PSValue new_val = ps_value_number(new_num);
+                        int wrote = ps_buffer32_write_index(vm, obj, prop, new_val, ctl);
+                        if (wrote < 0) return ctl->throw_value;
+                        return node->as.update.is_prefix ? new_val : current;
+                    }
+                    if (!ps_member_cached_get(obj, target, prop, &current)) {
+                        int found;
+                        current = ps_object_get(obj, prop, &found);
+                    }
+                    double num = ps_to_number(vm, current);
+                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                    double new_num = (node->as.update.op == TOK_PLUS_PLUS) ? num + 1 : num - 1;
+                    PSValue new_val = ps_value_number(new_num);
+                    ps_object_put(obj, prop, new_val);
+                    (void)ps_env_update_arguments(env, obj, prop, new_val);
+                    return node->as.update.is_prefix ? new_val : current;
+                } else if (obj && obj->kind == PS_OBJ_KIND_ARRAY && target->as.member.computed) {
+                    PSValue key_val = eval_expression(vm, env, target->as.member.property, ctl);
+                    if (ctl->did_throw) return ctl->throw_value;
+                    PSString *prop = NULL;
+                    size_t index = 0;
+                    int handled = ps_array_read_index_fast_value(obj, key_val, &current, &index);
+                    if (handled > 0) {
+                        double num = ps_to_number(vm, current);
+                        if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                        double new_num = (node->as.update.op == TOK_PLUS_PLUS) ? num + 1 : num - 1;
+                        PSValue new_val = ps_value_number(new_num);
+                        int wrote = ps_array_write_index_fast_value(obj, key_val, new_val, NULL);
+                        if (wrote == 0) {
+                            wrote = ps_array_write_index_value(vm, obj, key_val, new_val, ctl);
+                        }
+                        if (wrote < 0) return ctl->throw_value;
+                        return node->as.update.is_prefix ? new_val : current;
+                    }
+                    if (handled < 0) {
+                        prop = ps_array_index_string(vm, index);
+                        if (!ps_member_cached_get(obj, target, prop, &current)) {
+                            int found;
+                            current = ps_object_get(obj, prop, &found);
+                        }
+                    } else {
+                        handled = ps_array_read_index_value(vm, obj, key_val, &current, ctl);
+                        if (handled < 0) return ctl->throw_value;
+                        if (handled > 0) {
+                            double num = ps_to_number(vm, current);
+                            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                            double new_num = (node->as.update.op == TOK_PLUS_PLUS) ? num + 1 : num - 1;
+                            PSValue new_val = ps_value_number(new_num);
+                            int wrote = ps_array_write_index_value(vm, obj, key_val, new_val, ctl);
+                            if (wrote < 0) return ctl->throw_value;
+                            return node->as.update.is_prefix ? new_val : current;
+                        }
+                        if (handled == 0) {
+                            prop = ps_to_string(vm, key_val);
+                            if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                            if (!ps_member_cached_get(obj, target, prop, &current)) {
+                                int found;
+                                current = ps_object_get(obj, prop, &found);
+                            }
+                        }
+                    }
+                    if (!prop) {
+                        return ps_value_undefined();
+                    }
+                    double num = ps_to_number(vm, current);
+                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                    double new_num = (node->as.update.op == TOK_PLUS_PLUS) ? num + 1 : num - 1;
+                    PSValue new_val = ps_value_number(new_num);
+                    ps_object_put(obj, prop, new_val);
+                    ps_array_update_length(obj, prop);
+                    (void)ps_env_update_arguments(env, obj, prop, new_val);
+                    return node->as.update.is_prefix ? new_val : current;
+                } else if (obj && obj->kind == PS_OBJ_KIND_PLAIN && target->as.member.computed) {
+                    PSValue key_val = eval_expression(vm, env, target->as.member.property, ctl);
+                    if (ctl->did_throw) return ctl->throw_value;
+                    size_t index = 0;
+                    int idx = ps_value_to_index(vm, key_val, &index, ctl);
+                    if (idx < 0) return ctl->throw_value;
+                    if (idx > 0 && (obj->internal_kind == PS_INTERNAL_NUMMAP || obj->internal == NULL)) {
+                        PSProperty *p = NULL;
+                        if (obj->props) {
+                            PSString *prop = ps_array_index_string(vm, index);
+                            p = ps_object_get_own_prop(obj, prop);
+                        }
+                        if (p) {
+                            current = p->value;
+                        } else {
+                            PSValue out = ps_value_undefined();
+                            if (obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                                if (ps_num_map_get(obj, index, &out)) current = out;
+                                else current = ps_value_undefined();
+                            } else {
+                                current = ps_value_undefined();
+                            }
+                        }
+                        double num = ps_to_number(vm, current);
+                        if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                        double new_num = (node->as.update.op == TOK_PLUS_PLUS) ? num + 1 : num - 1;
+                        PSValue new_val = ps_value_number(new_num);
+                        if (p) {
+                            p->value = new_val;
+                            obj->cache_name = p->name;
+                            obj->cache_prop = p;
+                        } else {
+                            int is_new = 0;
+                            if (ps_num_map_set(obj, index, new_val, &is_new) && is_new) {
+                                ps_object_bump_shape(obj);
+                            }
+                        }
+                        return node->as.update.is_prefix ? new_val : current;
+                    }
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                    if (!ps_member_cached_get(obj, target, prop, &current)) {
+                        int found;
+                        current = ps_object_get(obj, prop, &found);
+                    }
+                    double num = ps_to_number(vm, current);
+                    if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                    double new_num = (node->as.update.op == TOK_PLUS_PLUS) ? num + 1 : num - 1;
+                    PSValue new_val = ps_value_number(new_num);
+                    ps_object_put(obj, prop, new_val);
+                    (void)ps_env_update_arguments(env, obj, prop, new_val);
+                    return node->as.update.is_prefix ? new_val : current;
+                }
                 PSString *prop = ps_member_key(vm, env, target, ctl);
                 if (ctl->did_throw) return ctl->throw_value;
                 int handled = ps_buffer_read_index(vm, obj, prop, &current, ctl);
@@ -2537,8 +12071,10 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                     if (wrote < 0) return ctl->throw_value;
                     return node->as.update.is_prefix ? new_val : current;
                 }
-                int found;
-                current = ps_object_get(obj, prop, &found);
+                if (!ps_member_cached_get(obj, target, prop, &current)) {
+                    int found;
+                    current = ps_object_get(obj, prop, &found);
+                }
                 double num = ps_to_number(vm, current);
                 if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
                 double new_num = (node->as.update.op == TOK_PLUS_PLUS) ? num + 1 : num - 1;
@@ -2565,6 +12101,76 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             if (ctl->did_throw) return obj_val;
             PSObject *obj = ps_to_object(vm, &obj_val, ctl);
             if (ctl->did_throw) return ctl->throw_value;
+            if (obj && obj->kind == PS_OBJ_KIND_BUFFER && node->as.member.computed) {
+                PSValue key_val = eval_expression(vm, env, node->as.member.property, ctl);
+                if (ctl->did_throw) return ctl->throw_value;
+                PSValue out = ps_value_undefined();
+                int handled = ps_buffer_read_index_value(vm, obj, key_val, &out, ctl);
+                if (handled < 0) return ctl->throw_value;
+                if (handled > 0) return out;
+                PSString *prop = ps_to_string(vm, key_val);
+                if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                if (handled < 0) return ctl->throw_value;
+                if (handled > 0) return out;
+                int found;
+                return ps_object_get(obj, prop, &found);
+            } else if (obj && obj->kind == PS_OBJ_KIND_BUFFER32 && node->as.member.computed) {
+                PSValue key_val = eval_expression(vm, env, node->as.member.property, ctl);
+                if (ctl->did_throw) return ctl->throw_value;
+                PSValue out = ps_value_undefined();
+                int handled = ps_buffer32_read_index_value(vm, obj, key_val, &out, ctl);
+                if (handled < 0) return ctl->throw_value;
+                if (handled > 0) return out;
+                PSString *prop = ps_to_string(vm, key_val);
+                if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                handled = ps_buffer32_read_index(vm, obj, prop, &out, ctl);
+                if (handled < 0) return ctl->throw_value;
+                if (handled > 0) return out;
+                int found;
+                return ps_object_get(obj, prop, &found);
+            } else if (obj && obj->kind == PS_OBJ_KIND_ARRAY && node->as.member.computed) {
+                PSValue key_val = eval_expression(vm, env, node->as.member.property, ctl);
+                if (ctl->did_throw) return ctl->throw_value;
+                PSValue out = ps_value_undefined();
+                size_t index = 0;
+                int handled = ps_array_read_index_fast_value(obj, key_val, &out, &index);
+                if (handled > 0) return out;
+                if (handled < 0) {
+                    PSString *prop = ps_array_index_string(vm, index);
+                    int found;
+                    return ps_object_get(obj, prop, &found);
+                }
+                handled = ps_array_read_index_value(vm, obj, key_val, &out, ctl);
+                if (handled < 0) return ctl->throw_value;
+                if (handled > 0) return out;
+                PSString *prop = ps_to_string(vm, key_val);
+                if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                int found;
+                return ps_object_get(obj, prop, &found);
+            } else if (obj && obj->kind == PS_OBJ_KIND_PLAIN && node->as.member.computed) {
+                PSValue key_val = eval_expression(vm, env, node->as.member.property, ctl);
+                if (ctl->did_throw) return ctl->throw_value;
+                size_t index = 0;
+                int idx = ps_value_to_index(vm, key_val, &index, ctl);
+                if (idx < 0) return ctl->throw_value;
+                if (idx > 0 && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                    PSValue out = ps_value_undefined();
+                    if (ps_num_map_get(obj, index, &out)) return out;
+                    return ps_value_undefined();
+                }
+                if (key_val.type == PS_T_STRING && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                    uint32_t kindex = 0;
+                    if (ps_string_to_k_index(key_val.as.string, &kindex)) {
+                        PSValue out = ps_value_undefined();
+                        if (ps_num_map_k_get(obj, kindex, &out)) return out;
+                    }
+                }
+                PSString *prop = (key_val.type == PS_T_STRING) ? key_val.as.string : ps_to_string(vm, key_val);
+                if (ps_check_pending_throw(vm, ctl)) return ctl->throw_value;
+                int found;
+                return ps_object_get(obj, prop, &found);
+            }
             PSString tmp_prop;
             char tmp_buf[96];
             PSString *prop = ps_member_key_read(vm, env, node, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
@@ -2573,11 +12179,29 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             int handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
             if (handled < 0) return ctl->throw_value;
             if (handled > 0) return out;
+            if (ps_member_cached_get(obj, node, prop, &out)) return out;
             int found;
             return ps_object_get(obj, prop, &found);
         }
 
         case AST_CALL: {
+#if PS_ENABLE_PERF
+            if (vm && node->as.call.callee) {
+                if (node->as.call.callee->kind == AST_IDENTIFIER) {
+                    vm->perf.call_ident_count++;
+                } else if (node->as.call.callee->kind == AST_MEMBER) {
+                    vm->perf.call_member_count++;
+                } else {
+                    vm->perf.call_other_count++;
+                }
+            }
+#endif
+            if (vm) {
+                PSValue fast_out = ps_value_undefined();
+                int fast_handled = ps_eval_math_intrinsic(vm, env, node, ctl, &fast_out);
+                if (fast_handled < 0) return ctl->throw_value;
+                if (fast_handled > 0) return fast_out;
+            }
             if (node->as.call.callee->kind == AST_IDENTIFIER) {
                 PSAstNode *id = node->as.call.callee;
                 if (id->as.identifier.length == 4 &&
@@ -2588,10 +12212,10 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                         return ctl->throw_value;
                     }
                     PSValue *args = NULL;
-                    PSValue stack_args[4];
+                    PSValue stack_args[8];
                     int args_heap = 0;
                     if (!ps_eval_args(vm, env, node->as.call.args, node->as.call.argc,
-                                      stack_args, 4, &args, &args_heap, ctl)) {
+                                      stack_args, 8, &args, &args_heap, ctl)) {
                         return ctl->did_throw ? ctl->throw_value : ps_value_undefined();
                     }
                     PSValue result = ps_value_undefined();
@@ -2609,32 +12233,115 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
                 }
             }
 
+            PSAstNode *callee_node = node->as.call.callee;
             PSValue this_val = ps_value_undefined();
             PSValue callee = ps_value_undefined();
 
-            if (node->as.call.callee->kind == AST_MEMBER) {
-                PSAstNode *member = node->as.call.callee;
+            if (callee_node->kind == AST_IDENTIFIER) {
+                if (node->as.call.cache_kind == PS_CALL_CACHE_IDENT_FAST &&
+                    node->as.call.cache_fast_env == env &&
+                    env->fast_values &&
+                    node->as.call.cache_fast_index < env->fast_count) {
+                    callee = env->fast_values[node->as.call.cache_fast_index];
+                    this_val = ps_value_object(vm->global);
+                    goto call_have_callee;
+                }
+                if (node->as.call.cache_kind == PS_CALL_CACHE_IDENT_PROP &&
+                    node->as.call.cache_env == env &&
+                    node->as.call.cache_record == env->record &&
+                    env->record &&
+                    node->as.call.cache_shape == env->record->shape_id &&
+                    node->as.call.cache_prop) {
+                    callee = node->as.call.cache_prop->value;
+                    this_val = ps_value_object(vm->global);
+                    goto call_have_callee;
+                }
+                PSAstNode *id = callee_node;
+                PSString *name = ps_identifier_string(id);
+                int found = 0;
+                if (!ps_identifier_cached_get(env, id, &callee, &found)) {
+                    callee = ps_env_get(env, name, &found);
+                }
+                if (!found) {
+                    ctl->did_throw = 1;
+                    const char *prefix = "Identifier not defined: ";
+                    size_t prefix_len = strlen(prefix);
+                    size_t name_len = name ? name->byte_len : 0;
+                    char *msg = NULL;
+                    if (name && name->utf8 && name_len > 0) {
+                        msg = (char *)malloc(prefix_len + name_len + 1);
+                    }
+                    if (msg) {
+                        memcpy(msg, prefix, prefix_len);
+                        memcpy(msg + prefix_len, name->utf8, name_len);
+                        msg[prefix_len + name_len] = '\0';
+                        ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", msg);
+                        free(msg);
+                    } else {
+                        ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", "Identifier not defined");
+                    }
+                    return ctl->throw_value;
+                }
+                this_val = ps_value_object(vm->global);
+                if (id->as.identifier.cache_fast_env == env) {
+                    node->as.call.cache_kind = PS_CALL_CACHE_IDENT_FAST;
+                    node->as.call.cache_fast_env = env;
+                    node->as.call.cache_fast_index = id->as.identifier.cache_fast_index;
+                } else if (id->as.identifier.cache_env == env &&
+                           id->as.identifier.cache_record == env->record &&
+                           id->as.identifier.cache_prop &&
+                           env->record) {
+                    node->as.call.cache_kind = PS_CALL_CACHE_IDENT_PROP;
+                    node->as.call.cache_env = env;
+                    node->as.call.cache_record = env->record;
+                    node->as.call.cache_prop = id->as.identifier.cache_prop;
+                    node->as.call.cache_shape = env->record->shape_id;
+                } else {
+                    node->as.call.cache_kind = PS_CALL_CACHE_NONE;
+                }
+            } else if (callee_node->kind == AST_MEMBER) {
+                PSAstNode *member = callee_node;
                 PSValue obj_val = eval_expression(vm, env, member->as.member.object, ctl);
                 if (ctl->did_throw) return obj_val;
                 PSObject *obj = ps_to_object(vm, &obj_val, ctl);
                 if (ctl->did_throw) return ctl->throw_value;
+                if (!member->as.member.computed &&
+                    node->as.call.cache_kind == PS_CALL_CACHE_MEMBER &&
+                    node->as.call.cache_obj == obj &&
+                    node->as.call.cache_member_shape == obj->shape_id &&
+                    node->as.call.cache_member_prop) {
+                    callee = node->as.call.cache_member_prop->value;
+                    this_val = ps_value_object(obj);
+                    goto call_have_callee;
+                }
                 PSString tmp_prop;
                 char tmp_buf[96];
                 PSString *prop = ps_member_key_read(vm, env, member, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
                 if (ctl->did_throw) return ctl->throw_value;
-                int found;
-                callee = ps_object_get(obj, prop, &found);
+                if (member->as.member.computed || !ps_member_cached_get(obj, member, prop, &callee)) {
+                    int found;
+                    callee = ps_object_get(obj, prop, &found);
+                }
                 this_val = ps_value_object(obj);
+                if (!member->as.member.computed &&
+                    member->as.member.cache_obj == obj &&
+                    member->as.member.cache_prop) {
+                    node->as.call.cache_kind = PS_CALL_CACHE_MEMBER;
+                    node->as.call.cache_obj = obj;
+                    node->as.call.cache_member_prop = member->as.member.cache_prop;
+                    node->as.call.cache_member_shape = obj->shape_id;
+                }
             } else {
-                callee = eval_expression(vm, env, node->as.call.callee, ctl);
+                callee = eval_expression(vm, env, callee_node, ctl);
                 if (ctl->did_throw) return callee;
                 this_val = ps_value_object(vm->global);
             }
 
+call_have_callee:
             if (callee.type != PS_T_OBJECT) {
                 ctl->did_throw = 1;
                 const char *prefix = "Call of non-object: ";
-                char *target = ps_format_call_target_name(node->as.call.callee);
+                char *target = ps_format_call_target_name(callee_node);
                 if (target) {
                     size_t prefix_len = strlen(prefix);
                     size_t target_len = strlen(target);
@@ -2659,7 +12366,7 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             if (!func) {
                 ctl->did_throw = 1;
                 const char *prefix = "Not a callable object: ";
-                char *target = ps_format_call_target_name(node->as.call.callee);
+                char *target = ps_format_call_target_name(callee_node);
                 if (target) {
                     size_t prefix_len = strlen(prefix);
                     size_t target_len = strlen(target);
@@ -2681,10 +12388,10 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             }
 
             PSValue *args = NULL;
-            PSValue stack_args[4];
+            PSValue stack_args[8];
             int args_heap = 0;
             if (!ps_eval_args(vm, env, node->as.call.args, node->as.call.argc,
-                              stack_args, 4, &args, &args_heap, ctl)) {
+                              stack_args, 8, &args, &args_heap, ctl)) {
                 return ctl->did_throw ? ctl->throw_value : ps_value_undefined();
             }
 #if PS_ENABLE_FAST_CALLS
@@ -2701,9 +12408,18 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
 #endif
             int did_throw = 0;
             PSValue throw_value = ps_value_undefined();
+            uint64_t prof_start = 0;
+            int prof_enabled = (vm && vm->profile.enabled);
+            if (prof_enabled) {
+                prof_start = ps_eval_now_ms();
+            }
             PSValue result = ps_eval_call_function(vm, env, callee.as.object, this_val,
                                                    (int)node->as.call.argc, args,
                                                    &did_throw, &throw_value);
+            if (prof_enabled) {
+                uint64_t elapsed = ps_eval_now_ms() - prof_start;
+                ps_vm_profile_add(vm, func, elapsed);
+            }
             if (args_heap) {
                 free(args);
             }
@@ -2758,10 +12474,10 @@ static PSValue eval_expression(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalCont
             if (proto == vm->regexp_proto) instance->kind = PS_OBJ_KIND_REGEXP;
 
             PSValue *args = NULL;
-            PSValue stack_args[4];
+            PSValue stack_args[8];
             int args_heap = 0;
             if (!ps_eval_args(vm, env, node->as.new_expr.args, node->as.new_expr.argc,
-                              stack_args, 4, &args, &args_heap, ctl)) {
+                              stack_args, 8, &args, &args_heap, ctl)) {
                 return ctl->did_throw ? ctl->throw_value : ps_value_undefined();
             }
 

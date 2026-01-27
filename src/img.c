@@ -18,6 +18,7 @@
 #include <limits.h>
 #include <math.h>
 #include <setjmp.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -31,6 +32,12 @@ typedef struct {
     struct jpeg_error_mgr pub;
     jmp_buf setjmp_buffer;
 } PSJpegError;
+
+typedef struct {
+    uint8_t *data;
+    size_t size;
+    size_t capacity;
+} PSPngWriteState;
 
 static size_t g_img_live = 0;
 
@@ -174,6 +181,31 @@ static int img_extract_image(PSVM *vm, PSValue value, int *out_w, int *out_h, PS
     return 1;
 }
 
+static void img_png_write(png_structp png_ptr, png_bytep data, png_size_t length) {
+    PSPngWriteState *state = (PSPngWriteState *)png_get_io_ptr(png_ptr);
+    if (!state) return;
+    size_t needed = state->size + length;
+    if (needed > state->capacity) {
+        size_t new_cap = state->capacity ? state->capacity : 1024;
+        while (new_cap < needed) {
+            new_cap *= 2;
+        }
+        uint8_t *next = (uint8_t *)realloc(state->data, new_cap);
+        if (!next) {
+            png_error(png_ptr, "out of memory");
+            return;
+        }
+        state->data = next;
+        state->capacity = new_cap;
+    }
+    memcpy(state->data + state->size, data, length);
+    state->size += length;
+}
+
+static void img_png_flush(png_structp png_ptr) {
+    (void)png_ptr;
+}
+
 static int img_parse_mode(PSVM *vm, PSValue value, PsImgResampleInterpolation *out) {
     if (value.type == PS_T_UNDEFINED || value.type == PS_T_NULL) {
         if (out) *out = PS_IMG_RESAMPLE_INTERP_CUBIC;
@@ -206,6 +238,23 @@ static int img_parse_mode(PSVM *vm, PSValue value, PsImgResampleInterpolation *o
     }
     img_throw(vm, "ArgumentError", "Invalid resample mode");
     return 0;
+}
+
+static int img_timing_enabled(void) {
+    static int checked = 0;
+    static int enabled = 0;
+    if (!checked) {
+        const char *env = getenv("PS_IMG_TIMING");
+        enabled = (env && env[0] == '1') ? 1 : 0;
+        checked = 1;
+    }
+    return enabled;
+}
+
+static uint64_t img_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
 }
 
 static PSValue img_make_image_object(PSVM *vm, int width, int height, PSObject *buf_obj, size_t byte_len) {
@@ -247,6 +296,8 @@ static PSValue ps_native_img_decode_png(PSVM *vm, PSValue this_val, int argc, PS
         img_throw(vm, "DecodeError", "Invalid PNG data");
         return ps_value_undefined();
     }
+    uint64_t t0 = 0;
+    if (img_timing_enabled()) t0 = img_now_ms();
 
     png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
     if (!png) {
@@ -338,6 +389,16 @@ static PSValue ps_native_img_decode_png(PSVM *vm, PSValue this_val, int argc, PS
     ps_gc_root_push(vm, PS_GC_ROOT_OBJECT, buf_obj);
     PSValue out = img_make_image_object(vm, (int)width, (int)height, buf_obj, expected);
     ps_gc_root_pop(vm, 1);
+    if (img_timing_enabled()) {
+        uint64_t dt = img_now_ms() - t0;
+        fprintf(stderr,
+                "img_timing decodePNG %ux%u input=%zuB output=%zuB %llums\n",
+                (unsigned)width,
+                (unsigned)height,
+                buf->size,
+                expected,
+                (unsigned long long)dt);
+    }
     return out;
 }
 
@@ -382,6 +443,8 @@ static PSValue ps_native_img_decode_jpeg(PSVM *vm, PSValue this_val, int argc, P
         img_throw(vm, "DecodeError", "Invalid JPEG data");
         return ps_value_undefined();
     }
+    uint64_t t0 = 0;
+    if (img_timing_enabled()) t0 = img_now_ms();
 
     struct jpeg_decompress_struct cinfo;
     PSJpegError jerr;
@@ -476,7 +539,206 @@ static PSValue ps_native_img_decode_jpeg(PSVM *vm, PSValue this_val, int argc, P
     ps_gc_root_push(vm, PS_GC_ROOT_OBJECT, buf_obj);
     PSValue out = img_make_image_object(vm, width, height, buf_obj, expected);
     ps_gc_root_pop(vm, 1);
+    if (img_timing_enabled()) {
+        uint64_t dt = img_now_ms() - t0;
+        fprintf(stderr,
+                "img_timing decodeJPEG %dx%d input=%zuB output=%zuB %llums\n",
+                width,
+                height,
+                buf->size,
+                expected,
+                (unsigned long long)dt);
+    }
     return out;
+}
+
+static PSValue ps_native_img_encode_png(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    if (argc < 1) {
+        img_throw(vm, "ArgumentError", "Image.encodePNG expects (image)");
+        return ps_value_undefined();
+    }
+    int width = 0;
+    int height = 0;
+    PSBuffer *src_buf = NULL;
+    if (!img_extract_image(vm, argv[0], &width, &height, &src_buf)) return ps_value_undefined();
+    uint64_t t0 = 0;
+    if (img_timing_enabled()) t0 = img_now_ms();
+
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png) {
+        img_throw(vm, "ResourceLimitError", "PNG encoder init failed");
+        return ps_value_undefined();
+    }
+    png_infop info = png_create_info_struct(png);
+    if (!info) {
+        png_destroy_write_struct(&png, NULL);
+        img_throw(vm, "ResourceLimitError", "PNG encoder init failed");
+        return ps_value_undefined();
+    }
+    PSPngWriteState state = {0};
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_write_struct(&png, &info);
+        free(state.data);
+        img_throw(vm, "EncodeError", "PNG encoding failed");
+        return ps_value_undefined();
+    }
+
+    png_set_write_fn(png, &state, img_png_write, img_png_flush);
+    png_set_IHDR(png, info,
+                 (png_uint_32)width,
+                 (png_uint_32)height,
+                 8,
+                 PNG_COLOR_TYPE_RGBA,
+                 PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_BASE,
+                 PNG_FILTER_TYPE_BASE);
+    png_write_info(png, info);
+
+    png_bytep *rows = (png_bytep *)malloc(sizeof(png_bytep) * (size_t)height);
+    if (!rows) {
+        png_destroy_write_struct(&png, &info);
+        free(state.data);
+        img_throw(vm, "ResourceLimitError", "Out of memory");
+        return ps_value_undefined();
+    }
+    size_t row_bytes = (size_t)width * 4;
+    for (int y = 0; y < height; y++) {
+        rows[y] = (png_bytep)(src_buf->data + (size_t)y * row_bytes);
+    }
+    png_write_image(png, rows);
+    png_write_end(png, NULL);
+    png_destroy_write_struct(&png, &info);
+    free(rows);
+
+    PSObject *buf_obj = ps_buffer_new(vm, state.size);
+    if (!buf_obj) {
+        free(state.data);
+        img_throw(vm, "ResourceLimitError", "Out of memory");
+        return ps_value_undefined();
+    }
+    PSBuffer *out_buf = ps_buffer_from_object(buf_obj);
+    if (!out_buf) {
+        free(state.data);
+        img_throw(vm, "ResourceLimitError", "Out of memory");
+        return ps_value_undefined();
+    }
+    memcpy(out_buf->data, state.data, state.size);
+    free(state.data);
+    if (img_timing_enabled()) {
+        uint64_t dt = img_now_ms() - t0;
+        fprintf(stderr,
+                "img_timing encodePNG %dx%d input=%zuB output=%zuB %llums\n",
+                width,
+                height,
+                (size_t)width * (size_t)height * 4,
+                state.size,
+                (unsigned long long)dt);
+    }
+    return ps_value_object(buf_obj);
+}
+
+static PSValue ps_native_img_encode_jpeg(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
+    (void)this_val;
+    if (argc < 1) {
+        img_throw(vm, "ArgumentError", "Image.encodeJPEG expects (image, quality)");
+        return ps_value_undefined();
+    }
+    int width = 0;
+    int height = 0;
+    PSBuffer *src_buf = NULL;
+    if (!img_extract_image(vm, argv[0], &width, &height, &src_buf)) return ps_value_undefined();
+    uint64_t t0 = 0;
+    if (img_timing_enabled()) t0 = img_now_ms();
+
+    int quality = 75;
+    if (argc > 1) {
+        double q = ps_to_number(vm, argv[1]);
+        if (vm && vm->has_pending_throw) return ps_value_undefined();
+        if (!isfinite(q)) {
+            img_throw(vm, "ArgumentError", "Invalid JPEG quality");
+            return ps_value_undefined();
+        }
+        if (q < 0) q = 0;
+        if (q > 100) q = 100;
+        quality = (int)q;
+    }
+
+    struct jpeg_compress_struct cinfo;
+    PSJpegError jerr;
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = img_jpeg_error_exit;
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_compress(&cinfo);
+        img_throw(vm, "EncodeError", "JPEG encoding failed");
+        return ps_value_undefined();
+    }
+    jpeg_create_compress(&cinfo);
+
+    unsigned char *out_buf = NULL;
+    unsigned long out_size = 0;
+    jpeg_mem_dest(&cinfo, &out_buf, &out_size);
+
+    cinfo.image_width = (JDIMENSION)width;
+    cinfo.image_height = (JDIMENSION)height;
+    cinfo.input_components = 3;
+    cinfo.in_color_space = JCS_RGB;
+
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, quality, TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+
+    JSAMPROW row[1];
+    uint8_t *row_buf = (uint8_t *)malloc((size_t)width * 3);
+    if (!row_buf) {
+        jpeg_destroy_compress(&cinfo);
+        img_throw(vm, "ResourceLimitError", "Out of memory");
+        return ps_value_undefined();
+    }
+
+    while (cinfo.next_scanline < cinfo.image_height) {
+        size_t y = cinfo.next_scanline;
+        const uint8_t *src = src_buf->data + y * (size_t)width * 4;
+        for (int x = 0; x < width; x++) {
+            row_buf[x * 3 + 0] = src[x * 4 + 0];
+            row_buf[x * 3 + 1] = src[x * 4 + 1];
+            row_buf[x * 3 + 2] = src[x * 4 + 2];
+        }
+        row[0] = row_buf;
+        jpeg_write_scanlines(&cinfo, row, 1);
+    }
+
+    free(row_buf);
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+
+    PSObject *buf_obj = ps_buffer_new(vm, (size_t)out_size);
+    if (!buf_obj) {
+        free(out_buf);
+        img_throw(vm, "ResourceLimitError", "Out of memory");
+        return ps_value_undefined();
+    }
+    PSBuffer *dst = ps_buffer_from_object(buf_obj);
+    if (!dst) {
+        free(out_buf);
+        img_throw(vm, "ResourceLimitError", "Out of memory");
+        return ps_value_undefined();
+    }
+    memcpy(dst->data, out_buf, (size_t)out_size);
+    free(out_buf);
+
+    if (img_timing_enabled()) {
+        uint64_t dt = img_now_ms() - t0;
+        fprintf(stderr,
+                "img_timing encodeJPEG %dx%d quality=%d input=%zuB output=%luB %llums\n",
+                width,
+                height,
+                quality,
+                (size_t)width * (size_t)height * 4,
+                out_size,
+                (unsigned long long)dt);
+    }
+    return ps_value_object(buf_obj);
 }
 
 static PSValue ps_native_img_resample(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
@@ -546,16 +808,22 @@ void ps_img_init(PSVM *vm) {
     PSObject *detect_fn = ps_function_new_native(ps_native_img_detect_format);
     PSObject *decode_png_fn = ps_function_new_native(ps_native_img_decode_png);
     PSObject *decode_jpeg_fn = ps_function_new_native(ps_native_img_decode_jpeg);
+    PSObject *encode_png_fn = ps_function_new_native(ps_native_img_encode_png);
+    PSObject *encode_jpeg_fn = ps_function_new_native(ps_native_img_encode_jpeg);
     PSObject *resample_fn = ps_function_new_native(ps_native_img_resample);
 
     if (detect_fn) ps_function_setup(detect_fn, vm->function_proto, vm->object_proto, NULL);
     if (decode_png_fn) ps_function_setup(decode_png_fn, vm->function_proto, vm->object_proto, NULL);
     if (decode_jpeg_fn) ps_function_setup(decode_jpeg_fn, vm->function_proto, vm->object_proto, NULL);
+    if (encode_png_fn) ps_function_setup(encode_png_fn, vm->function_proto, vm->object_proto, NULL);
+    if (encode_jpeg_fn) ps_function_setup(encode_jpeg_fn, vm->function_proto, vm->object_proto, NULL);
     if (resample_fn) ps_function_setup(resample_fn, vm->function_proto, vm->object_proto, NULL);
 
     if (detect_fn) ps_object_define(img, ps_string_from_cstr("detectFormat"), ps_value_object(detect_fn), PS_ATTR_NONE);
     if (decode_png_fn) ps_object_define(img, ps_string_from_cstr("decodePNG"), ps_value_object(decode_png_fn), PS_ATTR_NONE);
     if (decode_jpeg_fn) ps_object_define(img, ps_string_from_cstr("decodeJPEG"), ps_value_object(decode_jpeg_fn), PS_ATTR_NONE);
+    if (encode_png_fn) ps_object_define(img, ps_string_from_cstr("encodePNG"), ps_value_object(encode_png_fn), PS_ATTR_NONE);
+    if (encode_jpeg_fn) ps_object_define(img, ps_string_from_cstr("encodeJPEG"), ps_value_object(encode_jpeg_fn), PS_ATTR_NONE);
     if (resample_fn) ps_object_define(img, ps_string_from_cstr("resample"), ps_value_object(resample_fn), PS_ATTR_NONE);
 
     ps_object_define(vm->global, ps_string_from_cstr("Image"), ps_value_object(img), PS_ATTR_NONE);

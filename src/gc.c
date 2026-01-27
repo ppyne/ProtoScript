@@ -1,4 +1,6 @@
 #include "ps_gc.h"
+#include "ps_array.h"
+#include "ps_numeric_map.h"
 #include "ps_config.h"
 
 #include <stdlib.h>
@@ -12,16 +14,28 @@
 #include "ps_buffer.h"
 #include "ps_display.h"
 #include "ps_config.h"
+#include "ps_stmt_bc.h"
 #if PS_ENABLE_MODULE_IMG
 #include "ps_img.h"
 #endif
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static const uint32_t PS_GC_MAGIC = 0x50474331; /* "PGC1" */
 
 static PSVM *g_active_vm = NULL;
+static int g_gc_trace = -1;
+
+static int ps_gc_trace_enabled(void) {
+    if (g_gc_trace < 0) {
+        const char *env = getenv("PS_GC_TRACE");
+        g_gc_trace = (env && env[0]) ? 1 : 0;
+    }
+    return g_gc_trace;
+}
 
 static PSGCHeader *ps_gc_header(void *ptr) {
     return ptr ? ((PSGCHeader *)ptr - 1) : NULL;
@@ -42,9 +56,28 @@ PSVM *ps_gc_active_vm(void) {
 void ps_gc_init(PSVM *vm) {
     if (!vm) return;
     memset(&vm->gc, 0, sizeof(vm->gc));
-    vm->gc.min_threshold = 256 * 1024;
-    vm->gc.growth_factor = 2.0;
+    vm->gc.min_threshold = 256 * 1024 * 1024;
+    vm->gc.growth_factor = 4.0;
     vm->gc.threshold = vm->gc.min_threshold;
+    {
+        const char *min_env = getenv("PS_GC_MIN_THRESHOLD");
+        if (min_env && min_env[0]) {
+            char *end = NULL;
+            unsigned long long val = strtoull(min_env, &end, 10);
+            if (end != min_env && val > 0) {
+                vm->gc.min_threshold = (size_t)val;
+                vm->gc.threshold = vm->gc.min_threshold;
+            }
+        }
+        const char *growth_env = getenv("PS_GC_GROWTH_FACTOR");
+        if (growth_env && growth_env[0]) {
+            char *end = NULL;
+            double val = strtod(growth_env, &end);
+            if (end != growth_env && val > 1.0) {
+                vm->gc.growth_factor = val;
+            }
+        }
+    }
 }
 
 void ps_gc_destroy(PSVM *vm) {
@@ -206,6 +239,12 @@ static void ps_gc_mark_ast_node(PSVM *vm, PSAstNode *node) {
             ps_gc_mark_ast_node(vm, node->as.func_expr.body);
             break;
         case AST_IDENTIFIER:
+            node->as.identifier.cache_fast_env = NULL;
+            node->as.identifier.cache_fast_index = 0;
+            node->as.identifier.cache_env = NULL;
+            node->as.identifier.cache_record = NULL;
+            node->as.identifier.cache_prop = NULL;
+            node->as.identifier.cache_shape = 0;
             if (node->as.identifier.str) {
                 ps_gc_mark_string(vm, node->as.identifier.str);
             }
@@ -237,8 +276,21 @@ static void ps_gc_mark_ast_node(PSVM *vm, PSAstNode *node) {
             for (size_t i = 0; i < node->as.call.argc; i++) {
                 ps_gc_mark_ast_node(vm, node->as.call.args[i]);
             }
+            node->as.call.cache_kind = 0;
+            node->as.call.cache_env = NULL;
+            node->as.call.cache_fast_env = NULL;
+            node->as.call.cache_fast_index = 0;
+            node->as.call.cache_record = NULL;
+            node->as.call.cache_prop = NULL;
+            node->as.call.cache_shape = 0;
+            node->as.call.cache_obj = NULL;
+            node->as.call.cache_member_prop = NULL;
+            node->as.call.cache_member_shape = 0;
             break;
         case AST_MEMBER:
+            node->as.member.cache_obj = NULL;
+            node->as.member.cache_prop = NULL;
+            node->as.member.cache_shape = 0;
             ps_gc_mark_ast_node(vm, node->as.member.object);
             ps_gc_mark_ast_node(vm, node->as.member.property);
             break;
@@ -303,7 +355,22 @@ static void ps_gc_mark_function(PSVM *vm, PSFunction *fn) {
             ps_gc_mark_string(vm, fn->param_names[i]);
         }
     }
+    if (fn->fast_names) {
+        for (size_t i = 0; i < fn->fast_count; i++) {
+            ps_gc_mark_string(vm, fn->fast_names[i]);
+        }
+    }
+    if (fn->fast_env) {
+        ps_gc_mark_env(vm, fn->fast_env);
+    }
     ps_gc_mark_string(vm, fn->name);
+#if !PS_DISABLE_SPECIALIZATION
+    if (fn->slot_names) {
+        for (size_t i = 0; i < fn->slot_count; i++) {
+            ps_gc_mark_string(vm, fn->slot_names[i]);
+        }
+    }
+#endif
 }
 
 static void ps_gc_mark_env(PSVM *vm, PSEnv *env) {
@@ -319,6 +386,11 @@ static void ps_gc_mark_env(PSVM *vm, PSEnv *env) {
     if (env->param_names) {
         for (size_t i = 0; i < env->param_count; i++) {
             ps_gc_mark_string(vm, env->param_names[i]);
+        }
+    }
+    if (env->fast_values) {
+        for (size_t i = 0; i < env->fast_count; i++) {
+            ps_gc_mark_value(vm, env->fast_values[i]);
         }
     }
 }
@@ -339,6 +411,24 @@ static void ps_gc_mark_object(PSVM *vm, PSObject *obj) {
         case PS_OBJ_KIND_FUNCTION:
             ps_gc_mark_function(vm, (PSFunction *)obj->internal);
             break;
+        case PS_OBJ_KIND_PLAIN: {
+            if (obj->internal_kind != PS_INTERNAL_NUMMAP) break;
+            PSNumMap *map = (PSNumMap *)obj->internal;
+            if (!map) break;
+            for (size_t i = 0; i < map->capacity; i++) {
+                if (map->present[i]) {
+                    ps_gc_mark_value(vm, map->items[i]);
+                }
+            }
+            if (map->hash_state && map->hash_values) {
+                for (size_t i = 0; i < map->hash_cap; i++) {
+                    if (map->hash_state[i] == 1) {
+                        ps_gc_mark_value(vm, map->hash_values[i]);
+                    }
+                }
+            }
+            break;
+        }
         case PS_OBJ_KIND_BOOLEAN:
         case PS_OBJ_KIND_NUMBER:
         case PS_OBJ_KIND_STRING:
@@ -350,6 +440,24 @@ static void ps_gc_mark_object(PSVM *vm, PSObject *obj) {
         case PS_OBJ_KIND_REGEXP: {
             PSRegex *re = (PSRegex *)obj->internal;
             if (re) ps_gc_mark_string(vm, re->source);
+            break;
+        }
+        case PS_OBJ_KIND_ARRAY: {
+            PSArray *arr = (PSArray *)obj->internal;
+            if (!arr) break;
+            size_t limit = arr->capacity < arr->length ? arr->capacity : arr->length;
+            for (size_t i = 0; i < limit; i++) {
+                if (arr->dense || !arr->present || arr->present[i]) {
+                    ps_gc_mark_value(vm, arr->items[i]);
+                }
+            }
+            break;
+        }
+        case PS_OBJ_KIND_BUFFER32: {
+            PSBuffer32 *view = (PSBuffer32 *)obj->internal;
+            if (view && view->source) {
+                ps_gc_mark_object(vm, view->source);
+            }
             break;
         }
         default:
@@ -397,6 +505,11 @@ static void ps_gc_mark_roots(PSVM *vm) {
     if (vm->index_cache && vm->index_cache_size > 0) {
         for (size_t i = 0; i < vm->index_cache_size; i++) {
             ps_gc_mark_string(vm, vm->index_cache[i]);
+        }
+    }
+    if (vm->intern_cache && vm->intern_cache_size > 0) {
+        for (size_t i = 0; i < vm->intern_cache_size; i++) {
+            ps_gc_mark_string(vm, vm->intern_cache[i]);
         }
     }
     for (size_t i = 0; i < vm->gc.root_count; i++) {
@@ -448,6 +561,16 @@ static void ps_gc_finalize_object(PSObject *obj) {
         case PS_OBJ_KIND_REGEXP:
             ps_regex_free((PSRegex *)obj->internal);
             break;
+        case PS_OBJ_KIND_PLAIN:
+            if (obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                ps_num_map_free((PSNumMap *)obj->internal);
+            } else {
+                free(obj->internal);
+            }
+            break;
+        case PS_OBJ_KIND_ARRAY:
+            ps_array_free((PSArray *)obj->internal);
+            break;
         case PS_OBJ_KIND_BUFFER: {
             PSBuffer *buf = (PSBuffer *)obj->internal;
             if (buf) {
@@ -456,6 +579,9 @@ static void ps_gc_finalize_object(PSObject *obj) {
             }
             break;
         }
+        case PS_OBJ_KIND_BUFFER32:
+            free(obj->internal);
+            break;
 #if PS_ENABLE_MODULE_IMG
         case PS_OBJ_KIND_IMAGE:
             ps_img_handle_release((PSImageHandle *)obj->internal);
@@ -496,6 +622,56 @@ static void ps_gc_finalize_function(PSFunction *fn) {
     if (!fn) return;
     free(fn->param_names);
     fn->param_names = NULL;
+    free(fn->fast_names);
+    fn->fast_names = NULL;
+    fn->fast_count = 0;
+    free(fn->fast_param_index);
+    fn->fast_param_index = NULL;
+    free(fn->fast_local_index);
+    fn->fast_local_index = NULL;
+    fn->fast_local_index_count = 0;
+    fn->fast_local_count = 0;
+    fn->fast_this_index = 0;
+    free(fn->fast_num_inits);
+    fn->fast_num_inits = NULL;
+    free(fn->fast_num_names);
+    fn->fast_num_names = NULL;
+    fn->fast_num_count = 0;
+    fn->fast_num_return = NULL;
+    fn->fast_num_if_cond = NULL;
+    fn->fast_num_if_return = NULL;
+    free(fn->fast_num_ops);
+    fn->fast_num_ops = NULL;
+    fn->fast_num_ops_count = 0;
+    fn->fast_env = NULL;
+    fn->fast_env_in_use = 0;
+    ps_stmt_bc_free(fn->stmt_bc);
+    fn->stmt_bc = NULL;
+    fn->stmt_bc_state = 0;
+#if !PS_DISABLE_SPECIALIZATION
+    free(fn->slot_names);
+    fn->slot_names = NULL;
+    fn->slot_count = 0;
+    free(fn->spec_slot_names);
+    fn->spec_slot_names = NULL;
+    fn->spec_slot_count = 0;
+    fn->spec_hot_count = 0;
+    ps_stmt_bc_free(fn->spec_bc);
+    fn->spec_bc = NULL;
+    fn->spec_bc_state = 0;
+    fn->spec_guard_count = 0;
+#endif
+#if !PS_DISABLE_UNBOXED_SPEC
+    fn->unboxed_hot_count = 0;
+    ps_stmt_bc_free(fn->unboxed_bc);
+    fn->unboxed_bc = NULL;
+    fn->unboxed_bc_state = 0;
+    fn->unboxed_guard_count = 0;
+    fn->unboxed_used_count = 0;
+    for (size_t i = 0; i < (PS_SPECIALIZATION_SLOT_MAX + 31) / 32; i++) {
+        fn->unboxed_write_bits[i] = 0;
+    }
+#endif
     /* Function references are owned by AST or env; nothing to free here. */
 }
 
@@ -534,6 +710,9 @@ void ps_gc_free(void *ptr) {
 
 void ps_gc_collect(PSVM *vm) {
     if (!vm || vm->gc.in_collect) return;
+    clock_t start = 0;
+    if (ps_gc_trace_enabled())
+        start = clock();
     vm->gc.in_collect = 1;
     ps_gc_mark_roots(vm);
 
@@ -584,10 +763,23 @@ void ps_gc_collect(PSVM *vm) {
     }
     vm->gc.should_collect = 0;
     vm->gc.in_collect = 0;
+    if (ps_gc_trace_enabled()) {
+        double ms = 0.0;
+        if (start) {
+            ms = (double)(clock() - start) * 1000.0 / (double)CLOCKS_PER_SEC;
+        }
+        fprintf(stderr,
+            "[GC] collection=%d ms=%.2f heap=%zu live=%zu freed=%d threshold=%zu\n",
+            vm->gc.collections, ms, vm->gc.heap_bytes, vm->gc.live_bytes_last,
+            vm->gc.freed_last, vm->gc.threshold);
+    }
 }
 
 void ps_gc_safe_point(PSVM *vm) {
     if (!vm) return;
+#if PS_ENABLE_PERF
+    ps_vm_perf_poll(vm);
+#endif
     if (vm->gc.should_collect && !vm->gc.in_collect) {
         ps_gc_collect(vm);
     }

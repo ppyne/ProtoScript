@@ -1,5 +1,4 @@
-include "../../examples/utils/assign.js";
-
+ProtoScript.include("../../examples/utils/assign.js");
 var src = { a: 1, nested: { x: 1 } };
 var dst = assign({}, src);
 Io.print(dst.a + "\n");

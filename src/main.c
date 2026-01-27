@@ -75,15 +75,24 @@ static char *read_stream(FILE *fp, size_t *out_len) {
     return buf;
 }
 
+static int g_bench_exit_requested = 0;
+static int g_bench_exit_code = 0;
+
 static PSValue ps_native_protoscript_exit(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
     (void)this_val;
     int code = 0;
+    const char *bench_split = getenv("PS_BENCH_SPLIT_TIMING");
     if (argc > 0) {
         double num = ps_to_number(vm, argv[0]);
         if (vm && vm->has_pending_throw) return ps_value_undefined();
         if (!isnan(num) && !isinf(num)) {
             code = (int)num;
         }
+    }
+    if (bench_split && bench_split[0] == '1') {
+        g_bench_exit_requested = 1;
+        g_bench_exit_code = code;
+        return ps_value_undefined();
     }
     exit(code);
     return ps_value_undefined();
@@ -165,8 +174,92 @@ static PSValue ps_native_protoscript_perf_stats(PSVM *vm, PSValue this_val, int 
                      ps_value_number((double)vm->perf.call_count),
                      PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
     ps_object_define(obj,
+                     ps_string_from_cstr("evalNodeCount"),
+                     ps_value_number((double)vm->perf.eval_node_count),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("evalExprCount"),
+                     ps_value_number((double)vm->perf.eval_expr_count),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("callIdentCount"),
+                     ps_value_number((double)vm->perf.call_ident_count),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("callMemberCount"),
+                     ps_value_number((double)vm->perf.call_member_count),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("callOtherCount"),
+                     ps_value_number((double)vm->perf.call_other_count),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
                      ps_string_from_cstr("nativeCallCount"),
                      ps_value_number((double)vm->perf.native_call_count),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("objectGet"),
+                     ps_value_number((double)vm->perf.object_get),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("objectPut"),
+                     ps_value_number((double)vm->perf.object_put),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("objectDefine"),
+                     ps_value_number((double)vm->perf.object_define),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("objectDelete"),
+                     ps_value_number((double)vm->perf.object_delete),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("arrayGet"),
+                     ps_value_number((double)vm->perf.array_get),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("arraySet"),
+                     ps_value_number((double)vm->perf.array_set),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("arrayDelete"),
+                     ps_value_number((double)vm->perf.array_delete),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("stringFromCstr"),
+                     ps_value_number((double)vm->perf.string_from_cstr),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("bufferReadIndex"),
+                     ps_value_number((double)vm->perf.buffer_read_index),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("bufferWriteIndex"),
+                     ps_value_number((double)vm->perf.buffer_write_index),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("bufferReadIndexFast"),
+                     ps_value_number((double)vm->perf.buffer_read_index_fast),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("bufferWriteIndexFast"),
+                     ps_value_number((double)vm->perf.buffer_write_index_fast),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("buffer32ReadIndex"),
+                     ps_value_number((double)vm->perf.buffer32_read_index),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("buffer32WriteIndex"),
+                     ps_value_number((double)vm->perf.buffer32_write_index),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("buffer32ReadIndexFast"),
+                     ps_value_number((double)vm->perf.buffer32_read_index_fast),
+                     PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+    ps_object_define(obj,
+                     ps_string_from_cstr("buffer32WriteIndexFast"),
+                     ps_value_number((double)vm->perf.buffer32_write_index_fast),
                      PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
     ps_object_define(obj,
                      ps_string_from_cstr("gcCollections"),
@@ -276,6 +369,15 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    const char *perf_interval = getenv("PS_PERF_INTERVAL_MS");
+    if (perf_interval && perf_interval[0]) {
+        char *end = NULL;
+        unsigned long long interval = strtoull(perf_interval, &end, 10);
+        if (end && end != perf_interval && interval > 0) {
+            ps_vm_set_perf_interval(vm, (uint64_t)interval);
+        }
+    }
+
     define_protoscript_info(vm, argc, argv);
 
     const char *source_path = NULL;
@@ -290,6 +392,16 @@ int main(int argc, char **argv) {
     }
     ps_eval(vm, program);
     ps_ast_free(program);
+    const char *perf_dump = getenv("PS_PERF_DUMP");
+    if (perf_dump && perf_dump[0] == '1') {
+        ps_vm_perf_dump(vm);
+    }
+    if (g_bench_exit_requested) {
+        int code = g_bench_exit_code;
+        ps_vm_free(vm);
+        free(source);
+        exit(code);
+    }
     ps_vm_free(vm);
     free(source);
     return 0;

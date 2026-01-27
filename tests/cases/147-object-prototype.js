@@ -1,5 +1,4 @@
-include "../../examples/utils/clone.js";
-
+ProtoScript.include("../../examples/utils/clone.js");
 var base = { a: 1 };
 var obj = Object.create(base);
 Io.print((Object.getPrototypeOf(obj) === base) ? "proto-ok\n" : "proto-bad\n");

@@ -33,6 +33,28 @@ You can test ProtoScript immediately thanks to a demo running on the web via Web
 - ECMA-262 Edition 1 (June 1997): [`docs/specs/ECMA-262_1st_edition_june_1997.pdf`](docs/specs/ECMA-262_1st_edition_june_1997.pdf)
 - License (BSD-3-Clause): [`LICENSE`](LICENSE)
 
+## Performance Note
+
+The fastest current interpreter uses peephole optimizations and control-flow
+superinstructions, which deliver clear performance wins.
+
+| Interpreter configuration                         | Relative speed | Notes |
+|--------------------------------------------------|----------------|-------|
+| Baseline (simple opcode dispatch)                | 1.0×           | Reference interpreter, no peephole, no superinstructions |
+| + Peephole optimizations                         | ~1.3× – 1.5×   | Reduced dispatch overhead, shorter opcode sequences |
+| + Control-flow superinstructions                 | ~1.6× – 2.0×   | Fewer indirect branches, improved I-cache locality |
+| + Inline caches (monomorphic)                    | ~1.6×          | No measurable gain over superinstructions baseline |
+| + Per-function specialization (v1 / v2)         | ~1.6×          | No measurable gain in real workloads |
+
+Note: Speedups are relative to the simplest interpreter baseline and represent
+typical results observed on tight-loop microbenchmarks. Exact numbers vary by
+workload and platform.
+
+More advanced techniques (inline caches, function specialization) were evaluated on top
+of this baseline but did not yield measurable gains and are therefore disabled by default or removed.
+
+Further improvements would require a change of execution model (trace/JIT/AOT/native).
+
 ## Build (Simple, Complete)
 
 ### Prerequisites
@@ -45,12 +67,21 @@ You can test ProtoScript immediately thanks to a demo running on the web via Web
 - cmake
 - make
 
-### Install third_party submodules
+### Clone ProtoScript
+
 ```sh
+git clone https://github.com/ppyne/ProtoScript.git
+```
+
+### Install third_party submodules
+
+```sh
+cd ProtoScript
 git submodule update --init --recursive third_party/SDL third_party/libpng third_party/libjpeg
 ```
 
 ### Build third_party (SDL2, libpng, libjpeg)
+
 ```sh
 mkdir -p third_party/SDL/build
 cmake -S third_party/SDL -B third_party/SDL/build -DCMAKE_BUILD_TYPE=Release

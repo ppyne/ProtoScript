@@ -1,5 +1,4 @@
-include "PriorityQueue.js";
-
+ProtoScript.include("PriorityQueue.js");
 var pq = new PriorityQueue();
 pq.enqueue(5);
 pq.enqueue(1);

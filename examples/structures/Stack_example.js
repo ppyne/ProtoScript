@@ -1,5 +1,4 @@
-include "Stack.js";
-
+ProtoScript.include("Stack.js");
 var s = new Stack();
 Io.print(s.isEmpty() ? "empty\n" : "not empty\n");
 

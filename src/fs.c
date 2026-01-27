@@ -4,6 +4,7 @@
 
 #include "ps_eval.h"
 #include "ps_function.h"
+#include "ps_array.h"
 #include "ps_object.h"
 #include "ps_string.h"
 #include "ps_value.h"
@@ -86,15 +87,13 @@ static PSObject *fs_make_array(PSVM *vm) {
                                                         : (vm ? vm->object_proto : NULL));
     if (!arr) return NULL;
     arr->kind = PS_OBJ_KIND_ARRAY;
+    (void)ps_array_init(arr);
     return arr;
 }
 
 static void fs_finalize_array(PSObject *arr, size_t count) {
     if (!arr) return;
-    ps_object_define(arr,
-                     ps_string_from_cstr("length"),
-                     ps_value_number((double)count),
-                     PS_ATTR_DONTENUM | PS_ATTR_DONTDELETE);
+    (void)ps_array_set_length_internal(arr, count);
 }
 
 static PSValue ps_native_fs_chmod(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {

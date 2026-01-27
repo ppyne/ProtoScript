@@ -37,6 +37,8 @@ typedef struct PSObject {
     uint8_t          internal_kind; /* PSInternalKind for PLAIN objects */
 } PSObject;
 
+void ps_object_bump_shape(PSObject *obj);
+
 typedef enum {
     PS_OBJ_KIND_PLAIN = 0,
     PS_OBJ_KIND_FUNCTION = 1,

@@ -27,6 +27,14 @@
 #define PS_ENABLE_PERF 1
 #endif
 
+#ifndef PS_DISABLE_PEEPHOLE
+#define PS_DISABLE_PEEPHOLE 0
+#endif
+
+#ifndef PS_DISABLE_CF_FUSIONS
+#define PS_DISABLE_CF_FUSIONS 0
+#endif
+
 #ifndef PS_ENABLE_MODULE_DISPLAY
 #define PS_ENABLE_MODULE_DISPLAY 1
 #endif

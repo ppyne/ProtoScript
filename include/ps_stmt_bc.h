@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "ps_value.h"
 
 typedef struct PSStmtBCInstr {
     uint8_t op;
@@ -16,6 +17,8 @@ typedef struct PSStmtBCInstr {
 typedef struct PSStmtBC {
     PSStmtBCInstr *code;
     size_t count;
+    PSValue *consts;
+    size_t const_count;
 } PSStmtBC;
 
 void ps_stmt_bc_free(PSStmtBC *bc);

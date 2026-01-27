@@ -51,6 +51,20 @@ static int ps_string_to_k_index(const PSString *name, uint32_t *out_index) {
     return 1;
 }
 
+static uint32_t ps_shape_next_id(void) {
+    static uint32_t counter = 1;
+    uint32_t next = counter++;
+    if (next == 0) {
+        next = counter++;
+    }
+    return next;
+}
+
+void ps_object_bump_shape(PSObject *obj) {
+    if (!obj) return;
+    obj->shape_id = ps_shape_next_id();
+}
+
 static size_t ps_object_bucket_index(const PSObject *obj, const PSString *name) {
     return (size_t)name->hash & (obj->bucket_count - 1);
 }
@@ -148,7 +162,7 @@ PSObject *ps_object_new(PSObject *prototype) {
     o->prop_count = 0;
     o->kind = PS_OBJ_KIND_PLAIN;
     o->internal = NULL;
-    o->shape_id = 1;
+    o->shape_id = ps_shape_next_id();
     o->internal_kind = PS_INTERNAL_NONE;
     return o;
 }
@@ -351,7 +365,7 @@ int ps_object_define(PSObject *obj, PSString *name, PSValue value, uint8_t attrs
         if (ps_array_string_to_index((PSString *)name, &index)) {
             int is_new = 0;
             if (!ps_num_map_set(obj, index, value, &is_new)) return 0;
-            if (is_new) obj->shape_id++;
+            if (is_new) ps_object_bump_shape(obj);
             ps_math_intrinsics_invalidate(obj);
             return 1;
         }
@@ -359,7 +373,7 @@ int ps_object_define(PSObject *obj, PSString *name, PSValue value, uint8_t attrs
         if (ps_string_to_k_index(name, &kindex)) {
             int is_new = 0;
             if (!ps_num_map_k_set(obj, kindex, value, &is_new)) return 0;
-            if (is_new) obj->shape_id++;
+            if (is_new) ps_object_bump_shape(obj);
             ps_math_intrinsics_invalidate(obj);
             return 1;
         }
@@ -386,7 +400,7 @@ int ps_object_define(PSObject *obj, PSString *name, PSValue value, uint8_t attrs
     p->next = obj->props;
     obj->props = p;
     obj->prop_count++;
-    obj->shape_id++;
+    ps_object_bump_shape(obj);
 
     if (!obj->buckets && obj->prop_count > 8) {
         ps_object_ensure_buckets(obj);
@@ -432,7 +446,7 @@ int ps_object_put(PSObject *obj, PSString *name, PSValue value) {
         if (ps_array_string_to_index((PSString *)name, &index)) {
             int is_new = 0;
             if (!ps_num_map_set(obj, index, value, &is_new)) return 0;
-            if (is_new) obj->shape_id++;
+            if (is_new) ps_object_bump_shape(obj);
             ps_math_intrinsics_invalidate(obj);
             return 1;
         }
@@ -440,7 +454,7 @@ int ps_object_put(PSObject *obj, PSString *name, PSValue value) {
         if (ps_string_to_k_index(name, &kindex)) {
             int is_new = 0;
             if (!ps_num_map_k_set(obj, kindex, value, &is_new)) return 0;
-            if (is_new) obj->shape_id++;
+            if (is_new) ps_object_bump_shape(obj);
             ps_math_intrinsics_invalidate(obj);
             return 1;
         }
@@ -486,7 +500,7 @@ int ps_object_delete(PSObject *obj, const PSString *name, int *deleted) {
             if (!find_prop(obj, name)) {
                 int did_delete = 0;
                 if (ps_num_map_delete(obj, index, &did_delete) && did_delete) {
-                    obj->shape_id++;
+                    ps_object_bump_shape(obj);
                 }
                 if (deleted) *deleted = did_delete ? 1 : 0;
                 return 1;
@@ -497,7 +511,7 @@ int ps_object_delete(PSObject *obj, const PSString *name, int *deleted) {
             if (!find_prop(obj, name)) {
                 int did_delete = 0;
                 if (ps_num_map_k_delete(obj, kindex, &did_delete) && did_delete) {
-                    obj->shape_id++;
+                    ps_object_bump_shape(obj);
                 }
                 if (deleted) *deleted = did_delete ? 1 : 0;
                 return 1;
@@ -545,7 +559,7 @@ int ps_object_delete(PSObject *obj, const PSString *name, int *deleted) {
             if (obj->prop_count > 0) {
                 obj->prop_count--;
             }
-            obj->shape_id++;
+            ps_object_bump_shape(obj);
 
             if (obj->cache_prop == p) {
                 obj->cache_prop = NULL;

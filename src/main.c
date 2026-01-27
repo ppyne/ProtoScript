@@ -75,15 +75,24 @@ static char *read_stream(FILE *fp, size_t *out_len) {
     return buf;
 }
 
+static int g_bench_exit_requested = 0;
+static int g_bench_exit_code = 0;
+
 static PSValue ps_native_protoscript_exit(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
     (void)this_val;
     int code = 0;
+    const char *bench_split = getenv("PS_BENCH_SPLIT_TIMING");
     if (argc > 0) {
         double num = ps_to_number(vm, argv[0]);
         if (vm && vm->has_pending_throw) return ps_value_undefined();
         if (!isnan(num) && !isinf(num)) {
             code = (int)num;
         }
+    }
+    if (bench_split && bench_split[0] == '1') {
+        g_bench_exit_requested = 1;
+        g_bench_exit_code = code;
+        return ps_value_undefined();
     }
     exit(code);
     return ps_value_undefined();
@@ -386,6 +395,12 @@ int main(int argc, char **argv) {
     const char *perf_dump = getenv("PS_PERF_DUMP");
     if (perf_dump && perf_dump[0] == '1') {
         ps_vm_perf_dump(vm);
+    }
+    if (g_bench_exit_requested) {
+        int code = g_bench_exit_code;
+        ps_vm_free(vm);
+        free(source);
+        exit(code);
     }
     ps_vm_free(vm);
     free(source);

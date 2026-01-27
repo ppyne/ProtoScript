@@ -21,6 +21,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdint.h>
+#include <limits.h>
 #include <time.h>
 
 #define PS_PERF_POLL(vm) do { \
@@ -109,6 +110,7 @@ static PSValue eval_expression_inner(PSVM *vm,
                                      int allow_bc);
 static PSStmtBC *ps_stmt_bc_compile(PSAstNode *node);
 static PSValue ps_stmt_bc_execute(PSVM *vm, PSEnv *env, PSFunction *func, PSStmtBC *bc, PSEvalControl *ctl);
+static PSValue ps_stmt_bc_eval_expr(PSVM *vm, PSEnv *env, PSAstNode *expr, PSEvalControl *ctl);
 static PSValue eval_block(PSVM *vm, PSEnv *env, PSAstNode *node, PSEvalControl *ctl);
 static PSValue ps_eval_source(PSVM *vm, PSEnv *env, PSString *source, PSEvalControl *ctl);
 static void hoist_decls(PSVM *vm, PSEnv *env, PSAstNode *node);
@@ -591,6 +593,15 @@ static uint32_t ps_to_uint32_num(double num) {
     double val = fmod(sign * abs, 4294967296.0);
     if (val < 0) val += 4294967296.0;
     return (uint32_t)val;
+}
+
+static int ps_number_to_int32_strict(double num, int32_t *out) {
+    if (isnan(num) || isinf(num)) return 0;
+    if (num < (double)INT32_MIN || num > (double)INT32_MAX) return 0;
+    int32_t v = (int32_t)num;
+    if ((double)v != num) return 0;
+    if (out) *out = v;
+    return 1;
 }
 
 static double ps_to_number_fast(PSVM *vm, PSValue value) {
@@ -2893,7 +2904,7 @@ static int ps_assign_for_target(PSVM *vm,
             if (idx > 0 && (target_obj->internal == NULL || target_obj->internal_kind == PS_INTERNAL_NUMMAP)) {
                 int is_new = 0;
                 if (!ps_num_map_set(target_obj, index, value, &is_new)) return 0;
-                if (is_new) target_obj->shape_id++;
+                if (is_new) ps_object_bump_shape(target_obj);
                 if (env && env->arguments_obj == target_obj) {
                     PSString *prop = ps_array_index_string(vm, index);
                     (void)ps_env_update_arguments(env, target_obj, prop, value);
@@ -4034,7 +4045,7 @@ PSValue ps_eval_call_function(PSVM *vm,
         PSValue current = ((int)i < argc) ? argv[i] : ps_value_undefined();
         if (current.type != PS_T_UNDEFINED) continue;
         PSEvalControl default_ctl = {0};
-        PSValue default_val = eval_expression(vm, call_env, default_expr, &default_ctl);
+        PSValue default_val = ps_stmt_bc_eval_expr(vm, call_env, default_expr, &default_ctl);
         if (default_ctl.did_throw) {
             ps_env_free(call_env);
             if (vm) {
@@ -4080,7 +4091,10 @@ PSValue ps_eval_call_function(PSVM *vm,
     if (func->stmt_bc_state == 1 && func->stmt_bc) {
         ret = ps_stmt_bc_execute(vm, call_env, func, func->stmt_bc, &inner);
     } else {
-        ret = eval_node(vm, call_env, func->body, &inner);
+        inner.did_throw = 1;
+        inner.throw_value = ps_vm_make_error(vm, "SyntaxError",
+                                             "Statement bytecode compilation failed");
+        ret = inner.throw_value;
     }
     if (vm) vm->env = prev_env;
     if (vm && root_count) {
@@ -4133,6 +4147,73 @@ static int ps_collect_enum_name(PSString *name, PSValue value, uint8_t attrs, vo
     }
     list->items[list->count++] = name;
     return 0;
+}
+
+static PSObject *ps_for_in_collect_array(PSVM *vm, PSObject *obj) {
+    if (!vm) return NULL;
+    PSNameList list = {0};
+    for (PSObject *cur = obj; cur; cur = cur->prototype) {
+        if (ps_object_enum_own(cur, ps_collect_enum_name, &list) != 0) {
+            break;
+        }
+    }
+    PSString **ordered = list.items;
+    size_t ordered_count = list.count;
+    PSIndexName *indices = NULL;
+    PSString **others = NULL;
+    PSString **ordered_alloc = NULL;
+    if (obj && obj->kind == PS_OBJ_KIND_ARRAY && list.count > 0) {
+        indices = (PSIndexName *)calloc(list.count, sizeof(PSIndexName));
+        others = (PSString **)calloc(list.count, sizeof(PSString *));
+        if (indices && others) {
+            size_t index_count = 0;
+            size_t other_count = 0;
+            for (size_t i = 0; i < list.count; i++) {
+                PSString *name = list.items[i];
+                if (ps_string_is_length(name)) continue;
+                size_t idx = 0;
+                if (ps_array_string_to_index(name, &idx)) {
+                    indices[index_count].name = name;
+                    indices[index_count].index = idx;
+                    index_count++;
+                } else {
+                    others[other_count++] = name;
+                }
+            }
+            qsort(indices, index_count, sizeof(PSIndexName), ps_index_name_compare);
+            ordered_alloc = (PSString **)calloc(index_count + other_count, sizeof(PSString *));
+            if (ordered_alloc) {
+                ordered = ordered_alloc;
+                ordered_count = index_count + other_count;
+                for (size_t i = 0; i < index_count; i++) {
+                    ordered[i] = indices[i].name;
+                }
+                for (size_t i = 0; i < other_count; i++) {
+                    ordered[index_count + i] = others[i];
+                }
+            }
+        }
+    }
+
+    PSObject *arr = ps_object_new(vm->array_proto ? vm->array_proto : vm->object_proto);
+    if (!arr) {
+        free(ordered_alloc);
+        free(indices);
+        free(others);
+        free(list.items);
+        return NULL;
+    }
+    arr->kind = PS_OBJ_KIND_ARRAY;
+    (void)ps_array_init(arr);
+    for (size_t i = 0; i < ordered_count; i++) {
+        (void)ps_array_set_index(arr, i, ps_value_string(ordered[i]));
+    }
+    (void)ps_array_set_length_internal(arr, ordered_count);
+    free(ordered_alloc);
+    free(indices);
+    free(others);
+    free(list.items);
+    return arr;
 }
 
 static void hoist_list(PSVM *vm, PSEnv *env, PSAstNode **items, size_t count) {
@@ -4245,6 +4326,9 @@ static void hoist_decls(PSVM *vm, PSEnv *env, PSAstNode *node) {
 PSValue ps_eval(PSVM *vm, PSAstNode *program) {
     PSValue last = ps_value_undefined();
     PSEvalControl ctl = {0};
+    int split_timing = 0;
+    uint64_t compile_ms = 0;
+    uint64_t exec_ms = 0;
 
     if (vm) {
         vm->current_ast = program;
@@ -4252,20 +4336,48 @@ PSValue ps_eval(PSVM *vm, PSAstNode *program) {
     }
     hoist_decls(vm, vm->env, program);
 
-    for (size_t i = 0; i < program->as.list.count; i++) {
-        last = eval_node(vm, vm->env, program->as.list.items[i], &ctl);
-        if (ctl.did_throw) {
-            ps_print_uncaught(vm, ctl.throw_value);
-            exit(1);
+    {
+        const char *bench_split = getenv("PS_BENCH_SPLIT_TIMING");
+        if (bench_split && bench_split[0] == '1') {
+            split_timing = 1;
         }
-        if (ctl.did_return) {
-            if (vm) {
-                vm->current_ast = NULL;
-                vm->root_ast = NULL;
-                vm->current_node = NULL;
-            }
-            return last;
+    }
+
+    PSStmtBC *bc = NULL;
+    if (split_timing) {
+        uint64_t t0 = ps_eval_now_ms();
+        bc = ps_stmt_bc_compile(program);
+        compile_ms = ps_eval_now_ms() - t0;
+    } else {
+        bc = ps_stmt_bc_compile(program);
+    }
+    if (bc) {
+        uint64_t t1 = 0;
+        if (split_timing) t1 = ps_eval_now_ms();
+        last = ps_stmt_bc_execute(vm, vm->env, NULL, bc, &ctl);
+        if (split_timing) exec_ms = ps_eval_now_ms() - t1;
+        ps_stmt_bc_free(bc);
+    } else {
+        ctl.did_throw = 1;
+        ctl.throw_value = ps_vm_make_error(vm, "SyntaxError",
+                                           "Statement bytecode compilation failed");
+    }
+    if (split_timing) {
+        fprintf(stderr, "benchSplit compileMs=%llu execMs=%llu\n",
+                (unsigned long long)compile_ms,
+                (unsigned long long)exec_ms);
+    }
+    if (ctl.did_throw) {
+        ps_print_uncaught(vm, ctl.throw_value);
+        exit(1);
+    }
+    if (ctl.did_return) {
+        if (vm) {
+            vm->current_ast = NULL;
+            vm->root_ast = NULL;
+            vm->current_node = NULL;
         }
+        return last;
     }
     if (vm) {
         vm->current_ast = NULL;
@@ -4888,6 +5000,7 @@ enum {
     PS_EXPR_BC_BINARY_NUM,
     PS_EXPR_BC_GET_MEMBER,
     PS_EXPR_BC_CALL_IDENT,
+    PS_EXPR_BC_CALL_MEMBER,
     PS_EXPR_BC_STORE_IDENT,
     PS_EXPR_BC_STORE_MEMBER,
     PS_EXPR_BC_EVAL_AST
@@ -4968,6 +5081,46 @@ static int ps_expr_bc_emit_call_ident(PSExprBCBuilder *b, PSAstNode *expr) {
     instr.op = PS_EXPR_BC_CALL_IDENT;
     instr.a = (int)expr->as.call.argc;
     instr.ptr = callee;
+    return ps_expr_bc_push_instr(b, instr);
+}
+
+static int ps_expr_bc_emit_call_member(PSExprBCBuilder *b, PSAstNode *expr) {
+    if (!expr || expr->kind != AST_CALL) return 0;
+    PSAstNode *callee = expr->as.call.callee;
+    if (!callee || callee->kind != AST_MEMBER) return 0;
+    PSAstNode *obj = callee->as.member.object;
+    PSAstNode *prop = callee->as.member.property;
+    if (!obj) return 0;
+    if (!ps_expr_bc_emit(b, obj)) return 0;
+    if (callee->as.member.computed) {
+        if (!prop) return 0;
+        if (!ps_expr_bc_emit(b, prop)) return 0;
+    } else {
+        PSValue prop_val = ps_value_undefined();
+        if (prop && prop->kind == AST_IDENTIFIER) {
+            PSString *name = ps_identifier_string(prop);
+            prop_val = ps_value_string(name);
+        } else if (prop && prop->kind == AST_LITERAL &&
+                   prop->as.literal.value.type == PS_T_STRING) {
+            prop_val = prop->as.literal.value;
+        } else {
+            return 0;
+        }
+        int cidx = 0;
+        if (!ps_expr_bc_add_const(b, prop_val, &cidx)) return 0;
+        PSExprBCInstr push = {0};
+        push.op = PS_EXPR_BC_PUSH_CONST;
+        push.a = cidx;
+        if (!ps_expr_bc_push_instr(b, push)) return 0;
+    }
+    for (size_t i = 0; i < expr->as.call.argc; i++) {
+        if (!ps_expr_bc_emit(b, expr->as.call.args[i])) return 0;
+    }
+    PSExprBCInstr instr = {0};
+    instr.op = PS_EXPR_BC_CALL_MEMBER;
+    instr.a = (int)expr->as.call.argc;
+    instr.ptr = callee;
+    instr.flags = callee->as.member.computed ? 1 : 0;
     return ps_expr_bc_push_instr(b, instr);
 }
 
@@ -5064,6 +5217,7 @@ static int ps_expr_bc_emit(PSExprBCBuilder *b, PSAstNode *expr) {
             return ps_expr_bc_emit_member(b, expr);
         case AST_CALL: {
             if (ps_expr_bc_emit_call_ident(b, expr)) return 1;
+            if (ps_expr_bc_emit_call_member(b, expr)) return 1;
             break;
         }
         case AST_ASSIGN:
@@ -5071,10 +5225,7 @@ static int ps_expr_bc_emit(PSExprBCBuilder *b, PSAstNode *expr) {
         default:
             break;
     }
-    PSExprBCInstr fallback = {0};
-    fallback.op = PS_EXPR_BC_EVAL_AST;
-    fallback.ptr = expr;
-    return ps_expr_bc_push_instr(b, fallback);
+    return 0;
 }
 
 static PSExprBC *ps_expr_bc_compile(PSAstNode *expr) {
@@ -5363,6 +5514,110 @@ static PSValue ps_expr_bc_execute(PSVM *vm,
                 stack[sp++] = result;
                 break;
             }
+            case PS_EXPR_BC_CALL_MEMBER: {
+                int argc = ins->a;
+                PSAstNode *member = (PSAstNode *)ins->ptr;
+                if (!member || member->kind != AST_MEMBER) goto fail;
+                PSValue *args = NULL;
+                PSValue stack_args[8];
+                int args_heap = 0;
+                if (argc < 0 || (size_t)argc > sp) goto fail;
+                if (argc <= 8) {
+                    args = stack_args;
+                } else {
+                    args = (PSValue *)malloc(sizeof(PSValue) * (size_t)argc);
+                    args_heap = 1;
+                }
+                if (!args) goto fail;
+                for (int i = argc - 1; i >= 0; i--) {
+                    args[i] = stack[--sp];
+                }
+                if (sp < 2) {
+                    if (args_heap) free(args);
+                    goto fail;
+                }
+                PSValue key_val = stack[--sp];
+                PSValue obj_val = stack[--sp];
+                PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                if (ctl->did_throw) {
+                    if (args_heap) free(args);
+                    goto fail;
+                }
+                PSValue callee = ps_value_undefined();
+                int found = 0;
+                if (obj && obj->kind == PS_OBJ_KIND_BUFFER && ins->flags) {
+                    PSValue out = ps_value_undefined();
+                    int handled = ps_buffer_read_index_value(vm, obj, key_val, &out, ctl);
+                    if (handled < 0) {
+                        if (args_heap) free(args);
+                        goto fail;
+                    }
+                    if (handled > 0) {
+                        callee = out;
+                    } else {
+                        PSString *prop = ps_to_string(vm, key_val);
+                        if (ps_check_pending_throw(vm, ctl)) {
+                            if (args_heap) free(args);
+                            goto fail;
+                        }
+                        handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                        if (handled < 0) {
+                            if (args_heap) free(args);
+                            goto fail;
+                        }
+                        if (handled > 0) {
+                            callee = out;
+                        } else {
+                            callee = ps_object_get(obj, prop, &found);
+                        }
+                    }
+                } else {
+                    PSString tmp_prop;
+                    char tmp_buf[96];
+                    PSString *prop = NULL;
+                    if (ins->flags) {
+                        prop = ps_member_key_read(vm, env, member, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
+                    } else if (key_val.type == PS_T_STRING) {
+                        prop = key_val.as.string;
+                    } else {
+                        prop = ps_to_string(vm, key_val);
+                    }
+                    if (ctl->did_throw || ps_check_pending_throw(vm, ctl)) {
+                        if (args_heap) free(args);
+                        goto fail;
+                    }
+                    PSValue out = ps_value_undefined();
+                    int handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                    if (handled < 0) {
+                        if (args_heap) free(args);
+                        goto fail;
+                    }
+                    if (handled > 0) {
+                        callee = out;
+                    } else {
+                        callee = ps_object_get(obj, prop, &found);
+                    }
+                }
+                if (callee.type != PS_T_OBJECT) {
+                    if (args_heap) free(args);
+                    ctl->did_throw = 1;
+                    ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Call of non-object");
+                    goto fail;
+                }
+                int did_throw = 0;
+                PSValue throw_value = ps_value_undefined();
+                PSValue result = ps_eval_call_function(vm, env, callee.as.object,
+                                                       obj_val, argc, args,
+                                                       &did_throw, &throw_value);
+                if (args_heap) free(args);
+                if (did_throw) {
+                    ctl->did_throw = 1;
+                    ctl->throw_value = throw_value;
+                    goto fail;
+                }
+                stack[sp++] = result;
+                break;
+            }
             case PS_EXPR_BC_STORE_IDENT: {
                 if (sp == 0) goto fail;
                 PSAstNode *id = (PSAstNode *)ins->ptr;
@@ -5444,7 +5699,7 @@ static PSValue ps_expr_bc_execute(PSVM *vm,
                     if (idx > 0 && (obj->internal_kind == PS_INTERNAL_NUMMAP || obj->internal == NULL)) {
                         int is_new = 0;
                         if (!ps_num_map_set(obj, index, value, &is_new)) goto fail;
-                        if (is_new) obj->shape_id++;
+                        if (is_new) ps_object_bump_shape(obj);
                         if (env && env->arguments_obj == obj) {
                             PSString *prop = ps_array_index_string(vm, index);
                             (void)ps_env_update_arguments(env, obj, prop, value);
@@ -5458,7 +5713,7 @@ static PSValue ps_expr_bc_execute(PSVM *vm,
                         if (ps_string_to_k_index(key_val.as.string, &kindex)) {
                             int is_new = 0;
                             if (!ps_num_map_k_set(obj, kindex, value, &is_new)) goto fail;
-                            if (is_new) obj->shape_id++;
+                            if (is_new) ps_object_bump_shape(obj);
                             if (env && env->arguments_obj == obj) {
                                 (void)ps_env_update_arguments(env, obj, key_val.as.string, value);
                             }
@@ -5502,11 +5757,10 @@ static PSValue ps_expr_bc_execute(PSVM *vm,
                 break;
             }
             case PS_EXPR_BC_EVAL_AST: {
-                PSAstNode *node = (PSAstNode *)ins->ptr;
-                PSValue v = eval_expression_inner(vm, env, node, ctl, 0);
-                if (ctl->did_throw) goto fail;
-                stack[sp++] = v;
-                break;
+                ctl->did_throw = 1;
+                ctl->throw_value = ps_vm_make_error(vm, "SyntaxError",
+                                                    "Expression bytecode fallback is forbidden");
+                goto fail;
             }
             default:
                 goto fail;
@@ -5536,6 +5790,9 @@ typedef struct {
     PSStmtBCInstr *code;
     size_t count;
     size_t cap;
+    PSValue *consts;
+    size_t const_count;
+    size_t const_cap;
 } PSStmtBCBuilder;
 
 typedef struct {
@@ -5546,14 +5803,66 @@ typedef struct {
     size_t continue_count;
     size_t continue_cap;
     size_t continue_target;
+    int allow_continue;
+    PSString *label;
 } PSStmtLoop;
 
+typedef struct {
+    size_t catch_ip;
+    size_t finally_ip;
+    PSAstNode *catch_param;
+} PSTryHandler;
+
 enum {
-    STMT_BC_EVAL_EXPR = 1,
-    STMT_BC_VAR_INIT,
+    STMT_BC_EXPR_PUSH_CONST = 1,
+    STMT_BC_EXPR_LOAD_IDENT,
+    STMT_BC_EXPR_LOAD_THIS,
+    STMT_BC_EXPR_UNARY_NUM,
+    STMT_BC_EXPR_BINARY_NUM,
+    STMT_BC_EXPR_ADD_INT,
+    STMT_BC_EXPR_ADD_DOUBLE,
+    STMT_BC_EXPR_ADD_IDENT_CONST,
+    STMT_BC_EXPR_ADD_IDENT_IDENT,
+    STMT_BC_EXPR_SUB_INT,
+    STMT_BC_EXPR_SUB_DOUBLE,
+    STMT_BC_EXPR_MUL_INT,
+    STMT_BC_EXPR_MUL_DOUBLE,
+    STMT_BC_EXPR_DIV_DOUBLE,
+    STMT_BC_EXPR_NEW_OBJECT,
+    STMT_BC_EXPR_OBJ_PUT_CONST,
+    STMT_BC_EXPR_GET_MEMBER,
+    STMT_BC_EXPR_CALL_IDENT,
+    STMT_BC_EXPR_CALL_MEMBER,
+    STMT_BC_EXPR_NEW,
+    STMT_BC_EXPR_STORE_IDENT,
+    STMT_BC_EXPR_STORE_MEMBER,
+    STMT_BC_EXPR_NOT,
+    STMT_BC_EXPR_BIT_NOT,
+    STMT_BC_EXPR_DELETE,
+    STMT_BC_EXPR_TYPEOF,
+    STMT_BC_EXPR_EVAL_AST,
+    STMT_BC_EXPR_DUP,
+    STMT_BC_EXPR_POP,
+    STMT_BC_STMT_EVAL_AST,
+    STMT_BC_FOR_IN_INIT,
+    STMT_BC_FOR_IN_NEXT,
+    STMT_BC_FOR_IN_ASSIGN,
+    STMT_BC_WITH_ENTER,
+    STMT_BC_WITH_EXIT,
+    STMT_BC_TRY_PUSH,
+    STMT_BC_TRY_POP,
+    STMT_BC_CATCH_ENTER,
+    STMT_BC_CATCH_EXIT,
+    STMT_BC_THROW,
+    STMT_BC_FINALLY_EXIT,
     STMT_BC_JUMP,
     STMT_BC_JUMP_IF_FALSE,
-    STMT_BC_RETURN
+    STMT_BC_JUMP_IF_TRUE,
+    STMT_BC_JLT_IDENT_CONST,
+    STMT_BC_JBITAND_EQZ_IDENT_CONST,
+    STMT_BC_JUMP_ADD_IDENT_CONST,
+    STMT_BC_RETURN_VALUE,
+    STMT_BC_RETURN_VOID
 };
 
 static int ps_stmt_bc_push_instr(PSStmtBCBuilder *b, PSStmtBCInstr instr) {
@@ -5567,6 +5876,430 @@ static int ps_stmt_bc_push_instr(PSStmtBCBuilder *b, PSStmtBCInstr instr) {
     }
     b->code[b->count++] = instr;
     return 1;
+}
+
+static int ps_stmt_bc_add_const(PSStmtBCBuilder *b, PSValue value, int *out_index) {
+    if (!b) return 0;
+    if (b->const_count == b->const_cap) {
+        size_t new_cap = b->const_cap ? b->const_cap * 2 : 16;
+        PSValue *next = (PSValue *)realloc(b->consts, new_cap * sizeof(PSValue));
+        if (!next) return 0;
+        b->consts = next;
+        b->const_cap = new_cap;
+    }
+    int idx = (int)b->const_count;
+    b->consts[b->const_count++] = value;
+    if (out_index) *out_index = idx;
+    return 1;
+}
+
+static int ps_stmt_bc_emit_expr(PSStmtBCBuilder *b, PSAstNode *expr);
+
+static int ps_stmt_bc_emit_member(PSStmtBCBuilder *b, PSAstNode *expr) {
+    PSAstNode *obj = expr->as.member.object;
+    PSAstNode *prop = expr->as.member.property;
+    if (!obj) return 0;
+    if (!ps_stmt_bc_emit_expr(b, obj)) return 0;
+    if (expr->as.member.computed) {
+        if (!prop) return 0;
+        if (!ps_stmt_bc_emit_expr(b, prop)) return 0;
+    } else {
+        PSValue prop_val = ps_value_undefined();
+        if (prop && prop->kind == AST_IDENTIFIER) {
+            PSString *name = ps_identifier_string(prop);
+            prop_val = ps_value_string(name);
+        } else if (prop && prop->kind == AST_LITERAL &&
+                   prop->as.literal.value.type == PS_T_STRING) {
+            prop_val = prop->as.literal.value;
+        } else {
+            return 0;
+        }
+        int cidx = 0;
+        if (!ps_stmt_bc_add_const(b, prop_val, &cidx)) return 0;
+        PSStmtBCInstr push = {0};
+        push.op = STMT_BC_EXPR_PUSH_CONST;
+        push.a = cidx;
+        if (!ps_stmt_bc_push_instr(b, push)) return 0;
+    }
+    PSStmtBCInstr instr = {0};
+    instr.op = STMT_BC_EXPR_GET_MEMBER;
+    instr.a = expr->as.member.computed ? 1 : 0;
+    instr.ptr = expr;
+    return ps_stmt_bc_push_instr(b, instr);
+}
+
+static int ps_stmt_bc_emit_call_ident(PSStmtBCBuilder *b, PSAstNode *expr) {
+    if (!expr || expr->kind != AST_CALL) return 0;
+    PSAstNode *callee = expr->as.call.callee;
+    if (!callee || callee->kind != AST_IDENTIFIER) return 0;
+    for (size_t i = 0; i < expr->as.call.argc; i++) {
+        if (!ps_stmt_bc_emit_expr(b, expr->as.call.args[i])) return 0;
+    }
+    PSStmtBCInstr instr = {0};
+    instr.op = STMT_BC_EXPR_CALL_IDENT;
+    instr.a = (int)expr->as.call.argc;
+    instr.ptr = callee;
+    return ps_stmt_bc_push_instr(b, instr);
+}
+
+static int ps_stmt_bc_emit_call_member(PSStmtBCBuilder *b, PSAstNode *expr) {
+    if (!expr || expr->kind != AST_CALL) return 0;
+    PSAstNode *callee = expr->as.call.callee;
+    if (!callee || callee->kind != AST_MEMBER) return 0;
+    PSAstNode *obj = callee->as.member.object;
+    PSAstNode *prop = callee->as.member.property;
+    if (!obj) return 0;
+    if (!ps_stmt_bc_emit_expr(b, obj)) return 0;
+    if (callee->as.member.computed) {
+        if (!prop) return 0;
+        if (!ps_stmt_bc_emit_expr(b, prop)) return 0;
+    } else {
+        PSValue prop_val = ps_value_undefined();
+        if (prop && prop->kind == AST_IDENTIFIER) {
+            PSString *name = ps_identifier_string(prop);
+            prop_val = ps_value_string(name);
+        } else if (prop && prop->kind == AST_LITERAL &&
+                   prop->as.literal.value.type == PS_T_STRING) {
+            prop_val = prop->as.literal.value;
+        } else {
+            return 0;
+        }
+        int cidx = 0;
+        if (!ps_stmt_bc_add_const(b, prop_val, &cidx)) return 0;
+        PSStmtBCInstr push = {0};
+        push.op = STMT_BC_EXPR_PUSH_CONST;
+        push.a = cidx;
+        if (!ps_stmt_bc_push_instr(b, push)) return 0;
+    }
+    for (size_t i = 0; i < expr->as.call.argc; i++) {
+        if (!ps_stmt_bc_emit_expr(b, expr->as.call.args[i])) return 0;
+    }
+    PSStmtBCInstr instr = {0};
+    instr.op = STMT_BC_EXPR_CALL_MEMBER;
+    instr.a = (int)expr->as.call.argc;
+    instr.ptr = callee;
+    instr.flags = callee->as.member.computed ? 1 : 0;
+    return ps_stmt_bc_push_instr(b, instr);
+}
+
+static int ps_stmt_bc_emit_assign(PSStmtBCBuilder *b, PSAstNode *expr) {
+    if (!expr || expr->kind != AST_ASSIGN) return 0;
+    if (expr->as.assign.op != TOK_ASSIGN) return 0;
+    PSAstNode *target = expr->as.assign.target;
+    PSAstNode *value = expr->as.assign.value;
+    if (!target || !value) return 0;
+    if (!ps_stmt_bc_emit_expr(b, value)) return 0;
+    if (target->kind == AST_IDENTIFIER) {
+        PSStmtBCInstr instr = {0};
+        instr.op = STMT_BC_EXPR_STORE_IDENT;
+        instr.ptr = target;
+        return ps_stmt_bc_push_instr(b, instr);
+    }
+    if (target->kind == AST_MEMBER) {
+        PSAstNode *member = target;
+        PSAstNode *obj = member->as.member.object;
+        PSAstNode *prop = member->as.member.property;
+        if (!obj) return 0;
+        if (!ps_stmt_bc_emit_expr(b, obj)) return 0;
+        if (member->as.member.computed) {
+            if (!prop) return 0;
+            if (!ps_stmt_bc_emit_expr(b, prop)) return 0;
+        } else {
+            PSValue prop_val = ps_value_undefined();
+            if (prop && prop->kind == AST_IDENTIFIER) {
+                PSString *name = ps_identifier_string(prop);
+                prop_val = ps_value_string(name);
+            } else if (prop && prop->kind == AST_LITERAL &&
+                       prop->as.literal.value.type == PS_T_STRING) {
+                prop_val = prop->as.literal.value;
+            } else {
+                return 0;
+            }
+            int cidx = 0;
+            if (!ps_stmt_bc_add_const(b, prop_val, &cidx)) return 0;
+            PSStmtBCInstr push = {0};
+            push.op = STMT_BC_EXPR_PUSH_CONST;
+            push.a = cidx;
+            if (!ps_stmt_bc_push_instr(b, push)) return 0;
+        }
+        PSStmtBCInstr instr = {0};
+        instr.op = STMT_BC_EXPR_STORE_MEMBER;
+        instr.a = member->as.member.computed ? 1 : 0;
+        instr.ptr = member;
+        return ps_stmt_bc_push_instr(b, instr);
+    }
+    return 0;
+}
+
+static int ps_stmt_bc_emit_expr(PSStmtBCBuilder *b, PSAstNode *expr) {
+    if (!b || !expr) return 0;
+    switch (expr->kind) {
+        case AST_LITERAL: {
+            int cidx = 0;
+            if (!ps_stmt_bc_add_const(b, expr->as.literal.value, &cidx)) return 0;
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_EXPR_PUSH_CONST;
+            instr.a = cidx;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        case AST_IDENTIFIER: {
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_EXPR_LOAD_IDENT;
+            instr.ptr = expr;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        case AST_THIS: {
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_EXPR_LOAD_THIS;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        case AST_UNARY: {
+            if (expr->as.unary.op != TOK_PLUS &&
+                expr->as.unary.op != TOK_MINUS &&
+                expr->as.unary.op != TOK_NOT &&
+                expr->as.unary.op != TOK_BIT_NOT &&
+                expr->as.unary.op != TOK_VOID &&
+                expr->as.unary.op != TOK_DELETE &&
+                expr->as.unary.op != TOK_TYPEOF) return 0;
+            if (expr->as.unary.op == TOK_DELETE) {
+                if (expr->as.unary.expr && expr->as.unary.expr->kind == AST_MEMBER) {
+                    PSStmtBCInstr instr = {0};
+                    instr.op = STMT_BC_EXPR_DELETE;
+                    instr.ptr = expr->as.unary.expr;
+                    return ps_stmt_bc_push_instr(b, instr);
+                }
+                PSStmtBCInstr push = {0};
+                push.op = STMT_BC_EXPR_PUSH_CONST;
+                int cidx = 0;
+                if (!ps_stmt_bc_add_const(b, ps_value_boolean(0), &cidx)) return 0;
+                push.a = cidx;
+                return ps_stmt_bc_push_instr(b, push);
+            }
+            if (expr->as.unary.op == TOK_TYPEOF) {
+                PSStmtBCInstr instr = {0};
+                instr.op = STMT_BC_EXPR_TYPEOF;
+                instr.ptr = expr->as.unary.expr;
+                return ps_stmt_bc_push_instr(b, instr);
+            }
+            if (expr->as.unary.op == TOK_VOID) {
+                if (!ps_stmt_bc_emit_expr(b, expr->as.unary.expr)) return 0;
+                PSStmtBCInstr pop = {0};
+                pop.op = STMT_BC_EXPR_POP;
+                if (!ps_stmt_bc_push_instr(b, pop)) return 0;
+                int cidx = 0;
+                if (!ps_stmt_bc_add_const(b, ps_value_undefined(), &cidx)) return 0;
+                PSStmtBCInstr push = {0};
+                push.op = STMT_BC_EXPR_PUSH_CONST;
+                push.a = cidx;
+                return ps_stmt_bc_push_instr(b, push);
+            }
+            if (!ps_stmt_bc_emit_expr(b, expr->as.unary.expr)) return 0;
+            PSStmtBCInstr instr = {0};
+            if (expr->as.unary.op == TOK_NOT) {
+                instr.op = STMT_BC_EXPR_NOT;
+            } else if (expr->as.unary.op == TOK_BIT_NOT) {
+                instr.op = STMT_BC_EXPR_BIT_NOT;
+            } else {
+                instr.op = STMT_BC_EXPR_UNARY_NUM;
+                instr.a = expr->as.unary.op;
+            }
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        case AST_BINARY: {
+            int op = expr->as.binary.op;
+            if (op == TOK_COMMA) {
+                if (!ps_stmt_bc_emit_expr(b, expr->as.binary.left)) return 0;
+                PSStmtBCInstr pop = {0};
+                pop.op = STMT_BC_EXPR_POP;
+                if (!ps_stmt_bc_push_instr(b, pop)) return 0;
+                return ps_stmt_bc_emit_expr(b, expr->as.binary.right);
+            }
+            if (op == TOK_AND_AND || op == TOK_OR_OR) {
+                if (!ps_stmt_bc_emit_expr(b, expr->as.binary.left)) return 0;
+                PSStmtBCInstr dup = {0};
+                dup.op = STMT_BC_EXPR_DUP;
+                if (!ps_stmt_bc_push_instr(b, dup)) return 0;
+                PSStmtBCInstr jmp = {0};
+                jmp.op = (op == TOK_AND_AND) ? STMT_BC_JUMP_IF_FALSE : STMT_BC_JUMP_IF_TRUE;
+                size_t jmp_ip = b->count;
+                if (!ps_stmt_bc_push_instr(b, jmp)) return 0;
+                PSStmtBCInstr pop = {0};
+                pop.op = STMT_BC_EXPR_POP;
+                if (!ps_stmt_bc_push_instr(b, pop)) return 0;
+                if (!ps_stmt_bc_emit_expr(b, expr->as.binary.right)) return 0;
+                b->code[jmp_ip].a = (int32_t)b->count;
+                return 1;
+            }
+            if (!ps_stmt_bc_emit_expr(b, expr->as.binary.left)) return 0;
+            if (!ps_stmt_bc_emit_expr(b, expr->as.binary.right)) return 0;
+            PSStmtBCInstr instr = {0};
+            if (op == TOK_PLUS || op == TOK_MINUS || op == TOK_STAR) {
+                int use_double = 0;
+                double lit = 0.0;
+                if (expr->as.binary.left &&
+                    expr->as.binary.left->kind == AST_LITERAL &&
+                    expr->as.binary.left->as.literal.value.type == PS_T_NUMBER) {
+                    lit = expr->as.binary.left->as.literal.value.as.number;
+                    if (!ps_number_to_int32_strict(lit, NULL)) use_double = 1;
+                }
+                if (expr->as.binary.right &&
+                    expr->as.binary.right->kind == AST_LITERAL &&
+                    expr->as.binary.right->as.literal.value.type == PS_T_NUMBER) {
+                    lit = expr->as.binary.right->as.literal.value.as.number;
+                    if (!ps_number_to_int32_strict(lit, NULL)) use_double = 1;
+                }
+                if (op == TOK_PLUS) {
+                    instr.op = use_double ? STMT_BC_EXPR_ADD_DOUBLE : STMT_BC_EXPR_ADD_INT;
+                } else if (op == TOK_MINUS) {
+                    instr.op = use_double ? STMT_BC_EXPR_SUB_DOUBLE : STMT_BC_EXPR_SUB_INT;
+                } else {
+                    instr.op = use_double ? STMT_BC_EXPR_MUL_DOUBLE : STMT_BC_EXPR_MUL_INT;
+                }
+            } else if (op == TOK_SLASH) {
+                instr.op = STMT_BC_EXPR_DIV_DOUBLE;
+            } else {
+                instr.op = STMT_BC_EXPR_BINARY_NUM;
+                instr.a = op;
+            }
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        case AST_CONDITIONAL: {
+            if (!ps_stmt_bc_emit_expr(b, expr->as.conditional.cond)) return 0;
+            PSStmtBCInstr jmp_false = {0};
+            jmp_false.op = STMT_BC_JUMP_IF_FALSE;
+            size_t jmp_false_ip = b->count;
+            if (!ps_stmt_bc_push_instr(b, jmp_false)) return 0;
+            if (!ps_stmt_bc_emit_expr(b, expr->as.conditional.then_expr)) return 0;
+            PSStmtBCInstr jmp_end = {0};
+            jmp_end.op = STMT_BC_JUMP;
+            size_t jmp_end_ip = b->count;
+            if (!ps_stmt_bc_push_instr(b, jmp_end)) return 0;
+            b->code[jmp_false_ip].a = (int32_t)b->count;
+            if (!ps_stmt_bc_emit_expr(b, expr->as.conditional.else_expr)) return 0;
+            b->code[jmp_end_ip].a = (int32_t)b->count;
+            return 1;
+        }
+        case AST_MEMBER:
+            return ps_stmt_bc_emit_member(b, expr);
+        case AST_CALL: {
+            if (ps_stmt_bc_emit_call_ident(b, expr)) return 1;
+            if (ps_stmt_bc_emit_call_member(b, expr)) return 1;
+            break;
+        }
+        case AST_UPDATE: {
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_EXPR_EVAL_AST;
+            instr.ptr = expr;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        case AST_FUNCTION_EXPR: {
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_EXPR_EVAL_AST;
+            instr.ptr = expr;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        case AST_NEW: {
+            if (!ps_stmt_bc_emit_expr(b, expr->as.new_expr.callee)) return 0;
+            for (size_t i = 0; i < expr->as.new_expr.argc; i++) {
+                if (!ps_stmt_bc_emit_expr(b, expr->as.new_expr.args[i])) return 0;
+            }
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_EXPR_NEW;
+            instr.a = (int)expr->as.new_expr.argc;
+            instr.ptr = expr;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        case AST_ASSIGN:
+            if (expr->as.assign.op != TOK_ASSIGN) {
+                PSStmtBCInstr instr = {0};
+                instr.op = STMT_BC_EXPR_EVAL_AST;
+                instr.ptr = expr;
+                return ps_stmt_bc_push_instr(b, instr);
+            }
+            return ps_stmt_bc_emit_assign(b, expr);
+        case AST_OBJECT_LITERAL: {
+            PSStmtBCInstr obj = {0};
+            obj.op = STMT_BC_EXPR_NEW_OBJECT;
+            if (!ps_stmt_bc_push_instr(b, obj)) return 0;
+            for (size_t i = 0; i < expr->as.object_literal.count; i++) {
+                PSAstProperty *prop = &expr->as.object_literal.props[i];
+                if (!prop || !prop->key || !prop->value) return 0;
+                if (!ps_stmt_bc_emit_expr(b, prop->value)) return 0;
+                int cidx = 0;
+                if (!ps_stmt_bc_add_const(b, ps_value_string(prop->key), &cidx)) return 0;
+                PSStmtBCInstr put = {0};
+                put.op = STMT_BC_EXPR_OBJ_PUT_CONST;
+                put.a = cidx;
+                if (!ps_stmt_bc_push_instr(b, put)) return 0;
+            }
+            return 1;
+        }
+        case AST_ARRAY_LITERAL: {
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_EXPR_EVAL_AST;
+            instr.ptr = expr;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        default: {
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_EXPR_EVAL_AST;
+            instr.ptr = expr;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+    }
+    return 0;
+}
+
+static PSValue ps_stmt_bc_eval_expr(PSVM *vm, PSEnv *env, PSAstNode *expr, PSEvalControl *ctl) {
+    if (!expr) return ps_value_undefined();
+    PSStmtBCBuilder b = {0};
+    if (!ps_stmt_bc_emit_expr(&b, expr)) {
+        free(b.code);
+        free(b.consts);
+        if (ctl) {
+            ctl->did_throw = 1;
+            ctl->throw_value = ps_vm_make_error(vm, "SyntaxError",
+                                                "Expression bytecode compilation failed");
+        }
+        return ctl ? ctl->throw_value : ps_value_undefined();
+    }
+    PSStmtBCInstr ret = {0};
+    ret.op = STMT_BC_RETURN_VALUE;
+    if (!ps_stmt_bc_push_instr(&b, ret)) {
+        free(b.code);
+        free(b.consts);
+        if (ctl) {
+            ctl->did_throw = 1;
+            ctl->throw_value = ps_vm_make_error(vm, "SyntaxError",
+                                                "Expression bytecode compilation failed");
+        }
+        return ctl ? ctl->throw_value : ps_value_undefined();
+    }
+    PSStmtBC *bc = (PSStmtBC *)calloc(1, sizeof(PSStmtBC));
+    if (!bc) {
+        free(b.code);
+        free(b.consts);
+        if (ctl) {
+            ctl->did_throw = 1;
+            ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Out of memory");
+        }
+        return ctl ? ctl->throw_value : ps_value_undefined();
+    }
+    bc->code = b.code;
+    bc->count = b.count;
+    bc->consts = b.consts;
+    bc->const_count = b.const_count;
+    PSValue v = ps_stmt_bc_execute(vm, env, NULL, bc, ctl);
+    ps_stmt_bc_free(bc);
+    return v;
+}
+
+static PSValue ps_stmt_bc_binary_slow(PSVM *vm,
+                                      int op,
+                                      PSValue left,
+                                      PSValue right,
+                                      PSEvalControl *ctl) {
+    return ps_eval_binary_values(vm, op, left, right, ctl);
 }
 
 static int ps_stmt_loop_add(size_t **list, size_t *count, size_t *cap, size_t ip) {
@@ -5596,10 +6329,452 @@ static void ps_stmt_loop_free(PSStmtLoop *loop) {
 }
 
 static int ps_stmt_bc_emit_stmt(PSStmtBCBuilder *b,
-                                PSAstNode *stmt,
-                                PSStmtLoop **loops,
-                                size_t *loop_depth,
-                                size_t *loop_cap);
+                               PSAstNode *stmt,
+                               PSStmtLoop **loops,
+                               size_t *loop_depth,
+                               size_t *loop_cap);
+
+static int ps_stmt_bc_ident_same(PSAstNode *a, PSAstNode *b) {
+    if (!a || !b) return 0;
+    if (a->kind != AST_IDENTIFIER || b->kind != AST_IDENTIFIER) return 0;
+    PSString *aname = ps_identifier_string(a);
+    PSString *bname = ps_identifier_string(b);
+    if (!aname || !bname) return 0;
+    return ps_string_equals(aname, bname);
+}
+
+static int ps_stmt_bc_peephole(PSStmtBCBuilder *b) {
+    if (!b || b->count < 4) return 1;
+    size_t old_count = b->count;
+    PSStmtBCInstr *out = (PSStmtBCInstr *)malloc(sizeof(PSStmtBCInstr) * b->count);
+    if (!out) return 0;
+    size_t *map = (size_t *)malloc(sizeof(size_t) * b->count);
+    if (!map) {
+        free(out);
+        return 0;
+    }
+    size_t out_count = 0;
+    size_t i = 0;
+    while (i < b->count) {
+        if (i + 3 < b->count) {
+            PSStmtBCInstr *i0 = &b->code[i];
+            PSStmtBCInstr *i1 = &b->code[i + 1];
+            PSStmtBCInstr *i2 = &b->code[i + 2];
+            PSStmtBCInstr *i3 = &b->code[i + 3];
+#if !PS_DISABLE_CF_FUSIONS
+            if (i0->op == STMT_BC_EXPR_LOAD_IDENT &&
+                i1->op == STMT_BC_EXPR_PUSH_CONST &&
+                i2->op == STMT_BC_EXPR_BINARY_NUM &&
+                i2->a == TOK_LT &&
+                i3->op == STMT_BC_JUMP_IF_FALSE) {
+                PSStmtBCInstr fused = {0};
+                fused.op = STMT_BC_JLT_IDENT_CONST;
+                fused.a = i1->a;
+                fused.ptr = i0->ptr;
+                fused.ptr2 = (void *)(intptr_t)i3->a;
+                map[i] = out_count;
+                map[i + 1] = out_count;
+                map[i + 2] = out_count;
+                map[i + 3] = out_count;
+                out[out_count++] = fused;
+                i += 4;
+                continue;
+            }
+#endif
+            int is_add = (i2->op == STMT_BC_EXPR_ADD_INT || i2->op == STMT_BC_EXPR_ADD_DOUBLE);
+            if (is_add &&
+                i0->op == STMT_BC_EXPR_LOAD_IDENT &&
+                i1->op == STMT_BC_EXPR_PUSH_CONST &&
+                i3->op == STMT_BC_EXPR_STORE_IDENT &&
+                i1->a >= 0 && (size_t)i1->a < b->const_count &&
+                b->consts[i1->a].type == PS_T_NUMBER &&
+                ps_stmt_bc_ident_same((PSAstNode *)i0->ptr, (PSAstNode *)i3->ptr)) {
+                PSStmtBCInstr fused = {0};
+                fused.op = STMT_BC_EXPR_ADD_IDENT_CONST;
+                fused.a = i1->a;
+                fused.ptr = i3->ptr;
+                map[i] = out_count;
+                map[i + 1] = out_count;
+                map[i + 2] = out_count;
+                map[i + 3] = out_count;
+                out[out_count++] = fused;
+                i += 4;
+                continue;
+            }
+            if (is_add &&
+                i0->op == STMT_BC_EXPR_LOAD_IDENT &&
+                i1->op == STMT_BC_EXPR_LOAD_IDENT &&
+                i3->op == STMT_BC_EXPR_STORE_IDENT &&
+                ps_stmt_bc_ident_same((PSAstNode *)i0->ptr, (PSAstNode *)i3->ptr)) {
+                PSStmtBCInstr fused = {0};
+                fused.op = STMT_BC_EXPR_ADD_IDENT_IDENT;
+                fused.ptr = i3->ptr;
+                fused.ptr2 = i1->ptr;
+                map[i] = out_count;
+                map[i + 1] = out_count;
+                map[i + 2] = out_count;
+                map[i + 3] = out_count;
+                out[out_count++] = fused;
+                i += 4;
+                continue;
+            }
+        }
+#if !PS_DISABLE_CF_FUSIONS
+        if (i + 5 < b->count) {
+            PSStmtBCInstr *i0 = &b->code[i];
+            PSStmtBCInstr *i1 = &b->code[i + 1];
+            PSStmtBCInstr *i2 = &b->code[i + 2];
+            PSStmtBCInstr *i3 = &b->code[i + 3];
+            PSStmtBCInstr *i4 = &b->code[i + 4];
+            PSStmtBCInstr *i5 = &b->code[i + 5];
+            if (i0->op == STMT_BC_EXPR_LOAD_IDENT &&
+                i1->op == STMT_BC_EXPR_PUSH_CONST &&
+                i2->op == STMT_BC_EXPR_BINARY_NUM &&
+                i2->a == TOK_AND &&
+                i3->op == STMT_BC_EXPR_PUSH_CONST &&
+                i4->op == STMT_BC_EXPR_BINARY_NUM &&
+                i4->a == TOK_STRICT_EQ &&
+                i5->op == STMT_BC_JUMP_IF_FALSE &&
+                i1->a >= 0 && (size_t)i1->a < b->const_count &&
+                i3->a >= 0 && (size_t)i3->a < b->const_count) {
+                PSValue v_and = b->consts[i1->a];
+                PSValue v_zero = b->consts[i3->a];
+                if (v_and.type == PS_T_NUMBER && v_zero.type == PS_T_NUMBER &&
+                    v_and.as.number == 1.0 && v_zero.as.number == 0.0) {
+                    PSStmtBCInstr fused = {0};
+                    fused.op = STMT_BC_JBITAND_EQZ_IDENT_CONST;
+                    fused.a = i1->a;
+                    fused.ptr = i0->ptr;
+                    fused.ptr2 = (void *)(intptr_t)i5->a;
+                    map[i] = out_count;
+                    map[i + 1] = out_count;
+                    map[i + 2] = out_count;
+                    map[i + 3] = out_count;
+                    map[i + 4] = out_count;
+                    map[i + 5] = out_count;
+                    out[out_count++] = fused;
+                    i += 6;
+                    continue;
+                }
+            }
+        }
+#endif
+#if !PS_DISABLE_CF_FUSIONS
+        if (i + 2 < b->count) {
+            PSStmtBCInstr *i0 = &b->code[i];
+            PSStmtBCInstr *i1 = &b->code[i + 1];
+            PSStmtBCInstr *i2 = &b->code[i + 2];
+            if (i0->op == STMT_BC_EXPR_ADD_IDENT_CONST &&
+                i1->op == STMT_BC_EXPR_POP &&
+                i2->op == STMT_BC_JUMP) {
+                PSStmtBCInstr fused = {0};
+                fused.op = STMT_BC_JUMP_ADD_IDENT_CONST;
+                fused.a = i0->a;
+                fused.ptr = i0->ptr;
+                fused.ptr2 = (void *)(intptr_t)i2->a;
+                map[i] = out_count;
+                map[i + 1] = out_count;
+                map[i + 2] = out_count;
+                out[out_count++] = fused;
+                i += 3;
+                continue;
+            }
+        }
+#endif
+        map[i] = out_count;
+        out[out_count++] = b->code[i++];
+    }
+    for (size_t j = 0; j < out_count; j++) {
+        PSStmtBCInstr *ins = &out[j];
+        if (ins->op == STMT_BC_JUMP ||
+            ins->op == STMT_BC_JUMP_IF_FALSE ||
+            ins->op == STMT_BC_JUMP_IF_TRUE) {
+            if (ins->a >= 0 && (size_t)ins->a < old_count) {
+                ins->a = (int32_t)map[ins->a];
+            }
+        } else if (ins->op == STMT_BC_JLT_IDENT_CONST ||
+                   ins->op == STMT_BC_JBITAND_EQZ_IDENT_CONST ||
+                   ins->op == STMT_BC_JUMP_ADD_IDENT_CONST) {
+            intptr_t target = (intptr_t)ins->ptr2;
+            if (target >= 0 && (size_t)target < old_count) {
+                ins->ptr2 = (void *)(intptr_t)map[target];
+            }
+        } else if (ins->op == STMT_BC_TRY_PUSH) {
+            if (ins->a >= 0 && (size_t)ins->a < old_count) {
+                ins->a = (int32_t)map[ins->a];
+            }
+            intptr_t finally_ip = (intptr_t)ins->ptr;
+            if (finally_ip >= 0 && (size_t)finally_ip < old_count) {
+                ins->ptr = (void *)(intptr_t)map[finally_ip];
+            }
+        }
+    }
+    free(map);
+    free(b->code);
+    b->code = out;
+    b->count = out_count;
+    return 1;
+}
+
+static const char *ps_stmt_bc_op_name(uint8_t op) {
+    switch (op) {
+        case STMT_BC_EXPR_PUSH_CONST: return "PUSH_CONST";
+        case STMT_BC_EXPR_LOAD_IDENT: return "LOAD_IDENT";
+        case STMT_BC_EXPR_LOAD_THIS: return "LOAD_THIS";
+        case STMT_BC_EXPR_UNARY_NUM: return "UNARY_NUM";
+        case STMT_BC_EXPR_BINARY_NUM: return "BINARY_NUM";
+        case STMT_BC_EXPR_ADD_INT: return "ADD_INT";
+        case STMT_BC_EXPR_ADD_DOUBLE: return "ADD_DOUBLE";
+        case STMT_BC_EXPR_ADD_IDENT_CONST: return "ADD_IDENT_CONST";
+        case STMT_BC_EXPR_ADD_IDENT_IDENT: return "ADD_IDENT_IDENT";
+        case STMT_BC_EXPR_SUB_INT: return "SUB_INT";
+        case STMT_BC_EXPR_SUB_DOUBLE: return "SUB_DOUBLE";
+        case STMT_BC_EXPR_MUL_INT: return "MUL_INT";
+        case STMT_BC_EXPR_MUL_DOUBLE: return "MUL_DOUBLE";
+        case STMT_BC_EXPR_DIV_DOUBLE: return "DIV_DOUBLE";
+        case STMT_BC_EXPR_NEW_OBJECT: return "NEW_OBJECT";
+        case STMT_BC_EXPR_OBJ_PUT_CONST: return "OBJ_PUT_CONST";
+        case STMT_BC_EXPR_GET_MEMBER: return "GET_MEMBER";
+        case STMT_BC_EXPR_CALL_IDENT: return "CALL_IDENT";
+        case STMT_BC_EXPR_CALL_MEMBER: return "CALL_MEMBER";
+        case STMT_BC_EXPR_NEW: return "NEW";
+        case STMT_BC_EXPR_STORE_IDENT: return "STORE_IDENT";
+        case STMT_BC_EXPR_STORE_MEMBER: return "STORE_MEMBER";
+        case STMT_BC_EXPR_NOT: return "NOT";
+        case STMT_BC_EXPR_BIT_NOT: return "BIT_NOT";
+        case STMT_BC_EXPR_DELETE: return "DELETE";
+        case STMT_BC_EXPR_TYPEOF: return "TYPEOF";
+        case STMT_BC_EXPR_EVAL_AST: return "EVAL_AST";
+        case STMT_BC_EXPR_DUP: return "DUP";
+        case STMT_BC_EXPR_POP: return "POP";
+        case STMT_BC_STMT_EVAL_AST: return "STMT_EVAL_AST";
+        case STMT_BC_FOR_IN_INIT: return "FOR_IN_INIT";
+        case STMT_BC_FOR_IN_NEXT: return "FOR_IN_NEXT";
+        case STMT_BC_FOR_IN_ASSIGN: return "FOR_IN_ASSIGN";
+        case STMT_BC_WITH_ENTER: return "WITH_ENTER";
+        case STMT_BC_WITH_EXIT: return "WITH_EXIT";
+        case STMT_BC_TRY_PUSH: return "TRY_PUSH";
+        case STMT_BC_TRY_POP: return "TRY_POP";
+        case STMT_BC_CATCH_ENTER: return "CATCH_ENTER";
+        case STMT_BC_CATCH_EXIT: return "CATCH_EXIT";
+        case STMT_BC_THROW: return "THROW";
+        case STMT_BC_FINALLY_EXIT: return "FINALLY_EXIT";
+        case STMT_BC_JUMP: return "JUMP";
+        case STMT_BC_JUMP_IF_FALSE: return "JUMP_IF_FALSE";
+        case STMT_BC_JUMP_IF_TRUE: return "JUMP_IF_TRUE";
+        case STMT_BC_JLT_IDENT_CONST: return "JLT_IDENT_CONST";
+        case STMT_BC_JBITAND_EQZ_IDENT_CONST: return "JBITAND_EQZ_IDENT_CONST";
+        case STMT_BC_JUMP_ADD_IDENT_CONST: return "JUMP_ADD_IDENT_CONST";
+        case STMT_BC_RETURN_VALUE: return "RETURN_VALUE";
+        case STMT_BC_RETURN_VOID: return "RETURN_VOID";
+        default: return "UNKNOWN";
+    }
+}
+
+static const char *ps_token_name_short(int tok) {
+    switch (tok) {
+        case TOK_PLUS: return "+";
+        case TOK_MINUS: return "-";
+        case TOK_STAR: return "*";
+        case TOK_SLASH: return "/";
+        case TOK_PERCENT: return "%";
+        case TOK_LT: return "<";
+        case TOK_LTE: return "<=";
+        case TOK_GT: return ">";
+        case TOK_GTE: return ">=";
+        case TOK_EQ: return "==";
+        case TOK_NEQ: return "!=";
+        case TOK_STRICT_EQ: return "===";
+        case TOK_STRICT_NEQ: return "!==";
+        case TOK_AND: return "&";
+        case TOK_OR: return "|";
+        case TOK_XOR: return "^";
+        case TOK_SHL: return "<<";
+        case TOK_SHR: return ">>";
+        case TOK_USHR: return ">>>";
+        case TOK_AND_AND: return "&&";
+        case TOK_OR_OR: return "||";
+        case TOK_NOT: return "!";
+        case TOK_BIT_NOT: return "~";
+        default: return "?";
+    }
+}
+
+static const char *ps_ident_name(PSAstNode *node) {
+    if (!node || node->kind != AST_IDENTIFIER) return NULL;
+    return node->as.identifier.name;
+}
+
+static void ps_format_value(const PSValue *v, char *buf, size_t cap) {
+    if (!buf || cap == 0) return;
+    if (!v) {
+        snprintf(buf, cap, "null");
+        return;
+    }
+    switch (v->type) {
+        case PS_T_UNDEFINED:
+            snprintf(buf, cap, "undefined");
+            break;
+        case PS_T_NULL:
+            snprintf(buf, cap, "null");
+            break;
+        case PS_T_BOOLEAN:
+            snprintf(buf, cap, v->as.boolean ? "true" : "false");
+            break;
+        case PS_T_NUMBER:
+            snprintf(buf, cap, "%.15g", v->as.number);
+            break;
+        case PS_T_STRING: {
+            const PSString *s = v->as.string;
+            if (!s || !s->utf8) {
+                snprintf(buf, cap, "\"\"");
+            } else {
+                size_t n = s->byte_len < cap - 3 ? s->byte_len : cap - 3;
+                buf[0] = '"';
+                memcpy(buf + 1, s->utf8, n);
+                buf[1 + n] = '"';
+                buf[2 + n] = '\0';
+            }
+            break;
+        }
+        default:
+            snprintf(buf, cap, "<obj>");
+            break;
+    }
+}
+
+static void ps_stmt_bc_dump(const PSStmtBC *bc, const char *label) {
+    if (!bc || !bc->code) return;
+    printf("=== STMT_BC %s ===\n", label ? label : "<unknown>");
+    for (size_t i = 0; i < bc->count; i++) {
+        const PSStmtBCInstr *ins = &bc->code[i];
+        const char *op = ps_stmt_bc_op_name(ins->op);
+        printf("%04zu: %-16s", i, op);
+        switch (ins->op) {
+            case STMT_BC_EXPR_PUSH_CONST: {
+                char tmp[96];
+                PSValue v = (ins->a >= 0 && (size_t)ins->a < bc->const_count)
+                    ? bc->consts[ins->a] : ps_value_undefined();
+                ps_format_value(&v, tmp, sizeof(tmp));
+                printf(" %d (%s)", ins->a, tmp);
+                break;
+            }
+            case STMT_BC_EXPR_LOAD_IDENT:
+            case STMT_BC_EXPR_STORE_IDENT: {
+                const char *name = ps_ident_name((PSAstNode *)ins->ptr);
+                printf(" %s", name ? name : "<ident>");
+                break;
+            }
+            case STMT_BC_EXPR_ADD_IDENT_CONST: {
+                const char *name = ps_ident_name((PSAstNode *)ins->ptr);
+                char tmp[96];
+                PSValue v = (ins->a >= 0 && (size_t)ins->a < bc->const_count)
+                    ? bc->consts[ins->a] : ps_value_undefined();
+                ps_format_value(&v, tmp, sizeof(tmp));
+                printf(" %s, %s", name ? name : "<ident>", tmp);
+                break;
+            }
+            case STMT_BC_EXPR_ADD_IDENT_IDENT: {
+                const char *lhs = ps_ident_name((PSAstNode *)ins->ptr);
+                const char *rhs = ps_ident_name((PSAstNode *)ins->ptr2);
+                printf(" %s, %s", lhs ? lhs : "<ident>", rhs ? rhs : "<ident>");
+                break;
+            }
+            case STMT_BC_EXPR_UNARY_NUM:
+            case STMT_BC_EXPR_BINARY_NUM:
+                printf(" %s", ps_token_name_short(ins->a));
+                break;
+            case STMT_BC_EXPR_CALL_IDENT:
+                printf(" %s, argc=%d", ps_ident_name((PSAstNode *)ins->ptr), ins->a);
+                break;
+            case STMT_BC_EXPR_CALL_MEMBER:
+            case STMT_BC_EXPR_GET_MEMBER:
+            case STMT_BC_EXPR_STORE_MEMBER: {
+                PSAstNode *member = (PSAstNode *)ins->ptr;
+                const char *obj = NULL;
+                const char *prop = NULL;
+                if (member && member->kind == AST_MEMBER) {
+                    obj = ps_ident_name(member->as.member.object);
+                    if (!member->as.member.computed) {
+                        if (member->as.member.property &&
+                            member->as.member.property->kind == AST_IDENTIFIER) {
+                            prop = ps_ident_name(member->as.member.property);
+                        } else if (member->as.member.property &&
+                                   member->as.member.property->kind == AST_LITERAL &&
+                                   member->as.member.property->as.literal.value.type == PS_T_STRING) {
+                            PSString *s = member->as.member.property->as.literal.value.as.string;
+                            prop = s ? s->utf8 : NULL;
+                        }
+                    }
+                }
+                if (ins->op == STMT_BC_EXPR_CALL_MEMBER) {
+                    printf(" %s.%s, argc=%d", obj ? obj : "<obj>",
+                           prop ? prop : (ins->flags ? "<computed>" : "<prop>"),
+                           ins->a);
+                } else {
+                    printf(" %s.%s", obj ? obj : "<obj>",
+                           prop ? prop : (ins->a ? "<computed>" : "<prop>"));
+                }
+                break;
+            }
+            case STMT_BC_JUMP:
+            case STMT_BC_JUMP_IF_FALSE:
+            case STMT_BC_JUMP_IF_TRUE:
+                printf(" -> %d", ins->a);
+                break;
+            case STMT_BC_JLT_IDENT_CONST: {
+                const char *name = ps_ident_name((PSAstNode *)ins->ptr);
+                char tmp[96];
+                PSValue v = (ins->a >= 0 && (size_t)ins->a < bc->const_count)
+                    ? bc->consts[ins->a] : ps_value_undefined();
+                ps_format_value(&v, tmp, sizeof(tmp));
+                printf(" %s, %s -> %ld", name ? name : "<ident>", tmp,
+                       (long)(intptr_t)ins->ptr2);
+                break;
+            }
+            case STMT_BC_JBITAND_EQZ_IDENT_CONST: {
+                const char *name = ps_ident_name((PSAstNode *)ins->ptr);
+                char tmp[96];
+                PSValue v = (ins->a >= 0 && (size_t)ins->a < bc->const_count)
+                    ? bc->consts[ins->a] : ps_value_undefined();
+                ps_format_value(&v, tmp, sizeof(tmp));
+                printf(" %s, %s -> %ld", name ? name : "<ident>", tmp,
+                       (long)(intptr_t)ins->ptr2);
+                break;
+            }
+            case STMT_BC_JUMP_ADD_IDENT_CONST: {
+                const char *name = ps_ident_name((PSAstNode *)ins->ptr);
+                char tmp[96];
+                PSValue v = (ins->a >= 0 && (size_t)ins->a < bc->const_count)
+                    ? bc->consts[ins->a] : ps_value_undefined();
+                ps_format_value(&v, tmp, sizeof(tmp));
+                printf(" %s, %s -> %ld", name ? name : "<ident>", tmp,
+                       (long)(intptr_t)ins->ptr2);
+                break;
+            }
+            case STMT_BC_TRY_PUSH: {
+                intptr_t finally_ip = (intptr_t)ins->ptr;
+                printf(" catch=%d finally=%ld", ins->a, (long)finally_ip);
+                break;
+            }
+            case STMT_BC_EXPR_OBJ_PUT_CONST:
+                printf(" const=%d", ins->a);
+                break;
+            case STMT_BC_EXPR_NEW:
+                printf(" argc=%d", ins->a);
+                break;
+            case STMT_BC_EXPR_TYPEOF: {
+                PSAstNode *n = (PSAstNode *)ins->ptr;
+                const char *name = ps_ident_name(n);
+                printf(" %s", name ? name : "<expr>");
+                break;
+            }
+            default:
+                break;
+        }
+        printf("\n");
+    }
+}
 
 static int ps_stmt_bc_emit_list(PSStmtBCBuilder *b,
                                 PSAstNode **items,
@@ -5614,7 +6789,7 @@ static int ps_stmt_bc_emit_list(PSStmtBCBuilder *b,
     return 1;
 }
 
-static int ps_stmt_bc_push_loop(PSStmtLoop **loops, size_t *depth, size_t *cap) {
+static int ps_stmt_bc_push_loop(PSStmtLoop **loops, size_t *depth, size_t *cap, int allow_continue, PSString *label) {
     if (!loops || !depth || !cap) return 0;
     if (*depth == *cap) {
         size_t new_cap = *cap ? (*cap * 2) : 4;
@@ -5625,12 +6800,38 @@ static int ps_stmt_bc_push_loop(PSStmtLoop **loops, size_t *depth, size_t *cap) 
     }
     PSStmtLoop *loop = &(*loops)[(*depth)++];
     memset(loop, 0, sizeof(*loop));
+    loop->allow_continue = allow_continue ? 1 : 0;
+    loop->label = label;
     return 1;
 }
 
-static PSStmtLoop *ps_stmt_bc_current_loop(PSStmtLoop *loops, size_t depth) {
+static PSStmtLoop *ps_stmt_bc_current_break(PSStmtLoop *loops, size_t depth) {
     if (!loops || depth == 0) return NULL;
     return &loops[depth - 1];
+}
+
+static PSStmtLoop *ps_stmt_bc_current_continue(PSStmtLoop *loops, size_t depth) {
+    if (!loops || depth == 0) return NULL;
+    for (size_t i = depth; i > 0; i--) {
+        PSStmtLoop *loop = &loops[i - 1];
+        if (loop->allow_continue) return loop;
+    }
+    return NULL;
+}
+
+static PSStmtLoop *ps_stmt_bc_find_loop_by_label(PSStmtLoop *loops,
+                                                 size_t depth,
+                                                 PSString *label,
+                                                 int for_continue) {
+    if (!loops || depth == 0 || !label) return NULL;
+    for (size_t i = depth; i > 0; i--) {
+        PSStmtLoop *loop = &loops[i - 1];
+        if (for_continue && !loop->allow_continue) continue;
+        if (loop->label && ps_string_equals(loop->label, label)) {
+            return loop;
+        }
+    }
+    return NULL;
 }
 
 static int ps_stmt_bc_emit_stmt(PSStmtBCBuilder *b,
@@ -5645,31 +6846,39 @@ static int ps_stmt_bc_emit_stmt(PSStmtBCBuilder *b,
             return ps_stmt_bc_emit_list(b, stmt->as.list.items, stmt->as.list.count,
                                         loops, loop_depth, loop_cap);
         case AST_EXPR_STMT: {
-            PSStmtBCInstr ins = {0};
-            ins.op = STMT_BC_EVAL_EXPR;
-            ins.ptr = stmt->as.expr_stmt.expr;
-            return ps_stmt_bc_push_instr(b, ins);
+            if (!ps_stmt_bc_emit_expr(b, stmt->as.expr_stmt.expr)) return 0;
+            PSStmtBCInstr pop = {0};
+            pop.op = STMT_BC_EXPR_POP;
+            return ps_stmt_bc_push_instr(b, pop);
         }
         case AST_VAR_DECL: {
             if (stmt->as.var_decl.init) {
-                PSStmtBCInstr ins = {0};
-                ins.op = STMT_BC_VAR_INIT;
-                ins.ptr = stmt->as.var_decl.id;
-                ins.ptr2 = stmt->as.var_decl.init;
-                return ps_stmt_bc_push_instr(b, ins);
+                if (!ps_stmt_bc_emit_expr(b, stmt->as.var_decl.init)) return 0;
+                PSStmtBCInstr store = {0};
+                store.op = STMT_BC_EXPR_STORE_IDENT;
+                store.ptr = stmt->as.var_decl.id;
+                if (!ps_stmt_bc_push_instr(b, store)) return 0;
+                PSStmtBCInstr pop = {0};
+                pop.op = STMT_BC_EXPR_POP;
+                return ps_stmt_bc_push_instr(b, pop);
             }
             return 1;
         }
         case AST_RETURN: {
+            if (stmt->as.ret.expr) {
+                if (!ps_stmt_bc_emit_expr(b, stmt->as.ret.expr)) return 0;
+                PSStmtBCInstr ins = {0};
+                ins.op = STMT_BC_RETURN_VALUE;
+                return ps_stmt_bc_push_instr(b, ins);
+            }
             PSStmtBCInstr ins = {0};
-            ins.op = STMT_BC_RETURN;
-            ins.ptr = stmt->as.ret.expr;
+            ins.op = STMT_BC_RETURN_VOID;
             return ps_stmt_bc_push_instr(b, ins);
         }
         case AST_IF: {
+            if (!ps_stmt_bc_emit_expr(b, stmt->as.if_stmt.cond)) return 0;
             PSStmtBCInstr cond = {0};
             cond.op = STMT_BC_JUMP_IF_FALSE;
-            cond.ptr = stmt->as.if_stmt.cond;
             size_t cond_ip = b->count;
             if (!ps_stmt_bc_push_instr(b, cond)) return 0;
             if (!ps_stmt_bc_emit_stmt(b, stmt->as.if_stmt.then_branch,
@@ -5690,14 +6899,17 @@ static int ps_stmt_bc_emit_stmt(PSStmtBCBuilder *b,
         }
         case AST_WHILE: {
             size_t start_ip = b->count;
+            if (!ps_stmt_bc_emit_expr(b, stmt->as.while_stmt.cond)) return 0;
             PSStmtBCInstr cond = {0};
             cond.op = STMT_BC_JUMP_IF_FALSE;
-            cond.ptr = stmt->as.while_stmt.cond;
             size_t cond_ip = b->count;
             if (!ps_stmt_bc_push_instr(b, cond)) return 0;
-            if (!ps_stmt_bc_push_loop(loops, loop_depth, loop_cap)) return 0;
-            PSStmtLoop *loop = ps_stmt_bc_current_loop(*loops, *loop_depth);
-            loop->continue_target = cond_ip;
+            PSString *label = stmt->as.while_stmt.label
+                ? ps_identifier_string(stmt->as.while_stmt.label)
+                : NULL;
+            if (!ps_stmt_bc_push_loop(loops, loop_depth, loop_cap, 1, label)) return 0;
+            PSStmtLoop *loop = ps_stmt_bc_current_break(*loops, *loop_depth);
+            loop->continue_target = start_ip;
             if (!ps_stmt_bc_emit_stmt(b, stmt->as.while_stmt.body,
                                       loops, loop_depth, loop_cap)) return 0;
             PSStmtBCInstr back = {0};
@@ -5718,15 +6930,18 @@ static int ps_stmt_bc_emit_stmt(PSStmtBCBuilder *b,
         }
         case AST_DO_WHILE: {
             size_t start_ip = b->count;
-            if (!ps_stmt_bc_push_loop(loops, loop_depth, loop_cap)) return 0;
+            PSString *label = stmt->as.do_while.label
+                ? ps_identifier_string(stmt->as.do_while.label)
+                : NULL;
+            if (!ps_stmt_bc_push_loop(loops, loop_depth, loop_cap, 1, label)) return 0;
             if (!ps_stmt_bc_emit_stmt(b, stmt->as.do_while.body,
                                       loops, loop_depth, loop_cap)) return 0;
-            PSStmtLoop *loop = ps_stmt_bc_current_loop(*loops, *loop_depth);
+            PSStmtLoop *loop = ps_stmt_bc_current_break(*loops, *loop_depth);
             size_t cond_ip = b->count;
             loop->continue_target = cond_ip;
+            if (!ps_stmt_bc_emit_expr(b, stmt->as.do_while.cond)) return 0;
             PSStmtBCInstr cond = {0};
             cond.op = STMT_BC_JUMP_IF_FALSE;
-            cond.ptr = stmt->as.do_while.cond;
             size_t cond_jump_ip = b->count;
             if (!ps_stmt_bc_push_instr(b, cond)) return 0;
             PSStmtBCInstr back = {0};
@@ -5753,21 +6968,24 @@ static int ps_stmt_bc_emit_stmt(PSStmtBCBuilder *b,
             size_t test_ip = b->count;
             size_t test_jump_ip = (size_t)-1;
             if (stmt->as.for_stmt.test) {
+                if (!ps_stmt_bc_emit_expr(b, stmt->as.for_stmt.test)) return 0;
                 PSStmtBCInstr test = {0};
                 test.op = STMT_BC_JUMP_IF_FALSE;
-                test.ptr = stmt->as.for_stmt.test;
                 test_jump_ip = b->count;
                 if (!ps_stmt_bc_push_instr(b, test)) return 0;
             }
-            if (!ps_stmt_bc_push_loop(loops, loop_depth, loop_cap)) return 0;
+            PSString *label = stmt->as.for_stmt.label
+                ? ps_identifier_string(stmt->as.for_stmt.label)
+                : NULL;
+            if (!ps_stmt_bc_push_loop(loops, loop_depth, loop_cap, 1, label)) return 0;
             if (!ps_stmt_bc_emit_stmt(b, stmt->as.for_stmt.body,
                                       loops, loop_depth, loop_cap)) return 0;
             size_t update_ip = b->count;
             if (stmt->as.for_stmt.update) {
-                PSStmtBCInstr upd = {0};
-                upd.op = STMT_BC_EVAL_EXPR;
-                upd.ptr = stmt->as.for_stmt.update;
-                if (!ps_stmt_bc_push_instr(b, upd)) return 0;
+                if (!ps_stmt_bc_emit_expr(b, stmt->as.for_stmt.update)) return 0;
+                PSStmtBCInstr pop = {0};
+                pop.op = STMT_BC_EXPR_POP;
+                if (!ps_stmt_bc_push_instr(b, pop)) return 0;
             }
             PSStmtBCInstr back = {0};
             back.op = STMT_BC_JUMP;
@@ -5777,7 +6995,7 @@ static int ps_stmt_bc_emit_stmt(PSStmtBCBuilder *b,
             if (test_jump_ip != (size_t)-1) {
                 b->code[test_jump_ip].a = (int32_t)end_ip;
             }
-            PSStmtLoop *loop = ps_stmt_bc_current_loop(*loops, *loop_depth);
+            PSStmtLoop *loop = ps_stmt_bc_current_break(*loops, *loop_depth);
             loop->continue_target = stmt->as.for_stmt.update ? update_ip : test_ip;
             for (size_t i = 0; i < loop->break_count; i++) {
                 b->code[loop->breaks[i]].a = (int32_t)end_ip;
@@ -5789,8 +7007,261 @@ static int ps_stmt_bc_emit_stmt(PSStmtBCBuilder *b,
             (*loop_depth)--;
             return 1;
         }
+        case AST_FOR_IN: {
+            if (!ps_stmt_bc_emit_expr(b, stmt->as.for_in.object)) return 0;
+            PSStmtBCInstr init = {0};
+            init.op = STMT_BC_FOR_IN_INIT;
+            if (!ps_stmt_bc_push_instr(b, init)) return 0;
+            size_t loop_start = b->count;
+            PSStmtBCInstr next = {0};
+            next.op = STMT_BC_FOR_IN_NEXT;
+            if (!ps_stmt_bc_push_instr(b, next)) return 0;
+            PSStmtBCInstr cond = {0};
+            cond.op = STMT_BC_JUMP_IF_FALSE;
+            size_t cond_ip = b->count;
+            if (!ps_stmt_bc_push_instr(b, cond)) return 0;
+            PSString *label = stmt->as.for_in.label
+                ? ps_identifier_string(stmt->as.for_in.label)
+                : NULL;
+            if (!ps_stmt_bc_push_loop(loops, loop_depth, loop_cap, 1, label)) return 0;
+            PSStmtLoop *loop = ps_stmt_bc_current_break(*loops, *loop_depth);
+            loop->continue_target = loop_start;
+            PSStmtBCInstr assign = {0};
+            assign.op = STMT_BC_FOR_IN_ASSIGN;
+            assign.ptr = stmt->as.for_in.target;
+            assign.a = stmt->as.for_in.is_var ? 1 : 0;
+            if (!ps_stmt_bc_push_instr(b, assign)) return 0;
+            if (!ps_stmt_bc_emit_stmt(b, stmt->as.for_in.body,
+                                      loops, loop_depth, loop_cap)) return 0;
+            PSStmtBCInstr back = {0};
+            back.op = STMT_BC_JUMP;
+            back.a = (int32_t)loop_start;
+            if (!ps_stmt_bc_push_instr(b, back)) return 0;
+            size_t cleanup_ip = b->count;
+            PSStmtBCInstr pop = {0};
+            pop.op = STMT_BC_EXPR_POP;
+            if (!ps_stmt_bc_push_instr(b, pop)) return 0;
+            if (!ps_stmt_bc_push_instr(b, pop)) return 0;
+            size_t end_ip = b->count;
+            b->code[cond_ip].a = (int32_t)cleanup_ip;
+            for (size_t i = 0; i < loop->break_count; i++) {
+                b->code[loop->breaks[i]].a = (int32_t)cleanup_ip;
+            }
+            for (size_t i = 0; i < loop->continue_count; i++) {
+                b->code[loop->continues[i]].a = (int32_t)loop->continue_target;
+            }
+            (void)end_ip;
+            ps_stmt_loop_free(loop);
+            (*loop_depth)--;
+            return 1;
+        }
+        case AST_FOR_OF: {
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_STMT_EVAL_AST;
+            instr.ptr = stmt;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
+        case AST_SWITCH: {
+            PSAstNode *sw = stmt;
+            size_t case_count = sw->as.switch_stmt.case_count;
+            if (!ps_stmt_bc_emit_expr(b, sw->as.switch_stmt.expr)) return 0;
+            PSString *label = sw->as.switch_stmt.label
+                ? ps_identifier_string(sw->as.switch_stmt.label)
+                : NULL;
+            if (!ps_stmt_bc_push_loop(loops, loop_depth, loop_cap, 0, label)) return 0;
+            PSStmtLoop *loop = ps_stmt_bc_current_break(*loops, *loop_depth);
+
+            size_t *match_jumps = NULL;
+            size_t *match_labels = NULL;
+            size_t *entry_jumps = NULL;
+            size_t *body_labels = NULL;
+            if (case_count > 0) {
+                match_jumps = (size_t *)calloc(case_count, sizeof(size_t));
+                match_labels = (size_t *)calloc(case_count, sizeof(size_t));
+                entry_jumps = (size_t *)calloc(case_count, sizeof(size_t));
+                body_labels = (size_t *)calloc(case_count, sizeof(size_t));
+                if (!match_jumps || !match_labels || !entry_jumps || !body_labels) {
+                    free(match_jumps);
+                    free(match_labels);
+                    free(entry_jumps);
+                    free(body_labels);
+                    return 0;
+                }
+            }
+
+            int default_index = -1;
+            for (size_t i = 0; i < case_count; i++) {
+                PSAstNode *case_node = sw->as.switch_stmt.cases[i];
+                if (!case_node->as.case_stmt.test) {
+                    default_index = (int)i;
+                    continue;
+                }
+                PSStmtBCInstr dup = {0};
+                dup.op = STMT_BC_EXPR_DUP;
+                if (!ps_stmt_bc_push_instr(b, dup)) return 0;
+                if (!ps_stmt_bc_emit_expr(b, case_node->as.case_stmt.test)) return 0;
+                PSStmtBCInstr eq = {0};
+                eq.op = STMT_BC_EXPR_BINARY_NUM;
+                eq.a = TOK_STRICT_EQ;
+                if (!ps_stmt_bc_push_instr(b, eq)) return 0;
+                PSStmtBCInstr jmp = {0};
+                jmp.op = STMT_BC_JUMP_IF_TRUE;
+                size_t jmp_ip = b->count;
+                if (!ps_stmt_bc_push_instr(b, jmp)) return 0;
+                if (match_jumps) match_jumps[i] = jmp_ip;
+            }
+
+            PSStmtBCInstr pop = {0};
+            pop.op = STMT_BC_EXPR_POP;
+            if (!ps_stmt_bc_push_instr(b, pop)) return 0;
+            PSStmtBCInstr jmp_default = {0};
+            jmp_default.op = STMT_BC_JUMP;
+            size_t jmp_default_ip = b->count;
+            if (!ps_stmt_bc_push_instr(b, jmp_default)) return 0;
+
+            for (size_t i = 0; i < case_count; i++) {
+                PSAstNode *case_node = sw->as.switch_stmt.cases[i];
+                if (!case_node->as.case_stmt.test) continue;
+                match_labels[i] = b->count;
+                PSStmtBCInstr pop_disc = {0};
+                pop_disc.op = STMT_BC_EXPR_POP;
+                if (!ps_stmt_bc_push_instr(b, pop_disc)) return 0;
+                PSStmtBCInstr jump_body = {0};
+                jump_body.op = STMT_BC_JUMP;
+                size_t jump_body_ip = b->count;
+                if (!ps_stmt_bc_push_instr(b, jump_body)) return 0;
+                entry_jumps[i] = jump_body_ip;
+            }
+
+            for (size_t i = 0; i < case_count; i++) {
+                body_labels[i] = b->count;
+                PSAstNode *case_node = sw->as.switch_stmt.cases[i];
+                if (!ps_stmt_bc_emit_list(b, case_node->as.case_stmt.items,
+                                          case_node->as.case_stmt.count,
+                                          loops, loop_depth, loop_cap)) return 0;
+            }
+
+            size_t end_ip = b->count;
+            if (case_count > 0) {
+                for (size_t i = 0; i < case_count; i++) {
+                    PSAstNode *case_node = sw->as.switch_stmt.cases[i];
+                    if (!case_node->as.case_stmt.test) continue;
+                    b->code[match_jumps[i]].a = (int32_t)match_labels[i];
+                    b->code[entry_jumps[i]].a = (int32_t)body_labels[i];
+                }
+            }
+            if (default_index >= 0 && case_count > 0) {
+                b->code[jmp_default_ip].a = (int32_t)body_labels[default_index];
+            } else {
+                b->code[jmp_default_ip].a = (int32_t)end_ip;
+            }
+
+            for (size_t i = 0; i < loop->break_count; i++) {
+                b->code[loop->breaks[i]].a = (int32_t)end_ip;
+            }
+            for (size_t i = 0; i < loop->continue_count; i++) {
+                b->code[loop->continues[i]].a = (int32_t)loop->continue_target;
+            }
+            ps_stmt_loop_free(loop);
+            (*loop_depth)--;
+            free(match_jumps);
+            free(match_labels);
+            free(entry_jumps);
+            free(body_labels);
+            return 1;
+        }
+        case AST_WITH: {
+            if (!ps_stmt_bc_emit_expr(b, stmt->as.with_stmt.object)) return 0;
+            PSStmtBCInstr enter = {0};
+            enter.op = STMT_BC_WITH_ENTER;
+            if (!ps_stmt_bc_push_instr(b, enter)) return 0;
+            if (!ps_stmt_bc_emit_stmt(b, stmt->as.with_stmt.body,
+                                      loops, loop_depth, loop_cap)) return 0;
+            PSStmtBCInstr exit = {0};
+            exit.op = STMT_BC_WITH_EXIT;
+            return ps_stmt_bc_push_instr(b, exit);
+        }
+        case AST_TRY: {
+            PSAstNode *try_block = stmt->as.try_stmt.try_block;
+            PSAstNode *catch_block = stmt->as.try_stmt.catch_block;
+            PSAstNode *finally_block = stmt->as.try_stmt.finally_block;
+            PSStmtBCInstr push = {0};
+            push.op = STMT_BC_TRY_PUSH;
+            push.a = -1;
+            push.ptr = (void *)(intptr_t)-1;
+            push.ptr2 = catch_block ? stmt->as.try_stmt.catch_param : NULL;
+            size_t push_ip = b->count;
+            if (!ps_stmt_bc_push_instr(b, push)) return 0;
+            if (!ps_stmt_bc_emit_stmt(b, try_block, loops, loop_depth, loop_cap)) return 0;
+            PSStmtBCInstr jmp_after_try = {0};
+            jmp_after_try.op = STMT_BC_JUMP;
+            size_t jmp_after_try_ip = b->count;
+            if (!ps_stmt_bc_push_instr(b, jmp_after_try)) return 0;
+
+            size_t catch_ip = (size_t)-1;
+            size_t jmp_after_catch_ip = (size_t)-1;
+            if (catch_block) {
+                catch_ip = b->count;
+                PSStmtBCInstr enter = {0};
+                enter.op = STMT_BC_CATCH_ENTER;
+                if (!ps_stmt_bc_push_instr(b, enter)) return 0;
+                if (!ps_stmt_bc_emit_stmt(b, catch_block, loops, loop_depth, loop_cap)) return 0;
+                PSStmtBCInstr exit = {0};
+                exit.op = STMT_BC_CATCH_EXIT;
+                if (!ps_stmt_bc_push_instr(b, exit)) return 0;
+                PSStmtBCInstr jmp_after_catch = {0};
+                jmp_after_catch.op = STMT_BC_JUMP;
+                jmp_after_catch_ip = b->count;
+                if (!ps_stmt_bc_push_instr(b, jmp_after_catch)) return 0;
+            }
+
+            size_t finally_ip = (size_t)-1;
+            size_t cleanup_ip = (size_t)-1;
+            if (finally_block) {
+                finally_ip = b->count;
+                if (!ps_stmt_bc_emit_stmt(b, finally_block, loops, loop_depth, loop_cap)) return 0;
+                PSStmtBCInstr fin = {0};
+                fin.op = STMT_BC_FINALLY_EXIT;
+                if (!ps_stmt_bc_push_instr(b, fin)) return 0;
+            } else {
+                PSStmtBCInstr pop = {0};
+                pop.op = STMT_BC_TRY_POP;
+                cleanup_ip = b->count;
+                if (!ps_stmt_bc_push_instr(b, pop)) return 0;
+            }
+            size_t end_ip = b->count;
+            (void)end_ip;
+
+            b->code[push_ip].a = catch_block ? (int32_t)catch_ip : -1;
+            b->code[push_ip].ptr = (void *)(intptr_t)(finally_block ? (intptr_t)finally_ip : -1);
+
+            if (finally_block) {
+                b->code[jmp_after_try_ip].a = (int32_t)finally_ip;
+                if (catch_block) {
+                    b->code[jmp_after_catch_ip].a = (int32_t)finally_ip;
+                }
+            } else {
+                b->code[jmp_after_try_ip].a = (int32_t)cleanup_ip;
+                if (catch_block) {
+                    b->code[jmp_after_catch_ip].a = (int32_t)cleanup_ip;
+                }
+            }
+            return 1;
+        }
+        case AST_THROW: {
+            if (!ps_stmt_bc_emit_expr(b, stmt->as.throw_stmt.expr)) return 0;
+            PSStmtBCInstr thr = {0};
+            thr.op = STMT_BC_THROW;
+            return ps_stmt_bc_push_instr(b, thr);
+        }
         case AST_BREAK: {
-            PSStmtLoop *loop = ps_stmt_bc_current_loop(*loops, *loop_depth);
+            PSStmtLoop *loop = NULL;
+            if (stmt->as.jump_stmt.label) {
+                PSString *label = ps_identifier_string(stmt->as.jump_stmt.label);
+                loop = ps_stmt_bc_find_loop_by_label(*loops, *loop_depth, label, 0);
+            } else {
+                loop = ps_stmt_bc_current_break(*loops, *loop_depth);
+            }
             if (!loop) return 0;
             PSStmtBCInstr jmp = {0};
             jmp.op = STMT_BC_JUMP;
@@ -5799,7 +7270,13 @@ static int ps_stmt_bc_emit_stmt(PSStmtBCBuilder *b,
             return ps_stmt_loop_add(&loop->breaks, &loop->break_count, &loop->break_cap, ip);
         }
         case AST_CONTINUE: {
-            PSStmtLoop *loop = ps_stmt_bc_current_loop(*loops, *loop_depth);
+            PSStmtLoop *loop = NULL;
+            if (stmt->as.jump_stmt.label) {
+                PSString *label = ps_identifier_string(stmt->as.jump_stmt.label);
+                loop = ps_stmt_bc_find_loop_by_label(*loops, *loop_depth, label, 1);
+            } else {
+                loop = ps_stmt_bc_current_continue(*loops, *loop_depth);
+            }
             if (!loop) return 0;
             PSStmtBCInstr jmp = {0};
             jmp.op = STMT_BC_JUMP;
@@ -5809,8 +7286,12 @@ static int ps_stmt_bc_emit_stmt(PSStmtBCBuilder *b,
         }
         case AST_FUNCTION_DECL:
             return 1;
-        default:
-            return 0;
+        default: {
+            PSStmtBCInstr instr = {0};
+            instr.op = STMT_BC_STMT_EVAL_AST;
+            instr.ptr = stmt;
+            return ps_stmt_bc_push_instr(b, instr);
+        }
     }
 }
 
@@ -5822,6 +7303,7 @@ static PSStmtBC *ps_stmt_bc_compile(PSAstNode *node) {
     size_t loop_cap = 0;
     if (!ps_stmt_bc_emit_stmt(&b, node, &loops, &loop_depth, &loop_cap)) {
         free(b.code);
+        free(b.consts);
         if (loops) {
             for (size_t i = 0; i < loop_depth; i++) {
                 ps_stmt_loop_free(&loops[i]);
@@ -5829,6 +7311,45 @@ static PSStmtBC *ps_stmt_bc_compile(PSAstNode *node) {
         }
         free(loops);
         return NULL;
+    }
+    {
+        PSStmtBCInstr ret = {0};
+        ret.op = STMT_BC_RETURN_VOID;
+        if (!ps_stmt_bc_push_instr(&b, ret)) {
+            free(b.code);
+            free(b.consts);
+            if (loops) {
+                for (size_t i = 0; i < loop_depth; i++) {
+                    ps_stmt_loop_free(&loops[i]);
+                }
+            }
+            free(loops);
+            return NULL;
+        }
+    }
+#if !PS_DISABLE_PEEPHOLE
+    if (!ps_stmt_bc_peephole(&b)) {
+        free(b.code);
+        free(b.consts);
+        if (loops) {
+            for (size_t i = 0; i < loop_depth; i++) {
+                ps_stmt_loop_free(&loops[i]);
+            }
+        }
+        free(loops);
+        return NULL;
+    }
+#endif
+    {
+        const char *dump = getenv("PS_DUMP_STMT_BC");
+        if (dump && *dump && node->kind == AST_PROGRAM) {
+            PSStmtBC tmp = {0};
+            tmp.code = b.code;
+            tmp.count = b.count;
+            tmp.consts = b.consts;
+            tmp.const_count = b.const_count;
+            ps_stmt_bc_dump(&tmp, node->source_path ? node->source_path : "<program>");
+        }
     }
     if (loops) {
         for (size_t i = 0; i < loop_depth; i++) {
@@ -5839,46 +7360,2273 @@ static PSStmtBC *ps_stmt_bc_compile(PSAstNode *node) {
     PSStmtBC *bc = (PSStmtBC *)calloc(1, sizeof(PSStmtBC));
     if (!bc) {
         free(b.code);
+        free(b.consts);
         return NULL;
     }
     bc->code = b.code;
     bc->count = b.count;
+    bc->consts = b.consts;
+    bc->const_count = b.const_count;
     return bc;
 }
 
 void ps_stmt_bc_free(PSStmtBC *bc) {
     if (!bc) return;
     free(bc->code);
+    free(bc->consts);
     free(bc);
+}
+
+static int ps_stmt_bc_get_ident_value(PSVM *vm, PSEnv *env, PSAstNode *id, PSValue *out,
+                                      PSEvalControl *ctl) {
+    int found = 0;
+    PSValue v = ps_value_undefined();
+    if (!ps_identifier_cached_get(env, id, &v, &found)) {
+        PSString *name = ps_identifier_string(id);
+        v = ps_env_get(env, name, &found);
+    }
+    if (!found) {
+        ctl->did_throw = 1;
+        const char *prefix = "Identifier not defined: ";
+        PSString *name = ps_identifier_string(id);
+        size_t prefix_len = strlen(prefix);
+        size_t name_len = name ? name->byte_len : 0;
+        char *msg = NULL;
+        if (name && name->utf8 && name_len > 0) {
+            msg = (char *)malloc(prefix_len + name_len + 1);
+        }
+        if (msg) {
+            memcpy(msg, prefix, prefix_len);
+            memcpy(msg + prefix_len, name->utf8, name_len);
+            msg[prefix_len + name_len] = '\0';
+            ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", msg);
+            free(msg);
+        } else {
+            ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", "Identifier not defined");
+        }
+        return 0;
+    }
+    *out = v;
+    return 1;
 }
 
 static PSValue ps_stmt_bc_execute(PSVM *vm, PSEnv *env, PSFunction *func, PSStmtBC *bc, PSEvalControl *ctl) {
     (void)func;
     if (!bc || !bc->code || bc->count == 0) return ps_value_undefined();
+    PSValue stack_buf[64];
+    PSValue *stack = stack_buf;
+    size_t sp = 0;
+    if (bc->count > 64) {
+        stack = (PSValue *)calloc(bc->count, sizeof(PSValue));
+        if (!stack) return ps_value_undefined();
+    }
+    PSEnv *env_stack_buf[8];
+    PSEnv **env_stack = env_stack_buf;
+    size_t env_sp = 0;
+    size_t env_cap = 8;
+    PSTryHandler handler_stack_buf[8];
+    PSTryHandler *handler_stack = handler_stack_buf;
+    size_t handler_sp = 0;
+    size_t handler_cap = 8;
+    int pending_throw = 0;
+    PSValue pending_throw_value = ps_value_undefined();
     size_t ip = 0;
+#define UNWIND_ENVS() do { \
+        while (env_sp > 0) { \
+            PSEnv *prev = env_stack[--env_sp]; \
+            if (env) ps_env_free(env); \
+            env = prev; \
+        } \
+        if (env_stack != env_stack_buf) { \
+            free(env_stack); \
+            env_stack = env_stack_buf; \
+        } \
+    } while (0)
+#define FREE_HANDLER_STACK() do { \
+        if (handler_stack != handler_stack_buf) { \
+            free(handler_stack); \
+            handler_stack = handler_stack_buf; \
+        } \
+    } while (0)
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(PS_DISABLE_THREADED_DISPATCH)
+    static void *dispatch[] = {
+        &&op_bad,
+        &&op_push_const,
+        &&op_load_ident,
+        &&op_load_this,
+        &&op_unary_num,
+        &&op_binary_num,
+        &&op_add_int,
+        &&op_add_double,
+        &&op_add_ident_const,
+        &&op_add_ident_ident,
+        &&op_sub_int,
+        &&op_sub_double,
+        &&op_mul_int,
+        &&op_mul_double,
+        &&op_div_double,
+        &&op_new_object,
+        &&op_obj_put_const,
+        &&op_get_member,
+        &&op_call_ident,
+        &&op_call_member,
+        &&op_new,
+        &&op_store_ident,
+        &&op_store_member,
+        &&op_not,
+        &&op_bit_not,
+        &&op_delete,
+        &&op_typeof,
+        &&op_eval_ast,
+        &&op_dup,
+        &&op_pop,
+        &&op_eval_stmt,
+        &&op_for_in_init,
+        &&op_for_in_next,
+        &&op_for_in_assign,
+        &&op_with_enter,
+        &&op_with_exit,
+        &&op_try_push,
+        &&op_try_pop,
+        &&op_catch_enter,
+        &&op_catch_exit,
+        &&op_throw,
+        &&op_finally_exit,
+        &&op_jump,
+        &&op_jump_if_false,
+        &&op_jump_if_true,
+#if !PS_DISABLE_CF_FUSIONS
+        &&op_jlt_ident_const,
+        &&op_jbitand_eqz_ident_const,
+        &&op_jump_add_ident_const,
+#else
+        &&op_bad,
+        &&op_bad,
+        &&op_bad,
+#endif
+        &&op_return_value,
+        &&op_return_void
+    };
+    PSStmtBCInstr *ins = NULL;
+    #define DISPATCH() do { \
+        if (ip >= bc->count) goto fail; \
+        ins = &bc->code[ip]; \
+        if (ins->op >= (int)(sizeof(dispatch) / sizeof(dispatch[0]))) goto fail; \
+        goto *dispatch[ins->op]; \
+    } while (0)
+    DISPATCH();
+    while (1) {
+        op_bad:
+            goto fail;
+        op_push_const:
+            if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+            stack[sp++] = bc->consts[ins->a];
+            ip++;
+            DISPATCH();
+        op_load_ident: {
+            PSAstNode *id = (PSAstNode *)ins->ptr;
+            int found = 0;
+            PSValue v = ps_value_undefined();
+            if (!ps_identifier_cached_get(env, id, &v, &found)) {
+                PSString *name = ps_identifier_string(id);
+                v = ps_env_get(env, name, &found);
+            }
+            if (!found) {
+                ctl->did_throw = 1;
+                const char *prefix = "Identifier not defined: ";
+                PSString *name = ps_identifier_string(id);
+                size_t prefix_len = strlen(prefix);
+                size_t name_len = name ? name->byte_len : 0;
+                char *msg = NULL;
+                if (name && name->utf8 && name_len > 0) {
+                    msg = (char *)malloc(prefix_len + name_len + 1);
+                }
+                if (msg) {
+                    memcpy(msg, prefix, prefix_len);
+                    memcpy(msg + prefix_len, name->utf8, name_len);
+                    msg[prefix_len + name_len] = '\0';
+                    ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", msg);
+                    free(msg);
+                } else {
+                    ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", "Identifier not defined");
+                }
+                goto fail;
+            }
+            stack[sp++] = v;
+            ip++;
+            DISPATCH();
+        }
+        op_load_this: {
+            PSString *name = ps_string_from_cstr("this");
+            int found = 0;
+            PSValue v = ps_env_get(env, name, &found);
+            if (found) {
+                stack[sp++] = v;
+            } else if (vm && vm->global) {
+                stack[sp++] = ps_value_object(vm->global);
+            } else {
+                stack[sp++] = ps_value_undefined();
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_unary_num: {
+            if (sp == 0) goto fail;
+            PSValue v = stack[sp - 1];
+            if (v.type != PS_T_NUMBER) goto fail;
+            if (ins->a == TOK_MINUS) {
+                v.as.number = -v.as.number;
+            }
+            stack[sp - 1] = v;
+            ip++;
+            DISPATCH();
+        }
+        op_binary_num: {
+            if (sp < 2) goto fail;
+            PSValue right = stack[--sp];
+            PSValue left = stack[--sp];
+            PSValue out = ps_eval_binary_values(vm, ins->a, left, right, ctl);
+            if (ctl->did_throw) goto handle_throw;
+            stack[sp++] = out;
+            ip++;
+            DISPATCH();
+        }
+        op_add_int: {
+            if (sp < 2) goto fail;
+            PSValue right = stack[--sp];
+            PSValue left = stack[--sp];
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                int32_t li = 0;
+                int32_t ri = 0;
+                if (ps_number_to_int32_strict(left.as.number, &li) &&
+                    ps_number_to_int32_strict(right.as.number, &ri)) {
+                    int64_t sum = (int64_t)li + (int64_t)ri;
+                    if (sum >= INT32_MIN && sum <= INT32_MAX) {
+                        stack[sp++] = ps_value_number((double)sum);
+                    } else {
+                        stack[sp++] = ps_value_number(left.as.number + right.as.number);
+                    }
+                } else {
+                    stack[sp++] = ps_value_number(left.as.number + right.as.number);
+                }
+            } else {
+                PSValue out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = out;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_add_double: {
+            if (sp < 2) goto fail;
+            PSValue right = stack[--sp];
+            PSValue left = stack[--sp];
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                stack[sp++] = ps_value_number(left.as.number + right.as.number);
+            } else {
+                PSValue out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = out;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_add_ident_const: {
+            PSAstNode *id = (PSAstNode *)ins->ptr;
+            if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+            PSValue left = ps_value_undefined();
+            if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+            PSValue right = bc->consts[ins->a];
+            PSValue out = ps_value_undefined();
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                out = ps_value_number(left.as.number + right.as.number);
+            } else {
+                out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+            }
+            if (!ps_identifier_cached_set(env, id, out)) {
+                PSString *name = ps_identifier_string(id);
+                if (name) ps_env_set(env, name, out);
+            }
+            stack[sp++] = out;
+            ip++;
+            DISPATCH();
+        }
+        op_add_ident_ident: {
+            PSAstNode *id = (PSAstNode *)ins->ptr;
+            PSAstNode *rhs_id = (PSAstNode *)ins->ptr2;
+            PSValue left = ps_value_undefined();
+            PSValue right = ps_value_undefined();
+            if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+            if (!ps_stmt_bc_get_ident_value(vm, env, rhs_id, &right, ctl)) goto fail;
+            PSValue out = ps_value_undefined();
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                out = ps_value_number(left.as.number + right.as.number);
+            } else {
+                out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+            }
+            if (!ps_identifier_cached_set(env, id, out)) {
+                PSString *name = ps_identifier_string(id);
+                if (name) ps_env_set(env, name, out);
+            }
+            stack[sp++] = out;
+            ip++;
+            DISPATCH();
+        }
+        op_sub_int: {
+            if (sp < 2) goto fail;
+            PSValue right = stack[--sp];
+            PSValue left = stack[--sp];
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                int32_t li = 0;
+                int32_t ri = 0;
+                if (ps_number_to_int32_strict(left.as.number, &li) &&
+                    ps_number_to_int32_strict(right.as.number, &ri)) {
+                    int64_t diff = (int64_t)li - (int64_t)ri;
+                    if (diff >= INT32_MIN && diff <= INT32_MAX) {
+                        stack[sp++] = ps_value_number((double)diff);
+                    } else {
+                        stack[sp++] = ps_value_number(left.as.number - right.as.number);
+                    }
+                } else {
+                    stack[sp++] = ps_value_number(left.as.number - right.as.number);
+                }
+            } else {
+                PSValue out = ps_stmt_bc_binary_slow(vm, TOK_MINUS, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = out;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_sub_double: {
+            if (sp < 2) goto fail;
+            PSValue right = stack[--sp];
+            PSValue left = stack[--sp];
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                stack[sp++] = ps_value_number(left.as.number - right.as.number);
+            } else {
+                PSValue out = ps_stmt_bc_binary_slow(vm, TOK_MINUS, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = out;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_mul_int: {
+            if (sp < 2) goto fail;
+            PSValue right = stack[--sp];
+            PSValue left = stack[--sp];
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                int32_t li = 0;
+                int32_t ri = 0;
+                if (ps_number_to_int32_strict(left.as.number, &li) &&
+                    ps_number_to_int32_strict(right.as.number, &ri)) {
+                    int64_t prod = (int64_t)li * (int64_t)ri;
+                    if (prod >= INT32_MIN && prod <= INT32_MAX) {
+                        stack[sp++] = ps_value_number((double)prod);
+                    } else {
+                        stack[sp++] = ps_value_number(left.as.number * right.as.number);
+                    }
+                } else {
+                    stack[sp++] = ps_value_number(left.as.number * right.as.number);
+                }
+            } else {
+                PSValue out = ps_stmt_bc_binary_slow(vm, TOK_STAR, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = out;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_mul_double: {
+            if (sp < 2) goto fail;
+            PSValue right = stack[--sp];
+            PSValue left = stack[--sp];
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                stack[sp++] = ps_value_number(left.as.number * right.as.number);
+            } else {
+                PSValue out = ps_stmt_bc_binary_slow(vm, TOK_STAR, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = out;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_div_double: {
+            if (sp < 2) goto fail;
+            PSValue right = stack[--sp];
+            PSValue left = stack[--sp];
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                stack[sp++] = ps_value_number(left.as.number / right.as.number);
+            } else {
+                PSValue out = ps_stmt_bc_binary_slow(vm, TOK_SLASH, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = out;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_new_object: {
+            PSObject *obj = ps_object_new(vm ? vm->object_proto : NULL);
+            if (!obj) goto fail;
+            stack[sp++] = ps_value_object(obj);
+            ip++;
+            DISPATCH();
+        }
+        op_obj_put_const: {
+            if (sp < 2) goto fail;
+            if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+            PSValue key_val = bc->consts[ins->a];
+            if (key_val.type != PS_T_STRING) goto fail;
+            PSValue val = stack[--sp];
+            PSValue obj_val = stack[--sp];
+            if (obj_val.type != PS_T_OBJECT || !obj_val.as.object) goto fail;
+            ps_object_define(obj_val.as.object, key_val.as.string, val, PS_ATTR_NONE);
+            stack[sp++] = obj_val;
+            ip++;
+            DISPATCH();
+        }
+        op_get_member: {
+            if (sp < 2) goto fail;
+            PSValue key_val = stack[--sp];
+            PSValue obj_val = stack[--sp];
+            PSAstNode *member = (PSAstNode *)ins->ptr;
+            PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+            if (ctl->did_throw) goto handle_throw;
+            if (obj && obj->kind == PS_OBJ_KIND_BUFFER && ins->a) {
+                PSValue out = ps_value_undefined();
+                int handled = ps_buffer_read_index_value(vm, obj, key_val, &out, ctl);
+                if (handled < 0) goto handle_throw;
+                if (handled > 0) {
+                    stack[sp++] = out;
+                    ip++;
+                    DISPATCH();
+                }
+                PSString *prop = ps_to_string(vm, key_val);
+                if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                if (handled < 0) goto handle_throw;
+                if (handled > 0) {
+                    stack[sp++] = out;
+                    ip++;
+                    DISPATCH();
+                }
+                int found;
+                stack[sp++] = ps_object_get(obj, prop, &found);
+            } else if (obj && obj->kind == PS_OBJ_KIND_BUFFER32 && ins->a) {
+                PSValue out = ps_value_undefined();
+                int handled = ps_buffer32_read_index_value(vm, obj, key_val, &out, ctl);
+                if (handled < 0) goto handle_throw;
+                if (handled > 0) {
+                    stack[sp++] = out;
+                    ip++;
+                    DISPATCH();
+                }
+                PSString *prop = ps_to_string(vm, key_val);
+                if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                handled = ps_buffer32_read_index(vm, obj, prop, &out, ctl);
+                if (handled < 0) goto handle_throw;
+                if (handled > 0) {
+                    stack[sp++] = out;
+                    ip++;
+                    DISPATCH();
+                }
+                int found;
+                stack[sp++] = ps_object_get(obj, prop, &found);
+            } else if (obj && obj->kind == PS_OBJ_KIND_ARRAY && ins->a) {
+                PSValue out = ps_value_undefined();
+                size_t index = 0;
+                int handled = ps_array_read_index_fast_value(obj, key_val, &out, &index);
+                if (handled > 0) {
+                    stack[sp++] = out;
+                    ip++;
+                    DISPATCH();
+                }
+                if (handled < 0) {
+                    PSString *prop = ps_array_index_string(vm, index);
+                    int found;
+                    stack[sp++] = ps_object_get(obj, prop, &found);
+                    ip++;
+                    DISPATCH();
+                }
+                handled = ps_array_read_index_value(vm, obj, key_val, &out, ctl);
+                if (handled < 0) goto handle_throw;
+                if (handled > 0) {
+                    stack[sp++] = out;
+                    ip++;
+                    DISPATCH();
+                }
+                PSString *prop = ps_to_string(vm, key_val);
+                if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                int found;
+                stack[sp++] = ps_object_get(obj, prop, &found);
+            } else if (obj && obj->kind == PS_OBJ_KIND_PLAIN && ins->a) {
+                size_t index = 0;
+                int idx = ps_value_to_index(vm, key_val, &index, ctl);
+                if (idx < 0) goto handle_throw;
+                if (idx > 0 && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                    PSValue out = ps_value_undefined();
+                    if (ps_num_map_get(obj, index, &out)) {
+                        stack[sp++] = out;
+                    } else {
+                        stack[sp++] = ps_value_undefined();
+                    }
+                    ip++;
+                    DISPATCH();
+                }
+                if (key_val.type == PS_T_STRING && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                    uint32_t kindex = 0;
+                    if (ps_string_to_k_index(key_val.as.string, &kindex)) {
+                        PSValue out = ps_value_undefined();
+                        if (ps_num_map_k_get(obj, kindex, &out)) {
+                            stack[sp++] = out;
+                            ip++;
+                            DISPATCH();
+                        }
+                    }
+                }
+                PSString *prop = (key_val.type == PS_T_STRING) ? key_val.as.string
+                                                               : ps_to_string(vm, key_val);
+                if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                int found;
+                stack[sp++] = ps_object_get(obj, prop, &found);
+            } else {
+                PSString tmp_prop;
+                char tmp_buf[96];
+                PSString *prop = NULL;
+                if (ins->a) {
+                    prop = ps_member_key_read(vm, env, member, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
+                } else if (key_val.type == PS_T_STRING) {
+                    prop = key_val.as.string;
+                } else {
+                    prop = ps_to_string(vm, key_val);
+                }
+                if (ctl->did_throw || ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                PSValue out = ps_value_undefined();
+                int handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                if (handled < 0) goto handle_throw;
+                if (handled > 0) {
+                    stack[sp++] = out;
+                    ip++;
+                    DISPATCH();
+                }
+                if (ps_member_cached_get(obj, member, prop, &out)) {
+                    stack[sp++] = out;
+                    ip++;
+                    DISPATCH();
+                }
+                {
+                    int found;
+                    stack[sp++] = ps_object_get(obj, prop, &found);
+                }
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_call_ident: {
+            int argc = ins->a;
+            PSAstNode *id = (PSAstNode *)ins->ptr;
+            if (id && id->as.identifier.length == 4 &&
+                strncmp(id->as.identifier.name, "eval", 4) == 0) {
+#if !PS_ENABLE_EVAL
+                ctl->did_throw = 1;
+                ctl->throw_value = ps_vm_make_error(vm, "EvalError", "eval is disabled");
+                goto fail;
+#else
+                PSValue *args = NULL;
+                PSValue stack_args[8];
+                int args_heap = 0;
+                if (argc < 0 || (size_t)argc > sp) goto fail;
+                if (argc <= 8) {
+                    args = stack_args;
+                } else {
+                    args = (PSValue *)malloc(sizeof(PSValue) * (size_t)argc);
+                    args_heap = 1;
+                }
+                if (!args) goto fail;
+                for (int i = argc - 1; i >= 0; i--) {
+                    args[i] = stack[--sp];
+                }
+                PSValue result = ps_value_undefined();
+                if (argc > 0) {
+                    if (args[0].type == PS_T_STRING) {
+                        result = ps_eval_source(vm, env, args[0].as.string, ctl);
+                    } else {
+                        result = args[0];
+                    }
+                }
+                if (args_heap) free(args);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = result;
+                ip++;
+                DISPATCH();
+#endif
+            }
+            PSValue callee = ps_value_undefined();
+            int found = 0;
+            if (!ps_identifier_cached_get(env, id, &callee, &found)) {
+                PSString *name = ps_identifier_string(id);
+                callee = ps_env_get(env, name, &found);
+            }
+            if (!found) {
+                ctl->did_throw = 1;
+                ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", "Identifier not defined");
+                goto handle_throw;
+            }
+            if (callee.type != PS_T_OBJECT) {
+                ctl->did_throw = 1;
+                ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Call of non-object");
+                goto handle_throw;
+            }
+            PSValue *args = NULL;
+            PSValue stack_args[8];
+            int args_heap = 0;
+            if (argc < 0 || (size_t)argc > sp) goto fail;
+            if (argc <= 8) {
+                args = stack_args;
+            } else {
+                args = (PSValue *)malloc(sizeof(PSValue) * (size_t)argc);
+                args_heap = 1;
+            }
+            if (!args) goto fail;
+            for (int i = argc - 1; i >= 0; i--) {
+                args[i] = stack[--sp];
+            }
+            int did_throw = 0;
+            PSValue throw_value = ps_value_undefined();
+            PSValue result = ps_eval_call_function(vm, env, callee.as.object,
+                                                   ps_value_object(vm->global),
+                                                   argc, args, &did_throw, &throw_value);
+            if (args_heap) free(args);
+            if (did_throw) {
+                ctl->did_throw = 1;
+                ctl->throw_value = throw_value;
+                goto handle_throw;
+            }
+            stack[sp++] = result;
+            ip++;
+            DISPATCH();
+        }
+        op_call_member: {
+            int argc = ins->a;
+            PSAstNode *member = (PSAstNode *)ins->ptr;
+            if (!member || member->kind != AST_MEMBER) goto fail;
+            PSValue *args = NULL;
+            PSValue stack_args[8];
+            int args_heap = 0;
+            if (argc < 0 || (size_t)argc > sp) goto fail;
+            if (argc <= 8) {
+                args = stack_args;
+            } else {
+                args = (PSValue *)malloc(sizeof(PSValue) * (size_t)argc);
+                args_heap = 1;
+            }
+            if (!args) goto fail;
+            for (int i = argc - 1; i >= 0; i--) {
+                args[i] = stack[--sp];
+            }
+            if (sp < 2) {
+                if (args_heap) free(args);
+                goto fail;
+            }
+            PSValue key_val = stack[--sp];
+            PSValue obj_val = stack[--sp];
+            PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+            if (ctl->did_throw) {
+                if (args_heap) free(args);
+                goto handle_throw;
+            }
+            PSValue callee = ps_value_undefined();
+            int found = 0;
+            if (obj && obj->kind == PS_OBJ_KIND_BUFFER && ins->flags) {
+                PSValue out = ps_value_undefined();
+                int handled = ps_buffer_read_index_value(vm, obj, key_val, &out, ctl);
+                if (handled < 0) {
+                    if (args_heap) free(args);
+                    goto fail;
+                }
+                if (handled > 0) {
+                    callee = out;
+                } else {
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) {
+                        if (args_heap) free(args);
+                        goto fail;
+                    }
+                    handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                    if (handled < 0) {
+                        if (args_heap) free(args);
+                        goto fail;
+                    }
+                    if (handled > 0) {
+                        callee = out;
+                    } else {
+                        callee = ps_object_get(obj, prop, &found);
+                    }
+                }
+            } else {
+                PSString tmp_prop;
+                char tmp_buf[96];
+                PSString *prop = NULL;
+                if (ins->flags) {
+                    prop = ps_member_key_read(vm, env, member, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
+                } else if (key_val.type == PS_T_STRING) {
+                    prop = key_val.as.string;
+                } else {
+                    prop = ps_to_string(vm, key_val);
+                }
+                if (ctl->did_throw || ps_check_pending_throw(vm, ctl)) {
+                    if (args_heap) free(args);
+                    goto handle_throw;
+                }
+                PSValue out = ps_value_undefined();
+                int handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                if (handled < 0) {
+                    if (args_heap) free(args);
+                    goto fail;
+                }
+                if (handled > 0) {
+                    callee = out;
+                } else {
+                    callee = ps_object_get(obj, prop, &found);
+                }
+            }
+            if (callee.type != PS_T_OBJECT) {
+                if (args_heap) free(args);
+                ctl->did_throw = 1;
+                ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Call of non-object");
+                goto handle_throw;
+            }
+#if 0
+            if (!ps_gc_is_managed(callee.as.object)) {
+                fprintf(stderr, "bad callee in op_call_member ip=%zu sp=%zu op=%u\\n",
+                        ip, sp, (unsigned)ins->op);
+                abort();
+            }
+#endif
+            int did_throw = 0;
+            PSValue throw_value = ps_value_undefined();
+            PSValue result = ps_eval_call_function(vm, env, callee.as.object,
+                                                   obj_val, argc, args,
+                                                   &did_throw, &throw_value);
+            if (args_heap) free(args);
+                if (did_throw) {
+                    ctl->did_throw = 1;
+                    ctl->throw_value = throw_value;
+                    goto handle_throw;
+                }
+                stack[sp++] = result;
+                ip++;
+                DISPATCH();
+            }
+        op_new: {
+            PSAstNode *node = (PSAstNode *)ins->ptr;
+            int argc = ins->a;
+            if (argc < 0 || (size_t)argc + 1 > sp) goto fail;
+            sp -= (size_t)argc;
+            sp--;
+            PSValue v = eval_expression(vm, env, node, ctl);
+            if (ctl->did_throw) goto handle_throw;
+            stack[sp++] = v;
+            ip++;
+            DISPATCH();
+        }
+        op_store_ident: {
+            if (sp == 0) goto fail;
+            PSAstNode *id = (PSAstNode *)ins->ptr;
+            PSValue v = stack[sp - 1];
+            if (!ps_identifier_cached_set(env, id, v)) {
+                PSString *name = ps_identifier_string(id);
+                if (name) {
+                    ps_env_set(env, name, v);
+                }
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_store_member: {
+            if (sp < 3) goto fail;
+            PSValue key_val = stack[--sp];
+            PSValue obj_val = stack[--sp];
+            PSValue value = stack[--sp];
+            PSAstNode *member = (PSAstNode *)ins->ptr;
+            PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+            if (ctl->did_throw) goto handle_throw;
+            PSString *prop = NULL;
+            if (ins->a) {
+                if (obj && obj->kind == PS_OBJ_KIND_BUFFER) {
+                    int handled = ps_buffer_write_index_value(vm, obj, key_val, value, ctl);
+                    if (handled < 0) goto handle_throw;
+                    if (handled > 0) {
+                        stack[sp++] = value;
+                        ip++;
+                        DISPATCH();
+                    }
+                    prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                    handled = ps_buffer_write_index(vm, obj, prop, value, ctl);
+                    if (handled < 0) goto handle_throw;
+                    if (handled > 0) {
+                        stack[sp++] = value;
+                        ip++;
+                        DISPATCH();
+                    }
+                    ps_object_put(obj, prop, value);
+                    stack[sp++] = value;
+                    ip++;
+                    DISPATCH();
+                } else if (obj && obj->kind == PS_OBJ_KIND_BUFFER32) {
+                    int handled = ps_buffer32_write_index_value(vm, obj, key_val, value, ctl);
+                    if (handled < 0) goto handle_throw;
+                    if (handled > 0) {
+                        stack[sp++] = value;
+                        ip++;
+                        DISPATCH();
+                    }
+                    prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                    handled = ps_buffer32_write_index(vm, obj, prop, value, ctl);
+                    if (handled < 0) goto handle_throw;
+                    if (handled > 0) {
+                        stack[sp++] = value;
+                        ip++;
+                        DISPATCH();
+                    }
+                    ps_object_put(obj, prop, value);
+                    stack[sp++] = value;
+                    ip++;
+                    DISPATCH();
+                }
+                if (key_val.type == PS_T_STRING) {
+                    prop = key_val.as.string;
+                } else {
+                    prop = ps_to_string(vm, key_val);
+                }
+            } else {
+                PSString tmp_prop;
+                char tmp_buf[96];
+                prop = ps_member_key_read(vm, env, member, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
+            }
+            if (ctl->did_throw || ps_check_pending_throw(vm, ctl)) goto handle_throw;
+            if (obj->kind == PS_OBJ_KIND_ARRAY && ps_string_is_length(prop)) {
+                int ok = ps_array_set_length(vm, obj, value, ctl);
+                if (ok < 0) goto handle_throw;
+                stack[sp++] = value;
+                ip++;
+                DISPATCH();
+            }
+            ps_object_put(obj, prop, value);
+            ps_array_update_length(obj, prop);
+            (void)ps_env_update_arguments(env, obj, prop, value);
+            stack[sp++] = value;
+            ip++;
+            DISPATCH();
+        }
+        op_not:
+            if (sp == 0) goto fail;
+            stack[sp - 1] = ps_value_boolean(!ps_to_boolean(vm, stack[sp - 1]));
+            ip++;
+            DISPATCH();
+        op_bit_not: {
+            if (sp == 0) goto fail;
+            int32_t v = ps_to_int32_fast(vm, stack[sp - 1]);
+            if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+            stack[sp - 1] = ps_value_number((double)(~v));
+            ip++;
+            DISPATCH();
+        }
+        op_delete: {
+            PSAstNode *mem = (PSAstNode *)ins->ptr;
+            if (!mem || mem->kind != AST_MEMBER) goto fail;
+            PSValue obj_val = ps_stmt_bc_eval_expr(vm, env, mem->as.member.object, ctl);
+            if (ctl->did_throw) goto fail;
+            PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+            if (ctl->did_throw) goto fail;
+            if (obj && obj->kind == PS_OBJ_KIND_ARRAY && mem->as.member.computed) {
+                PSValue key_val = ps_stmt_bc_eval_expr(vm, env, mem->as.member.property, ctl);
+                if (ctl->did_throw) goto fail;
+                size_t index = 0;
+                int idx = ps_value_to_array_index(vm, key_val, &index, ctl);
+                if (idx < 0) goto fail;
+                if (idx > 0) {
+                    (void)ps_array_delete_index(obj, index);
+                    stack[sp++] = ps_value_boolean(1);
+                    ip++;
+                    DISPATCH();
+                }
+            }
+            PSString *prop = ps_member_key(vm, env, mem, ctl);
+            if (ctl->did_throw) goto fail;
+            int deleted = 0;
+            int ok = ps_object_delete(obj, prop, &deleted);
+            stack[sp++] = ps_value_boolean(ok ? 1 : 0);
+            ip++;
+            DISPATCH();
+        }
+        op_typeof: {
+            PSAstNode *node = (PSAstNode *)ins->ptr;
+            PSValue v = ps_value_undefined();
+            int found = 0;
+            if (node && node->kind == AST_IDENTIFIER) {
+                if (!ps_identifier_cached_get(env, node, &v, &found)) {
+                    PSString *name = ps_identifier_string(node);
+                    v = ps_env_get(env, name, &found);
+                }
+                if (!found) {
+                    stack[sp++] = ps_value_string(ps_string_from_cstr("undefined"));
+                    ip++;
+                    DISPATCH();
+                }
+            } else {
+                v = ps_stmt_bc_eval_expr(vm, env, node, ctl);
+                if (ctl->did_throw) goto fail;
+            }
+            const char *name = "undefined";
+            switch (v.type) {
+                case PS_T_UNDEFINED: name = "undefined"; break;
+                case PS_T_NULL: name = "object"; break;
+                case PS_T_BOOLEAN: name = "boolean"; break;
+                case PS_T_NUMBER: name = "number"; break;
+                case PS_T_STRING: name = "string"; break;
+                case PS_T_OBJECT:
+                    name = (v.as.object && v.as.object->kind == PS_OBJ_KIND_FUNCTION)
+                        ? "function"
+                        : "object";
+                    break;
+            }
+            stack[sp++] = ps_value_string(ps_string_from_cstr(name));
+            ip++;
+            DISPATCH();
+        }
+        op_eval_ast: {
+            PSAstNode *node = (PSAstNode *)ins->ptr;
+            PSValue v = eval_expression(vm, env, node, ctl);
+            if (ctl->did_throw) goto handle_throw;
+            stack[sp++] = v;
+            ip++;
+            DISPATCH();
+        }
+        op_dup:
+            if (sp == 0) goto fail;
+            stack[sp] = stack[sp - 1];
+            sp++;
+            ip++;
+            DISPATCH();
+        op_pop:
+            if (sp == 0) goto fail;
+            sp--;
+            ip++;
+            DISPATCH();
+        op_eval_stmt: {
+            PSAstNode *node = (PSAstNode *)ins->ptr;
+            PSValue v = eval_node(vm, env, node, ctl);
+            if (ctl->did_throw) goto handle_throw;
+            if (ctl->did_return) {
+                UNWIND_ENVS();
+                FREE_HANDLER_STACK();
+                if (stack != stack_buf) free(stack);
+                return v;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_for_in_init: {
+            if (sp == 0) goto fail;
+            PSValue obj_val = stack[--sp];
+            PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+            if (ctl->did_throw) goto fail;
+            PSObject *arr = ps_for_in_collect_array(vm, obj);
+            if (!arr) goto fail;
+            stack[sp++] = ps_value_object(arr);
+            stack[sp++] = ps_value_number(0);
+            ip++;
+            DISPATCH();
+        }
+        op_for_in_next: {
+            if (sp < 2) goto fail;
+            PSValue idx_val = stack[sp - 1];
+            PSValue arr_val = stack[sp - 2];
+            if (arr_val.type != PS_T_OBJECT || !arr_val.as.object ||
+                arr_val.as.object->kind != PS_OBJ_KIND_ARRAY) {
+                goto fail;
+            }
+            double idx_num = ps_to_number_fast(vm, idx_val);
+            if (ps_check_pending_throw(vm, ctl)) goto fail;
+            if (idx_num < 0) idx_num = 0;
+            size_t idx = (size_t)idx_num;
+            size_t len = ps_array_length(arr_val.as.object);
+            if (idx >= len) {
+                stack[sp++] = ps_value_boolean(0);
+                ip++;
+                DISPATCH();
+            }
+            PSValue key = ps_value_undefined();
+            (void)ps_array_get_index(arr_val.as.object, idx, &key);
+            stack[sp - 1] = ps_value_number((double)(idx + 1));
+            stack[sp++] = key;
+            stack[sp++] = ps_value_boolean(1);
+            ip++;
+            DISPATCH();
+        }
+        op_for_in_assign: {
+            if (sp == 0) goto fail;
+            PSValue key = stack[--sp];
+            PSAstNode *target = (PSAstNode *)ins->ptr;
+            int is_var = ins->a ? 1 : 0;
+            if (!target) goto fail;
+            if (target->kind == AST_IDENTIFIER) {
+                PSString *name = ps_identifier_string(target);
+                if (name) {
+                    if (is_var) {
+                        ps_env_define(env, name, key);
+                    } else {
+                        ps_env_set(env, name, key);
+                    }
+                }
+            } else if (target->kind == AST_MEMBER) {
+                PSValue obj_val = ps_stmt_bc_eval_expr(vm, env, target->as.member.object, ctl);
+                if (ctl->did_throw) goto fail;
+                PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                if (ctl->did_throw) goto fail;
+                PSString *prop = ps_member_key(vm, env, target, ctl);
+                if (ctl->did_throw) goto fail;
+                ps_object_put(obj, prop, key);
+                (void)ps_env_update_arguments(env, obj, prop, key);
+            } else {
+                goto fail;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_with_enter: {
+            if (sp == 0) goto fail;
+            PSValue obj_val = stack[--sp];
+            PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+            if (ctl->did_throw) goto fail;
+            PSEnv *with_env = ps_env_new(env, obj, 0);
+            if (!with_env) goto fail;
+            with_env->is_with = 1;
+            if (env_sp == env_cap) {
+                size_t new_cap = env_cap * 2;
+                PSEnv **next = (PSEnv **)malloc(sizeof(PSEnv *) * new_cap);
+                if (!next) {
+                    ps_env_free(with_env);
+                    goto fail;
+                }
+                memcpy(next, env_stack, sizeof(PSEnv *) * env_cap);
+                if (env_stack != env_stack_buf) free(env_stack);
+                env_stack = next;
+                env_cap = new_cap;
+            }
+            env_stack[env_sp++] = env;
+            env = with_env;
+            ip++;
+            DISPATCH();
+        }
+        op_with_exit: {
+            if (env_sp == 0) goto fail;
+            PSEnv *prev = env_stack[--env_sp];
+            if (env) ps_env_free(env);
+            env = prev;
+            ip++;
+            DISPATCH();
+        }
+        op_try_push: {
+            if (handler_sp == handler_cap) {
+                size_t new_cap = handler_cap * 2;
+                PSTryHandler *next = (PSTryHandler *)malloc(sizeof(PSTryHandler) * new_cap);
+                if (!next) goto fail;
+                memcpy(next, handler_stack, sizeof(PSTryHandler) * handler_cap);
+                if (handler_stack != handler_stack_buf) free(handler_stack);
+                handler_stack = next;
+                handler_cap = new_cap;
+            }
+            PSTryHandler h;
+            h.catch_ip = (size_t)ins->a;
+            h.finally_ip = (size_t)(intptr_t)ins->ptr;
+            h.catch_param = (PSAstNode *)ins->ptr2;
+            handler_stack[handler_sp++] = h;
+            ip++;
+            DISPATCH();
+        }
+        op_try_pop:
+            if (handler_sp == 0) goto fail;
+            handler_sp--;
+            ip++;
+            DISPATCH();
+        op_catch_enter: {
+            if (handler_sp == 0) goto fail;
+            PSTryHandler *h = &handler_stack[handler_sp - 1];
+            PSEnv *catch_env = ps_env_new_object(env);
+            if (!catch_env) goto fail;
+            if (h->catch_param) {
+                PSString *name = ps_identifier_string(h->catch_param);
+                if (name) {
+                    ps_env_define(catch_env, name, ctl->throw_value);
+                }
+            }
+            ctl->did_throw = 0;
+            h->catch_ip = (size_t)-1;
+            if (env_sp == env_cap) {
+                size_t new_cap = env_cap * 2;
+                PSEnv **next = (PSEnv **)malloc(sizeof(PSEnv *) * new_cap);
+                if (!next) {
+                    ps_env_free(catch_env);
+                    goto fail;
+                }
+                memcpy(next, env_stack, sizeof(PSEnv *) * env_cap);
+                if (env_stack != env_stack_buf) free(env_stack);
+                env_stack = next;
+                env_cap = new_cap;
+            }
+            env_stack[env_sp++] = env;
+            env = catch_env;
+            ip++;
+            DISPATCH();
+        }
+        op_catch_exit: {
+            if (env_sp == 0) goto fail;
+            PSEnv *prev = env_stack[--env_sp];
+            if (env) ps_env_free(env);
+            env = prev;
+            ip++;
+            DISPATCH();
+        }
+        op_throw: {
+            if (sp == 0) goto fail;
+            PSValue v = stack[--sp];
+            ctl->did_throw = 1;
+            ctl->throw_value = v;
+            goto handle_throw;
+        }
+        op_finally_exit: {
+            if (handler_sp == 0) goto fail;
+            handler_sp--;
+            if (pending_throw) {
+                ctl->did_throw = 1;
+                ctl->throw_value = pending_throw_value;
+                pending_throw = 0;
+                goto handle_throw;
+            }
+            ip++;
+            DISPATCH();
+        }
+        op_jump:
+            ip = (size_t)ins->a;
+            DISPATCH();
+        op_jump_if_false: {
+            if (sp == 0) goto fail;
+            PSValue v = stack[--sp];
+            if (!ps_to_boolean(vm, v)) {
+                ip = (size_t)ins->a;
+            } else {
+                ip++;
+            }
+            DISPATCH();
+        }
+        op_jump_if_true: {
+            if (sp == 0) goto fail;
+            PSValue v = stack[--sp];
+            if (ps_to_boolean(vm, v)) {
+                ip = (size_t)ins->a;
+            } else {
+                ip++;
+            }
+            DISPATCH();
+        }
+#if !PS_DISABLE_CF_FUSIONS
+        op_jlt_ident_const: {
+            PSAstNode *id = (PSAstNode *)ins->ptr;
+            if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+            PSValue left = ps_value_undefined();
+            if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+            PSValue right = bc->consts[ins->a];
+            int take = 0;
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                take = !(left.as.number < right.as.number);
+            } else {
+                PSValue out = ps_eval_binary_values(vm, TOK_LT, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                take = !ps_to_boolean(vm, out);
+            }
+            if (take) {
+                ip = (size_t)(intptr_t)ins->ptr2;
+            } else {
+                ip++;
+            }
+            DISPATCH();
+        }
+        op_jbitand_eqz_ident_const: {
+            PSAstNode *id = (PSAstNode *)ins->ptr;
+            if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+            PSValue left = ps_value_undefined();
+            if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+            PSValue right = bc->consts[ins->a];
+            int32_t ln = ps_to_int32_fast(vm, left);
+            if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+            int32_t rn = ps_to_int32_fast(vm, right);
+            if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+            int take = ((ln & rn) != 0);
+            if (take) {
+                ip = (size_t)(intptr_t)ins->ptr2;
+            } else {
+                ip++;
+            }
+            DISPATCH();
+        }
+        op_jump_add_ident_const: {
+            PSAstNode *id = (PSAstNode *)ins->ptr;
+            if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+            PSValue left = ps_value_undefined();
+            if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+            PSValue right = bc->consts[ins->a];
+            PSValue out = ps_value_undefined();
+            if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                out = ps_value_number(left.as.number + right.as.number);
+            } else {
+                out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+            }
+            if (!ps_identifier_cached_set(env, id, out)) {
+                PSString *name = ps_identifier_string(id);
+                if (name) ps_env_set(env, name, out);
+            }
+            ip = (size_t)(intptr_t)ins->ptr2;
+            DISPATCH();
+        }
+#endif
+        op_return_value: {
+            if (sp == 0) goto fail;
+            PSValue v = stack[--sp];
+            ctl->did_return = 1;
+            UNWIND_ENVS();
+            FREE_HANDLER_STACK();
+            if (stack != stack_buf) free(stack);
+            return v;
+        }
+        op_return_void:
+            ctl->did_return = 1;
+            UNWIND_ENVS();
+            FREE_HANDLER_STACK();
+            if (stack != stack_buf) free(stack);
+            return ps_value_undefined();
+    }
+handle_throw:
+    if (handler_sp == 0) goto fail;
+    {
+        PSTryHandler *h = &handler_stack[handler_sp - 1];
+        if (h->catch_ip != (size_t)-1) {
+            pending_throw = 0;
+            ip = h->catch_ip;
+            DISPATCH();
+        }
+        if (h->finally_ip != (size_t)-1) {
+            pending_throw = 1;
+            pending_throw_value = ctl->throw_value;
+            ctl->did_throw = 0;
+            ip = h->finally_ip;
+            DISPATCH();
+        }
+        handler_sp--;
+    }
+    goto fail;
+fail:
+    UNWIND_ENVS();
+    FREE_HANDLER_STACK();
+    if (stack != stack_buf) free(stack);
+    return ctl->did_throw ? ctl->throw_value : ps_value_undefined();
+#undef DISPATCH
+#else
+loop_top:
     while (ip < bc->count) {
         PSStmtBCInstr *ins = &bc->code[ip];
         switch (ins->op) {
-            case STMT_BC_EVAL_EXPR: {
-                if (ins->ptr) {
-                    (void)eval_expression(vm, env, (PSAstNode *)ins->ptr, ctl);
-                    if (ctl->did_throw) return ctl->throw_value;
+            case STMT_BC_EXPR_PUSH_CONST:
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                stack[sp++] = bc->consts[ins->a];
+                ip++;
+                break;
+            case STMT_BC_EXPR_LOAD_IDENT: {
+                PSAstNode *id = (PSAstNode *)ins->ptr;
+                int found = 0;
+                PSValue v = ps_value_undefined();
+                if (!ps_identifier_cached_get(env, id, &v, &found)) {
+                    PSString *name = ps_identifier_string(id);
+                    v = ps_env_get(env, name, &found);
+                }
+                if (!found) {
+                    ctl->did_throw = 1;
+                    const char *prefix = "Identifier not defined: ";
+                    PSString *name = ps_identifier_string(id);
+                    size_t prefix_len = strlen(prefix);
+                    size_t name_len = name ? name->byte_len : 0;
+                    char *msg = NULL;
+                    if (name && name->utf8 && name_len > 0) {
+                        msg = (char *)malloc(prefix_len + name_len + 1);
+                    }
+                    if (msg) {
+                        memcpy(msg, prefix, prefix_len);
+                        memcpy(msg + prefix_len, name->utf8, name_len);
+                        msg[prefix_len + name_len] = '\0';
+                        ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", msg);
+                        free(msg);
+                    } else {
+                        ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", "Identifier not defined");
+                    }
+                    goto fail;
+                }
+                stack[sp++] = v;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_LOAD_THIS: {
+                PSString *name = ps_string_from_cstr("this");
+                int found = 0;
+                PSValue v = ps_env_get(env, name, &found);
+                if (found) {
+                    stack[sp++] = v;
+                } else if (vm && vm->global) {
+                    stack[sp++] = ps_value_object(vm->global);
+                } else {
+                    stack[sp++] = ps_value_undefined();
                 }
                 ip++;
                 break;
             }
-            case STMT_BC_VAR_INIT: {
+            case STMT_BC_EXPR_UNARY_NUM: {
+                if (sp == 0) goto fail;
+                PSValue v = stack[sp - 1];
+                if (v.type != PS_T_NUMBER) goto fail;
+                if (ins->a == TOK_MINUS) {
+                    v.as.number = -v.as.number;
+                }
+                stack[sp - 1] = v;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_BINARY_NUM: {
+                if (sp < 2) goto fail;
+                PSValue right = stack[--sp];
+                PSValue left = stack[--sp];
+                PSValue out = ps_eval_binary_values(vm, ins->a, left, right, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = out;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_ADD_INT: {
+                if (sp < 2) goto fail;
+                PSValue right = stack[--sp];
+                PSValue left = stack[--sp];
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    int32_t li = 0;
+                    int32_t ri = 0;
+                    if (ps_number_to_int32_strict(left.as.number, &li) &&
+                        ps_number_to_int32_strict(right.as.number, &ri)) {
+                        int64_t sum = (int64_t)li + (int64_t)ri;
+                        if (sum >= INT32_MIN && sum <= INT32_MAX) {
+                            stack[sp++] = ps_value_number((double)sum);
+                        } else {
+                            stack[sp++] = ps_value_number(left.as.number + right.as.number);
+                        }
+                    } else {
+                        stack[sp++] = ps_value_number(left.as.number + right.as.number);
+                    }
+                } else {
+                    PSValue out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                    stack[sp++] = out;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_ADD_DOUBLE: {
+                if (sp < 2) goto fail;
+                PSValue right = stack[--sp];
+                PSValue left = stack[--sp];
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    stack[sp++] = ps_value_number(left.as.number + right.as.number);
+                } else {
+                    PSValue out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                    stack[sp++] = out;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_ADD_IDENT_CONST: {
                 PSAstNode *id = (PSAstNode *)ins->ptr;
-                PSAstNode *expr = (PSAstNode *)ins->ptr2;
-                if (id && expr) {
-                    PSValue v = eval_expression(vm, env, expr, ctl);
-                    if (ctl->did_throw) return ctl->throw_value;
-                    if (!ps_identifier_cached_set(env, id, v)) {
-                        PSString *name = ps_identifier_string(id);
-                        if (name) {
-                            ps_env_set(env, name, v);
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue left = ps_value_undefined();
+                if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+                PSValue right = bc->consts[ins->a];
+                PSValue out = ps_value_undefined();
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    out = ps_value_number(left.as.number + right.as.number);
+                } else {
+                    out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                }
+                if (!ps_identifier_cached_set(env, id, out)) {
+                    PSString *name = ps_identifier_string(id);
+                    if (name) ps_env_set(env, name, out);
+                }
+                stack[sp++] = out;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_ADD_IDENT_IDENT: {
+                PSAstNode *id = (PSAstNode *)ins->ptr;
+                PSAstNode *rhs_id = (PSAstNode *)ins->ptr2;
+                PSValue left = ps_value_undefined();
+                PSValue right = ps_value_undefined();
+                if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+                if (!ps_stmt_bc_get_ident_value(vm, env, rhs_id, &right, ctl)) goto fail;
+                PSValue out = ps_value_undefined();
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    out = ps_value_number(left.as.number + right.as.number);
+                } else {
+                    out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                }
+                if (!ps_identifier_cached_set(env, id, out)) {
+                    PSString *name = ps_identifier_string(id);
+                    if (name) ps_env_set(env, name, out);
+                }
+                stack[sp++] = out;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_SUB_INT: {
+                if (sp < 2) goto fail;
+                PSValue right = stack[--sp];
+                PSValue left = stack[--sp];
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    int32_t li = 0;
+                    int32_t ri = 0;
+                    if (ps_number_to_int32_strict(left.as.number, &li) &&
+                        ps_number_to_int32_strict(right.as.number, &ri)) {
+                        int64_t diff = (int64_t)li - (int64_t)ri;
+                        if (diff >= INT32_MIN && diff <= INT32_MAX) {
+                            stack[sp++] = ps_value_number((double)diff);
+                        } else {
+                            stack[sp++] = ps_value_number(left.as.number - right.as.number);
+                        }
+                    } else {
+                        stack[sp++] = ps_value_number(left.as.number - right.as.number);
+                    }
+                } else {
+                    PSValue out = ps_stmt_bc_binary_slow(vm, TOK_MINUS, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                    stack[sp++] = out;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_SUB_DOUBLE: {
+                if (sp < 2) goto fail;
+                PSValue right = stack[--sp];
+                PSValue left = stack[--sp];
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    stack[sp++] = ps_value_number(left.as.number - right.as.number);
+                } else {
+                    PSValue out = ps_stmt_bc_binary_slow(vm, TOK_MINUS, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                    stack[sp++] = out;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_MUL_INT: {
+                if (sp < 2) goto fail;
+                PSValue right = stack[--sp];
+                PSValue left = stack[--sp];
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    int32_t li = 0;
+                    int32_t ri = 0;
+                    if (ps_number_to_int32_strict(left.as.number, &li) &&
+                        ps_number_to_int32_strict(right.as.number, &ri)) {
+                        int64_t prod = (int64_t)li * (int64_t)ri;
+                        if (prod >= INT32_MIN && prod <= INT32_MAX) {
+                            stack[sp++] = ps_value_number((double)prod);
+                        } else {
+                            stack[sp++] = ps_value_number(left.as.number * right.as.number);
+                        }
+                    } else {
+                        stack[sp++] = ps_value_number(left.as.number * right.as.number);
+                    }
+                } else {
+                    PSValue out = ps_stmt_bc_binary_slow(vm, TOK_STAR, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                    stack[sp++] = out;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_MUL_DOUBLE: {
+                if (sp < 2) goto fail;
+                PSValue right = stack[--sp];
+                PSValue left = stack[--sp];
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    stack[sp++] = ps_value_number(left.as.number * right.as.number);
+                } else {
+                    PSValue out = ps_stmt_bc_binary_slow(vm, TOK_STAR, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                    stack[sp++] = out;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_DIV_DOUBLE: {
+                if (sp < 2) goto fail;
+                PSValue right = stack[--sp];
+                PSValue left = stack[--sp];
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    stack[sp++] = ps_value_number(left.as.number / right.as.number);
+                } else {
+                    PSValue out = ps_stmt_bc_binary_slow(vm, TOK_SLASH, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                    stack[sp++] = out;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_NEW_OBJECT: {
+                PSObject *obj = ps_object_new(vm ? vm->object_proto : NULL);
+                if (!obj) goto fail;
+                stack[sp++] = ps_value_object(obj);
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_OBJ_PUT_CONST: {
+                if (sp < 2) goto fail;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue key_val = bc->consts[ins->a];
+                if (key_val.type != PS_T_STRING) goto fail;
+                PSValue val = stack[--sp];
+                PSValue obj_val = stack[--sp];
+                if (obj_val.type != PS_T_OBJECT || !obj_val.as.object) goto fail;
+                ps_object_define(obj_val.as.object, key_val.as.string, val, PS_ATTR_NONE);
+                stack[sp++] = obj_val;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_GET_MEMBER: {
+                if (sp < 2) goto fail;
+                PSValue key_val = stack[--sp];
+                PSValue obj_val = stack[--sp];
+                PSAstNode *member = (PSAstNode *)ins->ptr;
+                PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                if (ctl->did_throw) goto fail;
+                if (obj && obj->kind == PS_OBJ_KIND_BUFFER && ins->a) {
+                    PSValue out = ps_value_undefined();
+                    int handled = ps_buffer_read_index_value(vm, obj, key_val, &out, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        ip++;
+                        break;
+                    }
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto fail;
+                    handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        ip++;
+                        break;
+                    }
+                    int found;
+                    stack[sp++] = ps_object_get(obj, prop, &found);
+                } else if (obj && obj->kind == PS_OBJ_KIND_BUFFER32 && ins->a) {
+                    PSValue out = ps_value_undefined();
+                    int handled = ps_buffer32_read_index_value(vm, obj, key_val, &out, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        ip++;
+                        break;
+                    }
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto fail;
+                    handled = ps_buffer32_read_index(vm, obj, prop, &out, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        ip++;
+                        break;
+                    }
+                    int found;
+                    stack[sp++] = ps_object_get(obj, prop, &found);
+                } else if (obj && obj->kind == PS_OBJ_KIND_ARRAY && ins->a) {
+                    PSValue out = ps_value_undefined();
+                    size_t index = 0;
+                    int handled = ps_array_read_index_fast_value(obj, key_val, &out, &index);
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        ip++;
+                        break;
+                    }
+                    if (handled < 0) {
+                        PSString *prop = ps_array_index_string(vm, index);
+                        int found;
+                        stack[sp++] = ps_object_get(obj, prop, &found);
+                        ip++;
+                        break;
+                    }
+                    handled = ps_array_read_index_value(vm, obj, key_val, &out, ctl);
+                    if (handled < 0) goto fail;
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        ip++;
+                        break;
+                    }
+                    PSString *prop = ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto fail;
+                    int found;
+                    stack[sp++] = ps_object_get(obj, prop, &found);
+                } else if (obj && obj->kind == PS_OBJ_KIND_PLAIN && ins->a) {
+                    size_t index = 0;
+                    int idx = ps_value_to_index(vm, key_val, &index, ctl);
+                    if (idx < 0) goto fail;
+                    if (idx > 0 && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                        PSValue out = ps_value_undefined();
+                        if (ps_num_map_get(obj, index, &out)) {
+                            stack[sp++] = out;
+                        } else {
+                            stack[sp++] = ps_value_undefined();
+                        }
+                        ip++;
+                        break;
+                    }
+                    if (key_val.type == PS_T_STRING && obj->internal_kind == PS_INTERNAL_NUMMAP) {
+                        uint32_t kindex = 0;
+                        if (ps_string_to_k_index(key_val.as.string, &kindex)) {
+                            PSValue out = ps_value_undefined();
+                            if (ps_num_map_k_get(obj, kindex, &out)) {
+                                stack[sp++] = out;
+                                ip++;
+                                break;
+                            }
                         }
                     }
+                    PSString *prop = (key_val.type == PS_T_STRING) ? key_val.as.string
+                                                                   : ps_to_string(vm, key_val);
+                    if (ps_check_pending_throw(vm, ctl)) goto fail;
+                    int found;
+                    stack[sp++] = ps_object_get(obj, prop, &found);
+                } else {
+                    PSString tmp_prop;
+                    char tmp_buf[96];
+                    PSString *prop = NULL;
+                    if (ins->a) {
+                        prop = ps_member_key_read(vm, env, member, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
+                    } else if (key_val.type == PS_T_STRING) {
+                        prop = key_val.as.string;
+                    } else {
+                        prop = ps_to_string(vm, key_val);
+                    }
+                    if (ctl->did_throw || ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                    PSValue out = ps_value_undefined();
+                    int handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                    if (handled < 0) goto handle_throw;
+                    if (handled > 0) {
+                        stack[sp++] = out;
+                        ip++;
+                        break;
+                    }
+                    if (ps_member_cached_get(obj, member, prop, &out)) {
+                        stack[sp++] = out;
+                        ip++;
+                        break;
+                    }
+                    {
+                        int found;
+                        stack[sp++] = ps_object_get(obj, prop, &found);
+                    }
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_CALL_IDENT: {
+                int argc = ins->a;
+                PSAstNode *id = (PSAstNode *)ins->ptr;
+                if (id && id->as.identifier.length == 4 &&
+                    strncmp(id->as.identifier.name, "eval", 4) == 0) {
+#if !PS_ENABLE_EVAL
+                    ctl->did_throw = 1;
+                    ctl->throw_value = ps_vm_make_error(vm, "EvalError", "eval is disabled");
+                    goto fail;
+#else
+                    PSValue *args = NULL;
+                    PSValue stack_args[8];
+                    int args_heap = 0;
+                    if (argc < 0 || (size_t)argc > sp) goto fail;
+                    if (argc <= 8) {
+                        args = stack_args;
+                    } else {
+                        args = (PSValue *)malloc(sizeof(PSValue) * (size_t)argc);
+                        args_heap = 1;
+                    }
+                    if (!args) goto fail;
+                    for (int i = argc - 1; i >= 0; i--) {
+                        args[i] = stack[--sp];
+                    }
+                    PSValue result = ps_value_undefined();
+                    if (argc > 0) {
+                        if (args[0].type == PS_T_STRING) {
+                            result = ps_eval_source(vm, env, args[0].as.string, ctl);
+                        } else {
+                            result = args[0];
+                        }
+                    }
+                    if (args_heap) free(args);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = result;
+                ip++;
+                break;
+#endif
+                }
+                PSValue callee = ps_value_undefined();
+                int found = 0;
+                if (!ps_identifier_cached_get(env, id, &callee, &found)) {
+                    PSString *name = ps_identifier_string(id);
+                    callee = ps_env_get(env, name, &found);
+                }
+                if (!found) {
+                    ctl->did_throw = 1;
+                    ctl->throw_value = ps_vm_make_error(vm, "ReferenceError", "Identifier not defined");
+                    goto fail;
+                }
+                if (callee.type != PS_T_OBJECT) {
+                    ctl->did_throw = 1;
+                    ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Call of non-object");
+                    goto fail;
+                }
+                PSValue *args = NULL;
+                PSValue stack_args[8];
+                int args_heap = 0;
+                if (argc < 0 || (size_t)argc > sp) goto fail;
+                if (argc <= 8) {
+                    args = stack_args;
+                } else {
+                    args = (PSValue *)malloc(sizeof(PSValue) * (size_t)argc);
+                    args_heap = 1;
+                }
+                if (!args) goto fail;
+                for (int i = argc - 1; i >= 0; i--) {
+                    args[i] = stack[--sp];
+                }
+                int did_throw = 0;
+                PSValue throw_value = ps_value_undefined();
+                PSValue result = ps_eval_call_function(vm, env, callee.as.object,
+                                                       ps_value_object(vm->global),
+                                                       argc, args, &did_throw, &throw_value);
+                if (args_heap) free(args);
+                if (did_throw) {
+                    ctl->did_throw = 1;
+                    ctl->throw_value = throw_value;
+                    goto handle_throw;
+                }
+                stack[sp++] = result;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_CALL_MEMBER: {
+                int argc = ins->a;
+                PSAstNode *member = (PSAstNode *)ins->ptr;
+                if (!member || member->kind != AST_MEMBER) goto fail;
+                PSValue *args = NULL;
+                PSValue stack_args[8];
+                int args_heap = 0;
+                if (argc < 0 || (size_t)argc > sp) goto fail;
+                if (argc <= 8) {
+                    args = stack_args;
+                } else {
+                    args = (PSValue *)malloc(sizeof(PSValue) * (size_t)argc);
+                    args_heap = 1;
+                }
+                if (!args) goto fail;
+                for (int i = argc - 1; i >= 0; i--) {
+                    args[i] = stack[--sp];
+                }
+                if (sp < 2) {
+                    if (args_heap) free(args);
+                    goto fail;
+                }
+                PSValue key_val = stack[--sp];
+                PSValue obj_val = stack[--sp];
+                PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                if (ctl->did_throw) {
+                    if (args_heap) free(args);
+                    goto handle_throw;
+                }
+                PSValue callee = ps_value_undefined();
+                int found = 0;
+                if (obj && obj->kind == PS_OBJ_KIND_BUFFER && ins->flags) {
+                    PSValue out = ps_value_undefined();
+                    int handled = ps_buffer_read_index_value(vm, obj, key_val, &out, ctl);
+                    if (handled < 0) {
+                        if (args_heap) free(args);
+                        goto fail;
+                    }
+                    if (handled > 0) {
+                        callee = out;
+                    } else {
+                        PSString *prop = ps_to_string(vm, key_val);
+                        if (ps_check_pending_throw(vm, ctl)) {
+                            if (args_heap) free(args);
+                            goto fail;
+                        }
+                        handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                        if (handled < 0) {
+                            if (args_heap) free(args);
+                            goto fail;
+                        }
+                        if (handled > 0) {
+                            callee = out;
+                        } else {
+                            callee = ps_object_get(obj, prop, &found);
+                        }
+                    }
+                } else {
+                    PSString tmp_prop;
+                    char tmp_buf[96];
+                    PSString *prop = NULL;
+                    if (ins->flags) {
+                        prop = ps_member_key_read(vm, env, member, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
+                    } else if (key_val.type == PS_T_STRING) {
+                        prop = key_val.as.string;
+                    } else {
+                        prop = ps_to_string(vm, key_val);
+                    }
+                    if (ctl->did_throw || ps_check_pending_throw(vm, ctl)) {
+                        if (args_heap) free(args);
+                        goto fail;
+                    }
+                    PSValue out = ps_value_undefined();
+                    int handled = ps_buffer_read_index(vm, obj, prop, &out, ctl);
+                    if (handled < 0) {
+                        if (args_heap) free(args);
+                        goto fail;
+                    }
+                    if (handled > 0) {
+                        callee = out;
+                    } else {
+                        callee = ps_object_get(obj, prop, &found);
+                    }
+                }
+                if (callee.type != PS_T_OBJECT) {
+                    if (args_heap) free(args);
+                    ctl->did_throw = 1;
+                    ctl->throw_value = ps_vm_make_error(vm, "TypeError", "Call of non-object");
+                    goto handle_throw;
+                }
+                int did_throw = 0;
+                PSValue throw_value = ps_value_undefined();
+                PSValue result = ps_eval_call_function(vm, env, callee.as.object,
+                                                       obj_val, argc, args,
+                                                       &did_throw, &throw_value);
+                if (args_heap) free(args);
+                if (did_throw) {
+                    ctl->did_throw = 1;
+                    ctl->throw_value = throw_value;
+                    goto handle_throw;
+                }
+                stack[sp++] = result;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_NEW: {
+                PSAstNode *node = (PSAstNode *)ins->ptr;
+                int argc = ins->a;
+                if (argc < 0 || (size_t)argc + 1 > sp) goto fail;
+                sp -= (size_t)argc;
+                sp--;
+                PSValue v = eval_expression(vm, env, node, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = v;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_STORE_IDENT: {
+                if (sp == 0) goto fail;
+                PSAstNode *id = (PSAstNode *)ins->ptr;
+                PSValue v = stack[sp - 1];
+                if (!ps_identifier_cached_set(env, id, v)) {
+                    PSString *name = ps_identifier_string(id);
+                    if (name) {
+                        ps_env_set(env, name, v);
+                    }
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_STORE_MEMBER: {
+                if (sp < 3) goto fail;
+                PSValue key_val = stack[--sp];
+                PSValue obj_val = stack[--sp];
+                PSValue value = stack[--sp];
+                PSAstNode *member = (PSAstNode *)ins->ptr;
+                PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                PSString *prop = NULL;
+                if (ins->a) {
+                    if (obj && obj->kind == PS_OBJ_KIND_BUFFER) {
+                        int handled = ps_buffer_write_index_value(vm, obj, key_val, value, ctl);
+                        if (handled < 0) goto handle_throw;
+                        if (handled > 0) {
+                            stack[sp++] = value;
+                            ip++;
+                            break;
+                        }
+                        prop = ps_to_string(vm, key_val);
+                        if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                        handled = ps_buffer_write_index(vm, obj, prop, value, ctl);
+                        if (handled < 0) goto handle_throw;
+                        if (handled > 0) {
+                            stack[sp++] = value;
+                            ip++;
+                            break;
+                        }
+                        ps_object_put(obj, prop, value);
+                        stack[sp++] = value;
+                        ip++;
+                        break;
+                    } else if (obj && obj->kind == PS_OBJ_KIND_BUFFER32) {
+                        int handled = ps_buffer32_write_index_value(vm, obj, key_val, value, ctl);
+                        if (handled < 0) goto handle_throw;
+                        if (handled > 0) {
+                            stack[sp++] = value;
+                            ip++;
+                            break;
+                        }
+                        prop = ps_to_string(vm, key_val);
+                        if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                        handled = ps_buffer32_write_index(vm, obj, prop, value, ctl);
+                        if (handled < 0) goto handle_throw;
+                        if (handled > 0) {
+                            stack[sp++] = value;
+                            ip++;
+                            break;
+                        }
+                        ps_object_put(obj, prop, value);
+                        stack[sp++] = value;
+                        ip++;
+                        break;
+                    }
+                    if (key_val.type == PS_T_STRING) {
+                        prop = key_val.as.string;
+                    } else {
+                        prop = ps_to_string(vm, key_val);
+                    }
+                } else {
+                    PSString tmp_prop;
+                    char tmp_buf[96];
+                    prop = ps_member_key_read(vm, env, member, ctl, &tmp_prop, tmp_buf, sizeof(tmp_buf));
+                }
+                if (ctl->did_throw || ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                if (obj->kind == PS_OBJ_KIND_ARRAY && ps_string_is_length(prop)) {
+                    int ok = ps_array_set_length(vm, obj, value, ctl);
+                    if (ok < 0) goto handle_throw;
+                    stack[sp++] = value;
+                    ip++;
+                    break;
+                }
+                ps_object_put(obj, prop, value);
+                ps_array_update_length(obj, prop);
+                (void)ps_env_update_arguments(env, obj, prop, value);
+                stack[sp++] = value;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_NOT:
+                if (sp == 0) goto fail;
+                stack[sp - 1] = ps_value_boolean(!ps_to_boolean(vm, stack[sp - 1]));
+                ip++;
+                break;
+            case STMT_BC_EXPR_BIT_NOT: {
+                if (sp == 0) goto fail;
+                int32_t v = ps_to_int32_fast(vm, stack[sp - 1]);
+                if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                stack[sp - 1] = ps_value_number((double)(~v));
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_DELETE: {
+                PSAstNode *mem = (PSAstNode *)ins->ptr;
+                if (!mem || mem->kind != AST_MEMBER) goto fail;
+                PSValue obj_val = ps_stmt_bc_eval_expr(vm, env, mem->as.member.object, ctl);
+                if (ctl->did_throw) goto fail;
+                PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                if (ctl->did_throw) goto fail;
+                if (obj && obj->kind == PS_OBJ_KIND_ARRAY && mem->as.member.computed) {
+                    PSValue key_val = ps_stmt_bc_eval_expr(vm, env, mem->as.member.property, ctl);
+                    if (ctl->did_throw) goto fail;
+                    size_t index = 0;
+                    int idx = ps_value_to_array_index(vm, key_val, &index, ctl);
+                    if (idx < 0) goto fail;
+                    if (idx > 0) {
+                        (void)ps_array_delete_index(obj, index);
+                        stack[sp++] = ps_value_boolean(1);
+                        ip++;
+                        break;
+                    }
+                }
+                PSString *prop = ps_member_key(vm, env, mem, ctl);
+                if (ctl->did_throw) goto fail;
+                int deleted = 0;
+                int ok = ps_object_delete(obj, prop, &deleted);
+                stack[sp++] = ps_value_boolean(ok ? 1 : 0);
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_TYPEOF: {
+                PSAstNode *node = (PSAstNode *)ins->ptr;
+                PSValue v = ps_value_undefined();
+                int found = 0;
+                if (node && node->kind == AST_IDENTIFIER) {
+                    if (!ps_identifier_cached_get(env, node, &v, &found)) {
+                        PSString *name = ps_identifier_string(node);
+                        v = ps_env_get(env, name, &found);
+                    }
+                    if (!found) {
+                        stack[sp++] = ps_value_string(ps_string_from_cstr("undefined"));
+                        ip++;
+                        break;
+                    }
+                } else {
+                    v = ps_stmt_bc_eval_expr(vm, env, node, ctl);
+                    if (ctl->did_throw) goto fail;
+                }
+                const char *name = "undefined";
+                switch (v.type) {
+                    case PS_T_UNDEFINED: name = "undefined"; break;
+                    case PS_T_NULL: name = "object"; break;
+                    case PS_T_BOOLEAN: name = "boolean"; break;
+                    case PS_T_NUMBER: name = "number"; break;
+                    case PS_T_STRING: name = "string"; break;
+                    case PS_T_OBJECT:
+                        name = (v.as.object && v.as.object->kind == PS_OBJ_KIND_FUNCTION)
+                            ? "function"
+                            : "object";
+                        break;
+                }
+                stack[sp++] = ps_value_string(ps_string_from_cstr(name));
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_EVAL_AST: {
+                PSAstNode *node = (PSAstNode *)ins->ptr;
+                PSValue v = eval_expression(vm, env, node, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                stack[sp++] = v;
+                ip++;
+                break;
+            }
+            case STMT_BC_EXPR_DUP:
+                if (sp == 0) goto fail;
+                stack[sp] = stack[sp - 1];
+                sp++;
+                ip++;
+                break;
+            case STMT_BC_EXPR_POP:
+                if (sp == 0) goto fail;
+                sp--;
+                ip++;
+                break;
+            case STMT_BC_STMT_EVAL_AST: {
+                PSAstNode *node = (PSAstNode *)ins->ptr;
+                PSValue v = eval_node(vm, env, node, ctl);
+                if (ctl->did_throw) goto handle_throw;
+                if (ctl->did_return) {
+                    UNWIND_ENVS();
+                    FREE_HANDLER_STACK();
+                    if (stack != stack_buf) free(stack);
+                    return v;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_FOR_IN_INIT: {
+                if (sp == 0) goto fail;
+                PSValue obj_val = stack[--sp];
+                PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                if (ctl->did_throw) goto fail;
+                PSObject *arr = ps_for_in_collect_array(vm, obj);
+                if (!arr) goto fail;
+                stack[sp++] = ps_value_object(arr);
+                stack[sp++] = ps_value_number(0);
+                ip++;
+                break;
+            }
+            case STMT_BC_FOR_IN_NEXT: {
+                if (sp < 2) goto fail;
+                PSValue idx_val = stack[sp - 1];
+                PSValue arr_val = stack[sp - 2];
+                if (arr_val.type != PS_T_OBJECT || !arr_val.as.object ||
+                    arr_val.as.object->kind != PS_OBJ_KIND_ARRAY) {
+                    goto fail;
+                }
+                double idx_num = ps_to_number_fast(vm, idx_val);
+                if (ps_check_pending_throw(vm, ctl)) goto fail;
+                if (idx_num < 0) idx_num = 0;
+                size_t idx = (size_t)idx_num;
+                size_t len = ps_array_length(arr_val.as.object);
+                if (idx >= len) {
+                    stack[sp++] = ps_value_boolean(0);
+                    ip++;
+                    break;
+                }
+                PSValue key = ps_value_undefined();
+                (void)ps_array_get_index(arr_val.as.object, idx, &key);
+                stack[sp - 1] = ps_value_number((double)(idx + 1));
+                stack[sp++] = key;
+                stack[sp++] = ps_value_boolean(1);
+                ip++;
+                break;
+            }
+            case STMT_BC_FOR_IN_ASSIGN: {
+                if (sp == 0) goto fail;
+                PSValue key = stack[--sp];
+                PSAstNode *target = (PSAstNode *)ins->ptr;
+                int is_var = ins->a ? 1 : 0;
+                if (!target) goto fail;
+                if (target->kind == AST_IDENTIFIER) {
+                    PSString *name = ps_identifier_string(target);
+                    if (name) {
+                        if (is_var) {
+                            ps_env_define(env, name, key);
+                        } else {
+                            ps_env_set(env, name, key);
+                        }
+                    }
+                } else if (target->kind == AST_MEMBER) {
+                    PSValue obj_val = ps_stmt_bc_eval_expr(vm, env, target->as.member.object, ctl);
+                    if (ctl->did_throw) goto fail;
+                    PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                    if (ctl->did_throw) goto fail;
+                    PSString *prop = ps_member_key(vm, env, target, ctl);
+                    if (ctl->did_throw) goto fail;
+                    ps_object_put(obj, prop, key);
+                    (void)ps_env_update_arguments(env, obj, prop, key);
+                } else {
+                    goto fail;
+                }
+                ip++;
+                break;
+            }
+            case STMT_BC_WITH_ENTER: {
+                if (sp == 0) goto fail;
+                PSValue obj_val = stack[--sp];
+                PSObject *obj = ps_to_object(vm, &obj_val, ctl);
+                if (ctl->did_throw) goto fail;
+                PSEnv *with_env = ps_env_new(env, obj, 0);
+                if (!with_env) goto fail;
+                with_env->is_with = 1;
+                if (env_sp == env_cap) {
+                    size_t new_cap = env_cap * 2;
+                    PSEnv **next = (PSEnv **)malloc(sizeof(PSEnv *) * new_cap);
+                    if (!next) {
+                        ps_env_free(with_env);
+                        goto fail;
+                    }
+                    memcpy(next, env_stack, sizeof(PSEnv *) * env_cap);
+                    if (env_stack != env_stack_buf) free(env_stack);
+                    env_stack = next;
+                    env_cap = new_cap;
+                }
+                env_stack[env_sp++] = env;
+                env = with_env;
+                ip++;
+                break;
+            }
+            case STMT_BC_WITH_EXIT: {
+                if (env_sp == 0) goto fail;
+                PSEnv *prev = env_stack[--env_sp];
+                if (env) ps_env_free(env);
+                env = prev;
+                ip++;
+                break;
+            }
+            case STMT_BC_TRY_PUSH: {
+                if (handler_sp == handler_cap) {
+                    size_t new_cap = handler_cap * 2;
+                    PSTryHandler *next = (PSTryHandler *)malloc(sizeof(PSTryHandler) * new_cap);
+                    if (!next) goto fail;
+                    memcpy(next, handler_stack, sizeof(PSTryHandler) * handler_cap);
+                    if (handler_stack != handler_stack_buf) free(handler_stack);
+                    handler_stack = next;
+                    handler_cap = new_cap;
+                }
+                PSTryHandler h;
+                h.catch_ip = (size_t)ins->a;
+                h.finally_ip = (size_t)(intptr_t)ins->ptr;
+                h.catch_param = (PSAstNode *)ins->ptr2;
+                handler_stack[handler_sp++] = h;
+                ip++;
+                break;
+            }
+            case STMT_BC_TRY_POP:
+                if (handler_sp == 0) goto fail;
+                handler_sp--;
+                ip++;
+                break;
+            case STMT_BC_CATCH_ENTER: {
+                if (handler_sp == 0) goto fail;
+                PSTryHandler *h = &handler_stack[handler_sp - 1];
+                PSEnv *catch_env = ps_env_new_object(env);
+                if (!catch_env) goto fail;
+                if (h->catch_param) {
+                    PSString *name = ps_identifier_string(h->catch_param);
+                    if (name) {
+                        ps_env_define(catch_env, name, ctl->throw_value);
+                    }
+                }
+                ctl->did_throw = 0;
+                h->catch_ip = (size_t)-1;
+                if (env_sp == env_cap) {
+                    size_t new_cap = env_cap * 2;
+                    PSEnv **next = (PSEnv **)malloc(sizeof(PSEnv *) * new_cap);
+                    if (!next) {
+                        ps_env_free(catch_env);
+                        goto fail;
+                    }
+                    memcpy(next, env_stack, sizeof(PSEnv *) * env_cap);
+                    if (env_stack != env_stack_buf) free(env_stack);
+                    env_stack = next;
+                    env_cap = new_cap;
+                }
+                env_stack[env_sp++] = env;
+                env = catch_env;
+                ip++;
+                break;
+            }
+            case STMT_BC_CATCH_EXIT: {
+                if (env_sp == 0) goto fail;
+                PSEnv *prev = env_stack[--env_sp];
+                if (env) ps_env_free(env);
+                env = prev;
+                ip++;
+                break;
+            }
+            case STMT_BC_THROW: {
+                if (sp == 0) goto fail;
+                PSValue v = stack[--sp];
+                ctl->did_throw = 1;
+                ctl->throw_value = v;
+                goto handle_throw;
+            }
+            case STMT_BC_FINALLY_EXIT: {
+                if (handler_sp == 0) goto fail;
+                handler_sp--;
+                if (pending_throw) {
+                    ctl->did_throw = 1;
+                    ctl->throw_value = pending_throw_value;
+                    pending_throw = 0;
+                    goto handle_throw;
                 }
                 ip++;
                 break;
@@ -5887,9 +9635,8 @@ static PSValue ps_stmt_bc_execute(PSVM *vm, PSEnv *env, PSFunction *func, PSStmt
                 ip = (size_t)ins->a;
                 break;
             case STMT_BC_JUMP_IF_FALSE: {
-                PSAstNode *cond = (PSAstNode *)ins->ptr;
-                PSValue v = eval_expression(vm, env, cond, ctl);
-                if (ctl->did_throw) return ctl->throw_value;
+                if (sp == 0) goto fail;
+                PSValue v = stack[--sp];
                 if (!ps_to_boolean(vm, v)) {
                     ip = (size_t)ins->a;
                 } else {
@@ -5897,20 +9644,126 @@ static PSValue ps_stmt_bc_execute(PSVM *vm, PSEnv *env, PSFunction *func, PSStmt
                 }
                 break;
             }
-            case STMT_BC_RETURN: {
-                PSValue v = ps_value_undefined();
-                if (ins->ptr) {
-                    v = eval_expression(vm, env, (PSAstNode *)ins->ptr, ctl);
-                    if (ctl->did_throw) return ctl->throw_value;
+            case STMT_BC_JUMP_IF_TRUE: {
+                if (sp == 0) goto fail;
+                PSValue v = stack[--sp];
+                if (ps_to_boolean(vm, v)) {
+                    ip = (size_t)ins->a;
+                } else {
+                    ip++;
                 }
+                break;
+            }
+#if !PS_DISABLE_CF_FUSIONS
+            case STMT_BC_JLT_IDENT_CONST: {
+                PSAstNode *id = (PSAstNode *)ins->ptr;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue left = ps_value_undefined();
+                if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+                PSValue right = bc->consts[ins->a];
+                int take = 0;
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    take = !(left.as.number < right.as.number);
+                } else {
+                    PSValue out = ps_eval_binary_values(vm, TOK_LT, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                    take = !ps_to_boolean(vm, out);
+                }
+                if (take) {
+                    ip = (size_t)(intptr_t)ins->ptr2;
+                } else {
+                    ip++;
+                }
+                break;
+            }
+            case STMT_BC_JBITAND_EQZ_IDENT_CONST: {
+                PSAstNode *id = (PSAstNode *)ins->ptr;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue left = ps_value_undefined();
+                if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+                PSValue right = bc->consts[ins->a];
+                int32_t ln = ps_to_int32_fast(vm, left);
+                if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                int32_t rn = ps_to_int32_fast(vm, right);
+                if (ps_check_pending_throw(vm, ctl)) goto handle_throw;
+                if ((ln & rn) != 0) {
+                    ip = (size_t)(intptr_t)ins->ptr2;
+                } else {
+                    ip++;
+                }
+                break;
+            }
+            case STMT_BC_JUMP_ADD_IDENT_CONST: {
+                PSAstNode *id = (PSAstNode *)ins->ptr;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue left = ps_value_undefined();
+                if (!ps_stmt_bc_get_ident_value(vm, env, id, &left, ctl)) goto fail;
+                PSValue right = bc->consts[ins->a];
+                PSValue out = ps_value_undefined();
+                if (left.type == PS_T_NUMBER && right.type == PS_T_NUMBER) {
+                    out = ps_value_number(left.as.number + right.as.number);
+                } else {
+                    out = ps_stmt_bc_binary_slow(vm, TOK_PLUS, left, right, ctl);
+                    if (ctl->did_throw) goto handle_throw;
+                }
+                if (!ps_identifier_cached_set(env, id, out)) {
+                    PSString *name = ps_identifier_string(id);
+                    if (name) ps_env_set(env, name, out);
+                }
+                ip = (size_t)(intptr_t)ins->ptr2;
+                break;
+            }
+#endif
+            case STMT_BC_RETURN_VALUE: {
+                if (sp == 0) goto fail;
+                PSValue v = stack[--sp];
                 ctl->did_return = 1;
+                UNWIND_ENVS();
+                FREE_HANDLER_STACK();
+                if (stack != stack_buf) free(stack);
                 return v;
             }
-            default:
+            case STMT_BC_RETURN_VOID:
+                ctl->did_return = 1;
+                UNWIND_ENVS();
+                FREE_HANDLER_STACK();
+                if (stack != stack_buf) free(stack);
                 return ps_value_undefined();
+            default:
+                goto fail;
         }
     }
+handle_throw:
+    if (handler_sp == 0) goto fail;
+    {
+        PSTryHandler *h = &handler_stack[handler_sp - 1];
+        if (h->catch_ip != (size_t)-1) {
+            pending_throw = 0;
+            ip = h->catch_ip;
+            goto loop_top;
+        }
+        if (h->finally_ip != (size_t)-1) {
+            pending_throw = 1;
+            pending_throw_value = ctl->throw_value;
+            ctl->did_throw = 0;
+            ip = h->finally_ip;
+            goto loop_top;
+        }
+        handler_sp--;
+    }
+    goto fail;
+    UNWIND_ENVS();
+    FREE_HANDLER_STACK();
+    if (stack != stack_buf) free(stack);
     return ps_value_undefined();
+fail:
+    UNWIND_ENVS();
+    FREE_HANDLER_STACK();
+    if (stack != stack_buf) free(stack);
+    return ctl->did_throw ? ctl->throw_value : ps_value_undefined();
+#undef UNWIND_ENVS
+#undef FREE_HANDLER_STACK
+#endif
 }
 
 /* --------------------------------------------------------- */
@@ -6154,27 +10007,7 @@ static PSValue eval_expression_inner(PSVM *vm,
         }
 #endif
     }
-    if (allow_bc && node) {
-        if (node->expr_bc_state == 1 && node->expr_bc) {
-            int ok = 0;
-            PSValue v = ps_expr_bc_execute(vm, env, node, node->expr_bc, ctl, &ok);
-            if (ctl->did_throw) return v;
-            if (ok) return v;
-        } else if (node->expr_bc_state == 0) {
-            PSExprBC *bc = ps_expr_bc_compile(node);
-            if (bc) {
-                node->expr_bc = bc;
-                node->expr_bc_state = 1;
-                int ok = 0;
-                PSValue v = ps_expr_bc_execute(vm, env, node, node->expr_bc, ctl, &ok);
-                if (ctl->did_throw) return v;
-                if (ok) return v;
-                node->expr_bc_state = 2;
-            } else {
-                node->expr_bc_state = 2;
-            }
-        }
-    }
+    (void)allow_bc;
     switch (node->kind) {
 
         case AST_LITERAL:
@@ -6605,7 +10438,7 @@ static PSValue eval_expression_inner(PSVM *vm,
                         }
                         int is_new = 0;
                         if (!ps_num_map_set(obj, index, new_value, &is_new)) return new_value;
-                        if (is_new) obj->shape_id++;
+                        if (is_new) ps_object_bump_shape(obj);
                         return new_value;
                     }
                     if (key_val.type == PS_T_STRING &&
@@ -6623,7 +10456,7 @@ static PSValue eval_expression_inner(PSVM *vm,
                             }
                             int is_new = 0;
                             if (!ps_num_map_k_set(obj, kindex, new_value, &is_new)) return new_value;
-                            if (is_new) obj->shape_id++;
+                            if (is_new) ps_object_bump_shape(obj);
                             return new_value;
                         }
                     }
@@ -6971,7 +10804,7 @@ static PSValue eval_expression_inner(PSVM *vm,
                         } else {
                             int is_new = 0;
                             if (ps_num_map_set(obj, index, new_val, &is_new) && is_new) {
-                                obj->shape_id++;
+                                ps_object_bump_shape(obj);
                             }
                         }
                         return node->as.update.is_prefix ? new_val : current;

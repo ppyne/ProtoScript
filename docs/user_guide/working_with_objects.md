@@ -590,7 +590,7 @@ Buffers are also used for binary I/O and the Display framebuffer.
 
 ## Buffer32 module
 
-Buffer32 provides a native 32-bit view over byte buffers for faster pixel work.
+Buffer32 provides a native 32-bit view over byte buffers `Buffer`.
 
 ```js
 var buf = Buffer.alloc(8);

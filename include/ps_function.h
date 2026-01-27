@@ -6,6 +6,7 @@
 
 #include "ps_value.h"
 #include "ps_object.h"
+#include "ps_config.h"
 
 struct PSAstNode;
 struct PSEnv;
@@ -50,6 +51,27 @@ typedef struct PSFunction {
     uint8_t          fast_checked;
     struct PSStmtBC *stmt_bc;
     uint8_t          stmt_bc_state;
+#if !PS_DISABLE_SPECIALIZATION
+    PSString        **slot_names;
+    size_t           slot_count;
+    PSString        **spec_slot_names;
+    size_t           spec_slot_count;
+    uint32_t         spec_hot_count;
+    struct PSStmtBC *spec_bc;
+    uint8_t          spec_bc_state;
+    uint8_t          spec_guard_count;
+    uint8_t          spec_guard_slots[PS_SPECIALIZATION_GUARD_MAX];
+#endif
+#if !PS_DISABLE_UNBOXED_SPEC
+    uint32_t         unboxed_hot_count;
+    struct PSStmtBC *unboxed_bc;
+    uint8_t          unboxed_bc_state;
+    uint8_t          unboxed_guard_count;
+    uint8_t          unboxed_guard_slots[PS_SPECIALIZATION_GUARD_MAX];
+    uint8_t          unboxed_used_count;
+    uint8_t          unboxed_used_slots[PS_SPECIALIZATION_GUARD_MAX];
+    uint32_t         unboxed_write_bits[(PS_SPECIALIZATION_SLOT_MAX + 31) / 32];
+#endif
 } PSFunction;
 
 PSObject   *ps_function_new_native(PSNativeFunc fn);

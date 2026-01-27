@@ -1,7 +1,7 @@
 ProtoScript.include("cpu_filters.js");
-CG.DEBUG_QUANT = true;
-RgbQuant.DEBUG = true;
-RgbQuant.DEBUG_FILTER = ["buildPal", "reduce image", "ditherImage", "perf"];
+//CG.DEBUG_QUANT = true;
+//RgbQuant.DEBUG = true;
+//RgbQuant.DEBUG_FILTER = ["buildPal", "reduce image", "ditherImage", "perf"];
 
 Io.stderr.write("indexed_colors_examples: decode JPEG\n");
 var f = Io.open("sample.jpg", "rb");

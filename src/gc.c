@@ -364,6 +364,13 @@ static void ps_gc_mark_function(PSVM *vm, PSFunction *fn) {
         ps_gc_mark_env(vm, fn->fast_env);
     }
     ps_gc_mark_string(vm, fn->name);
+#if !PS_DISABLE_SPECIALIZATION
+    if (fn->slot_names) {
+        for (size_t i = 0; i < fn->slot_count; i++) {
+            ps_gc_mark_string(vm, fn->slot_names[i]);
+        }
+    }
+#endif
 }
 
 static void ps_gc_mark_env(PSVM *vm, PSEnv *env) {
@@ -641,6 +648,30 @@ static void ps_gc_finalize_function(PSFunction *fn) {
     ps_stmt_bc_free(fn->stmt_bc);
     fn->stmt_bc = NULL;
     fn->stmt_bc_state = 0;
+#if !PS_DISABLE_SPECIALIZATION
+    free(fn->slot_names);
+    fn->slot_names = NULL;
+    fn->slot_count = 0;
+    free(fn->spec_slot_names);
+    fn->spec_slot_names = NULL;
+    fn->spec_slot_count = 0;
+    fn->spec_hot_count = 0;
+    ps_stmt_bc_free(fn->spec_bc);
+    fn->spec_bc = NULL;
+    fn->spec_bc_state = 0;
+    fn->spec_guard_count = 0;
+#endif
+#if !PS_DISABLE_UNBOXED_SPEC
+    fn->unboxed_hot_count = 0;
+    ps_stmt_bc_free(fn->unboxed_bc);
+    fn->unboxed_bc = NULL;
+    fn->unboxed_bc_state = 0;
+    fn->unboxed_guard_count = 0;
+    fn->unboxed_used_count = 0;
+    for (size_t i = 0; i < (PS_SPECIALIZATION_SLOT_MAX + 31) / 32; i++) {
+        fn->unboxed_write_bits[i] = 0;
+    }
+#endif
     /* Function references are owned by AST or env; nothing to free here. */
 }
 

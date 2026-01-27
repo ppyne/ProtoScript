@@ -4319,6 +4319,16 @@ static void hoist_decls(PSVM *vm, PSEnv *env, PSAstNode *node) {
     }
 }
 
+/*
+ * Production execution engine: peephole + control-flow superinstructions.
+ * Phase 5 and Phase 8 (v1/v2) are experimental, OFF by default, and closed
+ * as performance levers. Retained for research/reference only.
+ */
+/* --- Experimental / research paths (OFF by default) -------------------- */
+#if !PS_DISABLE_SPECIALIZATION
+static int ps_spec_collect_program_slots(PSAstNode *node, PSString ***names, size_t *count, size_t *cap);
+#endif
+
 /* --------------------------------------------------------- */
 /* Program                                                   */
 /* --------------------------------------------------------- */
@@ -4354,7 +4364,45 @@ PSValue ps_eval(PSVM *vm, PSAstNode *program) {
     if (bc) {
         uint64_t t1 = 0;
         if (split_timing) t1 = ps_eval_now_ms();
+#if !PS_DISABLE_SPECIALIZATION || !PS_DISABLE_UNBOXED_SPEC
+        {
+            PSFunction program_func;
+            memset(&program_func, 0, sizeof(program_func));
+            program_func.body = program;
+            program_func.stmt_bc = bc;
+#if !PS_DISABLE_SPECIALIZATION
+            program_func.spec_hot_count = PS_HOT_THRESHOLD;
+#endif
+#if !PS_DISABLE_UNBOXED_SPEC
+/* Unboxed specialization path (experimental; compiled out by default). */
+            program_func.unboxed_hot_count = PS_HOT_THRESHOLD;
+#endif
+            PSString **slot_names = NULL;
+            size_t slot_count = 0;
+            size_t slot_cap = 0;
+            if (ps_spec_collect_program_slots(program, &slot_names, &slot_count, &slot_cap)) {
+                program_func.slot_names = slot_names;
+                program_func.slot_count = slot_count;
+            } else {
+                free(slot_names);
+            }
+            last = ps_stmt_bc_execute(vm, vm->env, &program_func, bc, &ctl);
+            free(program_func.slot_names);
+#if !PS_DISABLE_SPECIALIZATION
+            free(program_func.spec_slot_names);
+            if (program_func.spec_bc) {
+                ps_stmt_bc_free(program_func.spec_bc);
+            }
+#endif
+#if !PS_DISABLE_UNBOXED_SPEC
+            if (program_func.unboxed_bc) {
+                ps_stmt_bc_free(program_func.unboxed_bc);
+            }
+#endif
+        }
+#else
         last = ps_stmt_bc_execute(vm, vm->env, NULL, bc, &ctl);
+#endif
         if (split_timing) exec_ms = ps_eval_now_ms() - t1;
         ps_stmt_bc_free(bc);
     } else {
@@ -5228,6 +5276,7 @@ static int ps_expr_bc_emit(PSExprBCBuilder *b, PSAstNode *expr) {
     return 0;
 }
 
+#if PS_ENABLE_EXPR_BC
 static PSExprBC *ps_expr_bc_compile(PSAstNode *expr) {
     if (!expr) return NULL;
     PSExprBCBuilder builder = {0};
@@ -5781,6 +5830,7 @@ fail:
     if (out_ok) *out_ok = ctl->did_throw ? 1 : 0;
     return ctl->did_throw ? ctl->throw_value : ps_value_undefined();
 }
+#endif
 
 /* --------------------------------------------------------- */
 /* Statement bytecode                                        */
@@ -5862,7 +5912,17 @@ enum {
     STMT_BC_JBITAND_EQZ_IDENT_CONST,
     STMT_BC_JUMP_ADD_IDENT_CONST,
     STMT_BC_RETURN_VALUE,
-    STMT_BC_RETURN_VOID
+    STMT_BC_RETURN_VOID,
+    STMT_BC_EXPR_LOAD_SLOT_NUM,
+    STMT_BC_EXPR_STORE_SLOT_NUM,
+    STMT_BC_EXPR_ADD_NUM,
+    STMT_BC_UNBOX_LOAD_SLOT_D,
+    STMT_BC_UNBOX_STORE_SLOT_D,
+    STMT_BC_UNBOX_ADD_SLOT_D_SLOT_D,
+    STMT_BC_UNBOX_ADD_SLOT_D_CONST,
+    STMT_BC_UNBOX_JLT_SLOT_D_CONST,
+    STMT_BC_UNBOX_JBITAND_EQZ_SLOT_D_CONST,
+    STMT_BC_UNBOX_JUMP_ADD_SLOT_D_CONST
 };
 
 static int ps_stmt_bc_push_instr(PSStmtBCBuilder *b, PSStmtBCInstr instr) {
@@ -6567,6 +6627,16 @@ static const char *ps_stmt_bc_op_name(uint8_t op) {
         case STMT_BC_JUMP_ADD_IDENT_CONST: return "JUMP_ADD_IDENT_CONST";
         case STMT_BC_RETURN_VALUE: return "RETURN_VALUE";
         case STMT_BC_RETURN_VOID: return "RETURN_VOID";
+        case STMT_BC_EXPR_LOAD_SLOT_NUM: return "LOAD_SLOT_NUM";
+        case STMT_BC_EXPR_STORE_SLOT_NUM: return "STORE_SLOT_NUM";
+        case STMT_BC_EXPR_ADD_NUM: return "ADD_NUM";
+        case STMT_BC_UNBOX_LOAD_SLOT_D: return "UNBOX_LOAD_SLOT_D";
+        case STMT_BC_UNBOX_STORE_SLOT_D: return "UNBOX_STORE_SLOT_D";
+        case STMT_BC_UNBOX_ADD_SLOT_D_SLOT_D: return "UNBOX_ADD_SLOT_D_SLOT_D";
+        case STMT_BC_UNBOX_ADD_SLOT_D_CONST: return "UNBOX_ADD_SLOT_D_CONST";
+        case STMT_BC_UNBOX_JLT_SLOT_D_CONST: return "UNBOX_JLT_SLOT_D_CONST";
+        case STMT_BC_UNBOX_JBITAND_EQZ_SLOT_D_CONST: return "UNBOX_JBITAND_EQZ_SLOT_D_CONST";
+        case STMT_BC_UNBOX_JUMP_ADD_SLOT_D_CONST: return "UNBOX_JUMP_ADD_SLOT_D_CONST";
         default: return "UNKNOWN";
     }
 }
@@ -6665,6 +6735,14 @@ static void ps_stmt_bc_dump(const PSStmtBC *bc, const char *label) {
                 printf(" %s", name ? name : "<ident>");
                 break;
             }
+            case STMT_BC_EXPR_LOAD_SLOT_NUM:
+            case STMT_BC_EXPR_STORE_SLOT_NUM:
+                printf(" slot=%d", ins->a);
+                break;
+            case STMT_BC_UNBOX_LOAD_SLOT_D:
+            case STMT_BC_UNBOX_STORE_SLOT_D:
+                printf(" slot=%d", ins->a);
+                break;
             case STMT_BC_EXPR_ADD_IDENT_CONST: {
                 const char *name = ps_ident_name((PSAstNode *)ins->ptr);
                 char tmp[96];
@@ -6678,6 +6756,21 @@ static void ps_stmt_bc_dump(const PSStmtBC *bc, const char *label) {
                 const char *lhs = ps_ident_name((PSAstNode *)ins->ptr);
                 const char *rhs = ps_ident_name((PSAstNode *)ins->ptr2);
                 printf(" %s, %s", lhs ? lhs : "<ident>", rhs ? rhs : "<ident>");
+                break;
+            }
+            case STMT_BC_EXPR_ADD_NUM:
+                printf(" dst=%d", ins->a);
+                break;
+            case STMT_BC_UNBOX_ADD_SLOT_D_SLOT_D:
+                printf(" dst=%d", ins->a);
+                break;
+            case STMT_BC_UNBOX_ADD_SLOT_D_CONST: {
+                char tmp[96];
+                int const_idx = (int)(intptr_t)ins->ptr2;
+                PSValue v = (const_idx >= 0 && (size_t)const_idx < bc->const_count)
+                    ? bc->consts[const_idx] : ps_value_undefined();
+                ps_format_value(&v, tmp, sizeof(tmp));
+                printf(" slot=%d, %s", (int)(intptr_t)ins->ptr, tmp);
                 break;
             }
             case STMT_BC_EXPR_UNARY_NUM:
@@ -6749,6 +6842,33 @@ static void ps_stmt_bc_dump(const PSStmtBC *bc, const char *label) {
                     ? bc->consts[ins->a] : ps_value_undefined();
                 ps_format_value(&v, tmp, sizeof(tmp));
                 printf(" %s, %s -> %ld", name ? name : "<ident>", tmp,
+                       (long)(intptr_t)ins->ptr2);
+                break;
+            }
+            case STMT_BC_UNBOX_JLT_SLOT_D_CONST: {
+                char tmp[96];
+                PSValue v = (ins->a >= 0 && (size_t)ins->a < bc->const_count)
+                    ? bc->consts[ins->a] : ps_value_undefined();
+                ps_format_value(&v, tmp, sizeof(tmp));
+                printf(" slot=%d, %s -> %ld", (int)(intptr_t)ins->ptr, tmp,
+                       (long)(intptr_t)ins->ptr2);
+                break;
+            }
+            case STMT_BC_UNBOX_JBITAND_EQZ_SLOT_D_CONST: {
+                char tmp[96];
+                PSValue v = (ins->a >= 0 && (size_t)ins->a < bc->const_count)
+                    ? bc->consts[ins->a] : ps_value_undefined();
+                ps_format_value(&v, tmp, sizeof(tmp));
+                printf(" slot=%d, %s -> %ld", (int)(intptr_t)ins->ptr, tmp,
+                       (long)(intptr_t)ins->ptr2);
+                break;
+            }
+            case STMT_BC_UNBOX_JUMP_ADD_SLOT_D_CONST: {
+                char tmp[96];
+                PSValue v = (ins->a >= 0 && (size_t)ins->a < bc->const_count)
+                    ? bc->consts[ins->a] : ps_value_undefined();
+                ps_format_value(&v, tmp, sizeof(tmp));
+                printf(" slot=%d, %s -> %ld", (int)(intptr_t)ins->ptr, tmp,
                        (long)(intptr_t)ins->ptr2);
                 break;
             }
@@ -7410,6 +7530,787 @@ static int ps_stmt_bc_get_ident_value(PSVM *vm, PSEnv *env, PSAstNode *id, PSVal
     return 1;
 }
 
+#if !PS_DISABLE_SPECIALIZATION
+ #if PS_ENABLE_PERF
+static int ps_spec_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("PS_SPEC_TRACE");
+        enabled = (env && *env) ? 1 : 0;
+    }
+    return enabled;
+}
+
+static void ps_spec_trace_log_once(const char *msg, int *printed) {
+    if (!msg || !printed) return;
+    if (!ps_spec_trace_enabled()) return;
+    if (*printed) return;
+    fprintf(stderr, "[spec] %s\n", msg);
+    *printed = 1;
+}
+
+static int ps_spec_trace_exec_printed = 0;
+static int ps_spec_trace_fail_printed = 0;
+ #endif
+
+typedef struct {
+    PSStmtBCInstr *code;
+    size_t count;
+    size_t cap;
+} PSSpecBCBuilder;
+
+static int ps_spec_push(PSSpecBCBuilder *b, PSStmtBCInstr ins) {
+    if (!b) return 0;
+    if (b->count == b->cap) {
+        size_t new_cap = b->cap ? b->cap * 2 : 64;
+        PSStmtBCInstr *next = (PSStmtBCInstr *)realloc(b->code, new_cap * sizeof(PSStmtBCInstr));
+        if (!next) return 0;
+        b->code = next;
+        b->cap = new_cap;
+    }
+    b->code[b->count++] = ins;
+    return 1;
+}
+
+static int ps_spec_ast_safe(PSAstNode *node) {
+    if (!node) return 1;
+    switch (node->kind) {
+        case AST_WITH:
+        case AST_FUNCTION_DECL:
+        case AST_FUNCTION_EXPR:
+            return 0;
+        case AST_PROGRAM:
+        case AST_BLOCK:
+            for (size_t i = 0; i < node->as.list.count; i++) {
+                if (!ps_spec_ast_safe(node->as.list.items[i])) return 0;
+            }
+            return 1;
+        case AST_IF:
+            return ps_spec_ast_safe(node->as.if_stmt.then_branch) &&
+                   ps_spec_ast_safe(node->as.if_stmt.else_branch);
+        case AST_WHILE:
+            return ps_spec_ast_safe(node->as.while_stmt.body);
+        case AST_DO_WHILE:
+            return ps_spec_ast_safe(node->as.do_while.body);
+        case AST_FOR:
+            return ps_spec_ast_safe(node->as.for_stmt.init) &&
+                   ps_spec_ast_safe(node->as.for_stmt.body);
+        case AST_FOR_IN:
+            return ps_spec_ast_safe(node->as.for_in.body);
+        case AST_FOR_OF:
+            return ps_spec_ast_safe(node->as.for_of.body);
+        case AST_SWITCH:
+            for (size_t i = 0; i < node->as.switch_stmt.case_count; i++) {
+                if (!ps_spec_ast_safe(node->as.switch_stmt.cases[i])) return 0;
+            }
+            return 1;
+        case AST_CASE:
+            for (size_t i = 0; i < node->as.case_stmt.count; i++) {
+                if (!ps_spec_ast_safe(node->as.case_stmt.items[i])) return 0;
+            }
+            return 1;
+        case AST_TRY:
+            return ps_spec_ast_safe(node->as.try_stmt.try_block) &&
+                   ps_spec_ast_safe(node->as.try_stmt.catch_block) &&
+                   ps_spec_ast_safe(node->as.try_stmt.finally_block);
+        case AST_LABEL:
+            return ps_spec_ast_safe(node->as.label_stmt.stmt);
+        default:
+            return 1;
+    }
+}
+
+static int ps_spec_guard_add(uint8_t *guards, uint8_t *guard_count, int slot) {
+    if (slot < 0) return 0;
+    if (!guards || !guard_count) return 0;
+    for (uint8_t i = 0; i < *guard_count; i++) {
+        if (guards[i] == (uint8_t)slot) return 1;
+    }
+    if (*guard_count >= PS_SPECIALIZATION_GUARD_MAX) return 0;
+    guards[(*guard_count)++] = (uint8_t)slot;
+    return 1;
+}
+
+static int ps_spec_slot_list_contains(PSString **names, size_t count, PSString *name) {
+    if (!name) return 0;
+    for (size_t i = 0; i < count; i++) {
+        if (names[i] && ps_string_equals(names[i], name)) return 1;
+    }
+    return 0;
+}
+
+static int ps_spec_slot_list_push(PSString ***names, size_t *count, size_t *cap, PSString *name) {
+    if (!names || !count || !cap || !name) return 0;
+    if (ps_spec_slot_list_contains(*names, *count, name)) return 1;
+    if (*count == *cap) {
+        size_t new_cap = *cap ? (*cap * 2) : 8;
+        PSString **next = (PSString **)realloc(*names, sizeof(PSString *) * new_cap);
+        if (!next) return 0;
+        *names = next;
+        *cap = new_cap;
+    }
+    (*names)[(*count)++] = name;
+    return 1;
+}
+
+static int ps_spec_slot_list_index(PSString **names, size_t count, PSString *name) {
+    if (!name) return -1;
+    for (size_t i = 0; i < count; i++) {
+        if (names[i] && ps_string_equals(names[i], name)) return (int)i;
+    }
+    return -1;
+}
+
+static int ps_spec_collect_program_slots(PSAstNode *node, PSString ***names, size_t *count, size_t *cap) {
+    if (!node) return 1;
+    switch (node->kind) {
+        case AST_VAR_DECL: {
+            PSString *name = ps_identifier_string(node->as.var_decl.id);
+            return ps_spec_slot_list_push(names, count, cap, name);
+        }
+        case AST_FUNCTION_DECL: {
+            PSString *name = ps_identifier_string(node->as.func_decl.id);
+            return ps_spec_slot_list_push(names, count, cap, name);
+        }
+        case AST_PROGRAM:
+        case AST_BLOCK:
+            for (size_t i = 0; i < node->as.list.count; i++) {
+                if (!ps_spec_collect_program_slots(node->as.list.items[i], names, count, cap)) {
+                    return 0;
+                }
+            }
+            return 1;
+        case AST_IF:
+            return ps_spec_collect_program_slots(node->as.if_stmt.then_branch, names, count, cap) &&
+                   ps_spec_collect_program_slots(node->as.if_stmt.else_branch, names, count, cap);
+        case AST_WHILE:
+            return ps_spec_collect_program_slots(node->as.while_stmt.body, names, count, cap);
+        case AST_DO_WHILE:
+            return ps_spec_collect_program_slots(node->as.do_while.body, names, count, cap);
+        case AST_FOR:
+            return ps_spec_collect_program_slots(node->as.for_stmt.init, names, count, cap) &&
+                   ps_spec_collect_program_slots(node->as.for_stmt.body, names, count, cap);
+        case AST_FOR_IN:
+            if (node->as.for_in.is_var &&
+                node->as.for_in.target &&
+                node->as.for_in.target->kind == AST_IDENTIFIER) {
+                PSString *name = ps_identifier_string(node->as.for_in.target);
+                if (!ps_spec_slot_list_push(names, count, cap, name)) return 0;
+            }
+            return ps_spec_collect_program_slots(node->as.for_in.body, names, count, cap);
+        case AST_FOR_OF:
+            if (node->as.for_of.is_var &&
+                node->as.for_of.target &&
+                node->as.for_of.target->kind == AST_IDENTIFIER) {
+                PSString *name = ps_identifier_string(node->as.for_of.target);
+                if (!ps_spec_slot_list_push(names, count, cap, name)) return 0;
+            }
+            return ps_spec_collect_program_slots(node->as.for_of.body, names, count, cap);
+        case AST_SWITCH:
+            for (size_t i = 0; i < node->as.switch_stmt.case_count; i++) {
+                if (!ps_spec_collect_program_slots(node->as.switch_stmt.cases[i], names, count, cap)) {
+                    return 0;
+                }
+            }
+            return 1;
+        case AST_CASE:
+            for (size_t i = 0; i < node->as.case_stmt.count; i++) {
+                if (!ps_spec_collect_program_slots(node->as.case_stmt.items[i], names, count, cap)) {
+                    return 0;
+                }
+            }
+            return 1;
+        case AST_WITH:
+            return ps_spec_collect_program_slots(node->as.with_stmt.body, names, count, cap);
+        case AST_TRY:
+            return ps_spec_collect_program_slots(node->as.try_stmt.try_block, names, count, cap) &&
+                   ps_spec_collect_program_slots(node->as.try_stmt.catch_block, names, count, cap) &&
+                   ps_spec_collect_program_slots(node->as.try_stmt.finally_block, names, count, cap);
+        case AST_LABEL:
+            return ps_spec_collect_program_slots(node->as.label_stmt.stmt, names, count, cap);
+        default:
+            return 1;
+    }
+}
+
+static PSStmtBC *ps_stmt_bc_build_spec(PSFunction *func, PSStmtBC *bc,
+                                       uint8_t *guard_slots, uint8_t *guard_count) {
+    if (!func || !bc || !guard_slots || !guard_count) return NULL;
+    if (!func->slot_names || func->slot_count == 0) return NULL;
+    if (func->slot_count > PS_SPECIALIZATION_SLOT_MAX) return NULL;
+    if (!ps_spec_ast_safe(func->body)) return NULL;
+
+    size_t old_count = bc->count;
+    size_t *map = (size_t *)malloc(sizeof(size_t) * old_count);
+    if (!map) return NULL;
+    PSSpecBCBuilder out = {0};
+    *guard_count = 0;
+    PSString **spec_names = NULL;
+    size_t spec_count = 0;
+    size_t spec_cap = 0;
+    uint8_t slot_init[PS_SPECIALIZATION_SLOT_MAX] = {0};
+    for (size_t i = 0; i < func->slot_count; i++) {
+        if (!ps_spec_slot_list_push(&spec_names, &spec_count, &spec_cap, func->slot_names[i])) {
+            goto fail;
+        }
+    }
+    if (spec_count > PS_SPECIALIZATION_SLOT_MAX) goto fail;
+
+    for (size_t i = 0; i < old_count; i++) {
+        PSStmtBCInstr *ins = &bc->code[i];
+        map[i] = out.count;
+        switch (ins->op) {
+            case STMT_BC_EXPR_PUSH_CONST: {
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                if (!ps_spec_push(&out, *ins)) goto fail;
+                break;
+            }
+            case STMT_BC_EXPR_LOAD_IDENT: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int local_slot = ps_spec_slot_list_index(func->slot_names, func->slot_count, name);
+                if (local_slot < 0) {
+                    if (!ps_spec_push(&out, *ins)) goto fail;
+                    break;
+                }
+                int slot = ps_spec_slot_list_index(spec_names, spec_count, name);
+                if (slot < 0) goto fail;
+                PSStmtBCInstr load = {0};
+                load.op = STMT_BC_EXPR_LOAD_SLOT_NUM;
+                load.a = slot;
+                if (!ps_spec_push(&out, load)) goto fail;
+                break;
+            }
+            case STMT_BC_EXPR_STORE_IDENT: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int local_slot = ps_spec_slot_list_index(func->slot_names, func->slot_count, name);
+                if (local_slot < 0) goto fail;
+                int slot = ps_spec_slot_list_index(spec_names, spec_count, name);
+                if (slot < 0) goto fail;
+                PSStmtBCInstr store = {0};
+                store.op = STMT_BC_EXPR_STORE_SLOT_NUM;
+                store.a = slot;
+                if (!ps_spec_push(&out, store)) goto fail;
+                if (slot >= 0 && (size_t)slot < PS_SPECIALIZATION_SLOT_MAX) {
+                    slot_init[slot] = 1;
+                }
+                break;
+            }
+            case STMT_BC_EXPR_ADD_INT:
+            case STMT_BC_EXPR_ADD_DOUBLE:
+                goto fail;
+            case STMT_BC_EXPR_ADD_IDENT_CONST: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int local_slot = ps_spec_slot_list_index(func->slot_names, func->slot_count, name);
+                if (local_slot < 0) goto fail;
+                int slot = ps_spec_slot_list_index(spec_names, spec_count, name);
+                if (slot < 0) goto fail;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue v = bc->consts[ins->a];
+                if (v.type != PS_T_NUMBER) goto fail;
+                if (slot >= 0 && (size_t)slot < PS_SPECIALIZATION_SLOT_MAX && !slot_init[slot]) {
+                    if (!ps_spec_guard_add(guard_slots, guard_count, slot)) goto fail;
+                }
+                PSStmtBCInstr add = {0};
+                add.op = STMT_BC_EXPR_ADD_NUM;
+                add.a = slot;
+                add.ptr = (void *)(intptr_t)slot;
+                add.ptr2 = (void *)(intptr_t)ins->a;
+                add.flags = 1;
+                if (!ps_spec_push(&out, add)) goto fail;
+                if (slot >= 0 && (size_t)slot < PS_SPECIALIZATION_SLOT_MAX) {
+                    slot_init[slot] = 1;
+                }
+                break;
+            }
+            case STMT_BC_EXPR_ADD_IDENT_IDENT: {
+                PSString *name_l = ps_identifier_string((PSAstNode *)ins->ptr);
+                PSString *name_r = ps_identifier_string((PSAstNode *)ins->ptr2);
+                int local_l = ps_spec_slot_list_index(func->slot_names, func->slot_count, name_l);
+                int local_r = ps_spec_slot_list_index(func->slot_names, func->slot_count, name_r);
+                if (local_l < 0 || local_r < 0) goto fail;
+                int slot_l = ps_spec_slot_list_index(spec_names, spec_count, name_l);
+                int slot_r = ps_spec_slot_list_index(spec_names, spec_count, name_r);
+                if (slot_l < 0 || slot_r < 0) goto fail;
+                if (slot_l >= 0 && (size_t)slot_l < PS_SPECIALIZATION_SLOT_MAX && !slot_init[slot_l]) {
+                    if (!ps_spec_guard_add(guard_slots, guard_count, slot_l)) goto fail;
+                }
+                if (slot_r >= 0 && (size_t)slot_r < PS_SPECIALIZATION_SLOT_MAX && !slot_init[slot_r]) {
+                    if (!ps_spec_guard_add(guard_slots, guard_count, slot_r)) goto fail;
+                }
+                PSStmtBCInstr add = {0};
+                add.op = STMT_BC_EXPR_ADD_NUM;
+                add.a = slot_l;
+                add.ptr = (void *)(intptr_t)slot_l;
+                add.ptr2 = (void *)(intptr_t)slot_r;
+                add.flags = 0;
+                if (!ps_spec_push(&out, add)) goto fail;
+                if (slot_l >= 0 && (size_t)slot_l < PS_SPECIALIZATION_SLOT_MAX) {
+                    slot_init[slot_l] = 1;
+                }
+                break;
+            }
+            case STMT_BC_JLT_IDENT_CONST: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int local_slot = ps_spec_slot_list_index(func->slot_names, func->slot_count, name);
+                if (local_slot < 0) goto fail;
+                int slot = ps_spec_slot_list_index(spec_names, spec_count, name);
+                if (slot < 0) goto fail;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue v = bc->consts[ins->a];
+                if (v.type != PS_T_NUMBER) goto fail;
+                PSStmtBCInstr load = {0};
+                load.op = STMT_BC_EXPR_LOAD_SLOT_NUM;
+                load.a = slot;
+                if (slot >= 0 && (size_t)slot < PS_SPECIALIZATION_SLOT_MAX && !slot_init[slot]) {
+                    if (!ps_spec_guard_add(guard_slots, guard_count, slot)) goto fail;
+                }
+                if (!ps_spec_push(&out, load)) goto fail;
+                if (!ps_spec_push(&out, (PSStmtBCInstr){ .op = STMT_BC_EXPR_PUSH_CONST, .a = ins->a })) goto fail;
+                if (!ps_spec_push(&out, (PSStmtBCInstr){ .op = STMT_BC_EXPR_BINARY_NUM, .a = TOK_LT })) goto fail;
+                if (!ps_spec_push(&out, (PSStmtBCInstr){ .op = STMT_BC_JUMP_IF_FALSE, .a = (int32_t)(intptr_t)ins->ptr2 })) goto fail;
+                break;
+            }
+            case STMT_BC_JUMP_ADD_IDENT_CONST: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int local_slot = ps_spec_slot_list_index(func->slot_names, func->slot_count, name);
+                if (local_slot < 0) goto fail;
+                int slot = ps_spec_slot_list_index(spec_names, spec_count, name);
+                if (slot < 0) goto fail;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue v = bc->consts[ins->a];
+                if (v.type != PS_T_NUMBER) goto fail;
+                if (slot >= 0 && (size_t)slot < PS_SPECIALIZATION_SLOT_MAX && !slot_init[slot]) {
+                    if (!ps_spec_guard_add(guard_slots, guard_count, slot)) goto fail;
+                }
+                PSStmtBCInstr add = {0};
+                add.op = STMT_BC_EXPR_ADD_NUM;
+                add.a = slot;
+                add.ptr = (void *)(intptr_t)slot;
+                add.ptr2 = (void *)(intptr_t)ins->a;
+                add.flags = 1;
+                if (!ps_spec_push(&out, add)) goto fail;
+                if (slot >= 0 && (size_t)slot < PS_SPECIALIZATION_SLOT_MAX) {
+                    slot_init[slot] = 1;
+                }
+                if (!ps_spec_push(&out, (PSStmtBCInstr){ .op = STMT_BC_JUMP, .a = (int32_t)(intptr_t)ins->ptr2 })) goto fail;
+                break;
+            }
+            case STMT_BC_EXPR_BINARY_NUM:
+                if (ins->a != TOK_LT) goto fail;
+                if (!ps_spec_push(&out, *ins)) goto fail;
+                break;
+            case STMT_BC_EXPR_CALL_IDENT:
+            case STMT_BC_EXPR_CALL_MEMBER:
+                if (!ps_spec_push(&out, *ins)) goto fail;
+                break;
+            case STMT_BC_EXPR_POP:
+            case STMT_BC_JUMP:
+            case STMT_BC_JUMP_IF_FALSE:
+            case STMT_BC_JUMP_IF_TRUE:
+            case STMT_BC_RETURN_VALUE:
+            case STMT_BC_RETURN_VOID:
+                if (!ps_spec_push(&out, *ins)) goto fail;
+                break;
+            default:
+                goto fail;
+        }
+    }
+
+    for (size_t j = 0; j < out.count; j++) {
+        PSStmtBCInstr *ins = &out.code[j];
+        if (ins->op == STMT_BC_JUMP ||
+            ins->op == STMT_BC_JUMP_IF_FALSE ||
+            ins->op == STMT_BC_JUMP_IF_TRUE) {
+            if (ins->a >= 0 && (size_t)ins->a < old_count) {
+                ins->a = (int32_t)map[ins->a];
+            } else {
+                goto fail;
+            }
+        }
+    }
+
+    PSStmtBC *spec = (PSStmtBC *)calloc(1, sizeof(PSStmtBC));
+    if (!spec) goto fail;
+    spec->code = out.code;
+    spec->count = out.count;
+    spec->const_count = bc->const_count;
+    if (bc->const_count > 0) {
+        spec->consts = (PSValue *)malloc(sizeof(PSValue) * bc->const_count);
+        if (!spec->consts) {
+            free(spec);
+            goto fail;
+        }
+        memcpy(spec->consts, bc->consts, sizeof(PSValue) * bc->const_count);
+    } else {
+        spec->consts = NULL;
+    }
+    func->spec_slot_names = spec_names;
+    func->spec_slot_count = spec_count;
+    free(map);
+    return spec;
+
+fail:
+    free(map);
+    free(out.code);
+    free(spec_names);
+    return NULL;
+}
+#endif
+
+#if !PS_DISABLE_UNBOXED_SPEC
+ #if PS_ENABLE_PERF
+static int ps_unboxed_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("PS_UNBOXED_TRACE");
+        enabled = (env && *env) ? 1 : 0;
+    }
+    return enabled;
+}
+
+static int ps_unboxed_dump_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("PS_UNBOXED_DUMP");
+        enabled = (env && *env) ? 1 : 0;
+    }
+    return enabled;
+}
+
+static void ps_unboxed_trace_log_once(const char *msg, int *printed) {
+    if (!msg || !printed) return;
+    if (!ps_unboxed_trace_enabled()) return;
+    if (*printed) return;
+    printf("[unboxed] %s\n", msg);
+    fflush(stdout);
+    *printed = 1;
+}
+
+static int ps_unboxed_trace_exec_printed = 0;
+static int ps_unboxed_trace_fail_printed = 0;
+ #endif
+
+typedef struct {
+    PSStmtBCInstr *code;
+    size_t count;
+    size_t cap;
+} PSUnboxedBCBuilder;
+
+static int __attribute__((unused)) ps_unboxed_push(PSUnboxedBCBuilder *b, PSStmtBCInstr ins) {
+    if (!b) return 0;
+    if (b->count == b->cap) {
+        size_t new_cap = b->cap ? b->cap * 2 : 64;
+        PSStmtBCInstr *next = (PSStmtBCInstr *)realloc(b->code, new_cap * sizeof(PSStmtBCInstr));
+        if (!next) return 0;
+        b->code = next;
+        b->cap = new_cap;
+    }
+    b->code[b->count++] = ins;
+    return 1;
+}
+
+static int __attribute__((unused)) ps_unboxed_slot_index(PSString **names, size_t count, PSString *name) {
+    if (!name) return -1;
+    for (size_t i = 0; i < count; i++) {
+        if (names[i] && ps_string_equals(names[i], name)) return (int)i;
+    }
+    return -1;
+}
+
+static int __attribute__((unused)) ps_unboxed_mark_used(uint8_t *used,
+                                                        uint8_t *list,
+                                                        uint8_t *count,
+                                                        int slot) {
+    if (slot < 0 || slot >= PS_SPECIALIZATION_SLOT_MAX) return 0;
+    if (used[slot]) return 1;
+    if (*count >= PS_SPECIALIZATION_GUARD_MAX) return 0;
+    used[slot] = 1;
+    list[(*count)++] = (uint8_t)slot;
+    return 1;
+}
+
+static void __attribute__((unused)) ps_unboxed_write_mark(uint32_t *bits, int slot) {
+    if (slot < 0 || slot >= PS_SPECIALIZATION_SLOT_MAX) return;
+    size_t idx = (size_t)slot / 32;
+    uint32_t mask = 1u << (slot & 31);
+    bits[idx] |= mask;
+}
+
+static PSStmtBC *__attribute__((unused)) ps_stmt_bc_build_unboxed_spec(PSFunction *func, PSStmtBC *bc) {
+    if (!func || !bc) return NULL;
+    if (!func->slot_names || func->slot_count == 0) return NULL;
+    if (func->slot_count > PS_SPECIALIZATION_SLOT_MAX) return NULL;
+
+    size_t old_count = bc->count;
+    size_t *map = (size_t *)malloc(sizeof(size_t) * old_count);
+    if (!map) return NULL;
+    PSUnboxedBCBuilder out = {0};
+    uint8_t used[PS_SPECIALIZATION_SLOT_MAX];
+    uint8_t written[PS_SPECIALIZATION_SLOT_MAX];
+    uint8_t used_list[PS_SPECIALIZATION_GUARD_MAX];
+    uint8_t used_count = 0;
+    uint32_t write_bits[(PS_SPECIALIZATION_SLOT_MAX + 31) / 32];
+    for (size_t i = 0; i < PS_SPECIALIZATION_SLOT_MAX; i++) {
+        used[i] = 0;
+        written[i] = 0;
+    }
+    for (size_t i = 0; i < PS_SPECIALIZATION_GUARD_MAX; i++) used_list[i] = 0;
+    for (size_t i = 0; i < (PS_SPECIALIZATION_SLOT_MAX + 31) / 32; i++) write_bits[i] = 0;
+    int last_unboxed_no_stack = 0;
+    int last_stack_numeric = 0;
+
+    for (size_t i = 0; i < old_count; i++) {
+        PSStmtBCInstr *ins = &bc->code[i];
+        map[i] = out.count;
+        switch (ins->op) {
+            case STMT_BC_EXPR_PUSH_CONST:
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                last_stack_numeric = (bc->consts[ins->a].type == PS_T_NUMBER);
+                if (!ps_unboxed_push(&out, *ins)) goto fail;
+                last_unboxed_no_stack = 0;
+                break;
+            case STMT_BC_EXPR_POP:
+            case STMT_BC_EXPR_CALL_IDENT:
+            case STMT_BC_EXPR_CALL_MEMBER:
+            case STMT_BC_RETURN_VALUE:
+            case STMT_BC_RETURN_VOID:
+            case STMT_BC_JUMP:
+            case STMT_BC_JUMP_IF_FALSE:
+            case STMT_BC_JUMP_IF_TRUE:
+                if (ins->op == STMT_BC_EXPR_POP && last_unboxed_no_stack) {
+                    last_unboxed_no_stack = 0;
+                    break;
+                }
+                if (!ps_unboxed_push(&out, *ins)) goto fail;
+                last_unboxed_no_stack = 0;
+                last_stack_numeric = 0;
+                break;
+            case STMT_BC_EXPR_LOAD_IDENT: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int slot = ps_unboxed_slot_index(func->slot_names, func->slot_count, name);
+                if (slot < 0) {
+                    if (!ps_unboxed_push(&out, *ins)) goto fail;
+                    last_unboxed_no_stack = 0;
+                    last_stack_numeric = 0;
+                    break;
+                }
+                if (!written[slot]) {
+                    if (!ps_unboxed_mark_used(used, used_list, &used_count, slot)) goto fail;
+                }
+                PSStmtBCInstr load = {0};
+                load.op = STMT_BC_UNBOX_LOAD_SLOT_D;
+                load.a = slot;
+                if (!ps_unboxed_push(&out, load)) goto fail;
+                last_unboxed_no_stack = 0;
+                last_stack_numeric = 1;
+                break;
+            }
+            case STMT_BC_EXPR_STORE_IDENT: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int slot = ps_unboxed_slot_index(func->slot_names, func->slot_count, name);
+                if (slot < 0) goto fail;
+                if (!last_stack_numeric) goto fail;
+                if (!written[slot]) {
+                    if (!ps_unboxed_mark_used(used, used_list, &used_count, slot)) goto fail;
+                }
+                PSStmtBCInstr store = {0};
+                store.op = STMT_BC_UNBOX_STORE_SLOT_D;
+                store.a = slot;
+                if (!ps_unboxed_push(&out, store)) goto fail;
+                ps_unboxed_write_mark(write_bits, slot);
+                written[slot] = 1;
+                last_unboxed_no_stack = 0;
+                last_stack_numeric = 0;
+                break;
+            }
+            case STMT_BC_EXPR_ADD_IDENT_CONST: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int slot = ps_unboxed_slot_index(func->slot_names, func->slot_count, name);
+                if (slot < 0) goto fail;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue v = bc->consts[ins->a];
+                if (v.type != PS_T_NUMBER) goto fail;
+                if (!written[slot]) {
+                    if (!ps_unboxed_mark_used(used, used_list, &used_count, slot)) goto fail;
+                }
+                PSStmtBCInstr add = {0};
+                add.op = STMT_BC_UNBOX_ADD_SLOT_D_CONST;
+                add.a = slot;
+                add.ptr = (void *)(intptr_t)slot;
+                add.ptr2 = (void *)(intptr_t)ins->a;
+                if (!ps_unboxed_push(&out, add)) goto fail;
+                ps_unboxed_write_mark(write_bits, slot);
+                written[slot] = 1;
+                last_unboxed_no_stack = 1;
+                last_stack_numeric = 0;
+                break;
+            }
+            case STMT_BC_EXPR_ADD_IDENT_IDENT: {
+                PSString *name_l = ps_identifier_string((PSAstNode *)ins->ptr);
+                PSString *name_r = ps_identifier_string((PSAstNode *)ins->ptr2);
+                int slot_l = ps_unboxed_slot_index(func->slot_names, func->slot_count, name_l);
+                int slot_r = ps_unboxed_slot_index(func->slot_names, func->slot_count, name_r);
+                if (slot_l < 0 || slot_r < 0) goto fail;
+                if (!written[slot_l]) {
+                    if (!ps_unboxed_mark_used(used, used_list, &used_count, slot_l)) goto fail;
+                }
+                if (!written[slot_r]) {
+                    if (!ps_unboxed_mark_used(used, used_list, &used_count, slot_r)) goto fail;
+                }
+                PSStmtBCInstr add = {0};
+                add.op = STMT_BC_UNBOX_ADD_SLOT_D_SLOT_D;
+                add.a = slot_l;
+                add.ptr = (void *)(intptr_t)slot_l;
+                add.ptr2 = (void *)(intptr_t)slot_r;
+                if (!ps_unboxed_push(&out, add)) goto fail;
+                ps_unboxed_write_mark(write_bits, slot_l);
+                written[slot_l] = 1;
+                last_unboxed_no_stack = 1;
+                last_stack_numeric = 0;
+                break;
+            }
+            case STMT_BC_JLT_IDENT_CONST: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int slot = ps_unboxed_slot_index(func->slot_names, func->slot_count, name);
+                if (slot < 0) goto fail;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue v = bc->consts[ins->a];
+                if (v.type != PS_T_NUMBER) goto fail;
+                if (!written[slot]) {
+                    if (!ps_unboxed_mark_used(used, used_list, &used_count, slot)) goto fail;
+                }
+                PSStmtBCInstr jlt = {0};
+                jlt.op = STMT_BC_UNBOX_JLT_SLOT_D_CONST;
+                jlt.a = ins->a;
+                jlt.ptr = (void *)(intptr_t)slot;
+                jlt.ptr2 = ins->ptr2;
+                if (!ps_unboxed_push(&out, jlt)) goto fail;
+                last_unboxed_no_stack = 1;
+                last_stack_numeric = 0;
+                break;
+            }
+            case STMT_BC_JBITAND_EQZ_IDENT_CONST: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int slot = ps_unboxed_slot_index(func->slot_names, func->slot_count, name);
+                if (slot < 0) goto fail;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue v = bc->consts[ins->a];
+                if (v.type != PS_T_NUMBER) goto fail;
+                if (!written[slot]) {
+                    if (!ps_unboxed_mark_used(used, used_list, &used_count, slot)) goto fail;
+                }
+                PSStmtBCInstr jbt = {0};
+                jbt.op = STMT_BC_UNBOX_JBITAND_EQZ_SLOT_D_CONST;
+                jbt.a = ins->a;
+                jbt.ptr = (void *)(intptr_t)slot;
+                jbt.ptr2 = ins->ptr2;
+                if (!ps_unboxed_push(&out, jbt)) goto fail;
+                last_unboxed_no_stack = 1;
+                last_stack_numeric = 0;
+                break;
+            }
+            case STMT_BC_JUMP_ADD_IDENT_CONST: {
+                PSString *name = ps_identifier_string((PSAstNode *)ins->ptr);
+                int slot = ps_unboxed_slot_index(func->slot_names, func->slot_count, name);
+                if (slot < 0) goto fail;
+                if (ins->a < 0 || (size_t)ins->a >= bc->const_count) goto fail;
+                PSValue v = bc->consts[ins->a];
+                if (v.type != PS_T_NUMBER) goto fail;
+                if (!written[slot]) {
+                    if (!ps_unboxed_mark_used(used, used_list, &used_count, slot)) goto fail;
+                }
+                PSStmtBCInstr add = {0};
+                add.op = STMT_BC_UNBOX_JUMP_ADD_SLOT_D_CONST;
+                add.a = ins->a;
+                add.ptr = (void *)(intptr_t)slot;
+                add.ptr2 = ins->ptr2;
+                if (!ps_unboxed_push(&out, add)) goto fail;
+                ps_unboxed_write_mark(write_bits, slot);
+                written[slot] = 1;
+                last_unboxed_no_stack = 1;
+                last_stack_numeric = 0;
+                break;
+            }
+            default:
+                goto fail;
+        }
+    }
+
+    for (size_t j = 0; j < out.count; j++) {
+        PSStmtBCInstr *ins = &out.code[j];
+        if (ins->op == STMT_BC_JUMP ||
+            ins->op == STMT_BC_JUMP_IF_FALSE ||
+            ins->op == STMT_BC_JUMP_IF_TRUE) {
+            if (ins->a >= 0 && (size_t)ins->a < old_count) {
+                ins->a = (int32_t)map[ins->a];
+            } else {
+                goto fail;
+            }
+        }
+        if (ins->op == STMT_BC_UNBOX_JLT_SLOT_D_CONST ||
+            ins->op == STMT_BC_UNBOX_JBITAND_EQZ_SLOT_D_CONST ||
+            ins->op == STMT_BC_UNBOX_JUMP_ADD_SLOT_D_CONST) {
+            int target = (int)(intptr_t)ins->ptr2;
+            if (target >= 0 && (size_t)target < old_count) {
+                ins->ptr2 = (void *)(intptr_t)map[target];
+            } else {
+                goto fail;
+            }
+        }
+    }
+
+    PSStmtBC *spec = (PSStmtBC *)calloc(1, sizeof(PSStmtBC));
+    if (!spec) goto fail;
+    spec->code = out.code;
+    spec->count = out.count;
+    spec->const_count = bc->const_count;
+    if (bc->const_count > 0) {
+        spec->consts = (PSValue *)malloc(sizeof(PSValue) * bc->const_count);
+        if (!spec->consts) {
+            free(spec);
+            goto fail;
+        }
+        memcpy(spec->consts, bc->consts, sizeof(PSValue) * bc->const_count);
+    } else {
+        spec->consts = NULL;
+    }
+    func->unboxed_used_count = used_count;
+    func->unboxed_guard_count = used_count;
+    for (size_t i = 0; i < PS_SPECIALIZATION_GUARD_MAX; i++) {
+        func->unboxed_guard_slots[i] = (i < used_count) ? used_list[i] : 0;
+        func->unboxed_used_slots[i] = (i < used_count) ? used_list[i] : 0;
+    }
+    for (size_t i = 0; i < (PS_SPECIALIZATION_SLOT_MAX + 31) / 32; i++) {
+        func->unboxed_write_bits[i] = write_bits[i];
+    }
+    free(map);
+    return spec;
+
+fail:
+    free(map);
+    free(out.code);
+    return NULL;
+}
+
+static void __attribute__((unused)) ps_unboxed_writeback(PSEnv *env, PSFunction *func, double *unboxed_d) {
+    if (!env || !func || !unboxed_d) return;
+    for (size_t i = 0; i < (PS_SPECIALIZATION_SLOT_MAX + 31) / 32; i++) {
+        uint32_t bits = func->unboxed_write_bits[i];
+        if (!bits) continue;
+        for (size_t b = 0; b < 32; b++) {
+            if ((bits & (1u << b)) == 0) continue;
+            int slot = (int)(i * 32 + b);
+            if (slot < 0 || slot >= (int)func->slot_count) continue;
+            PSString *name = func->slot_names[slot];
+            if (!name) continue;
+            PSValue v = ps_value_number(unboxed_d[slot]);
+            ps_env_set(env, name, v);
+        }
+    }
+}
+#endif
+
+/* --- Core execution engine (production path) -------------------------- */
 static PSValue ps_stmt_bc_execute(PSVM *vm, PSEnv *env, PSFunction *func, PSStmtBC *bc, PSEvalControl *ctl) {
     (void)func;
     if (!bc || !bc->code || bc->count == 0) return ps_value_undefined();
@@ -7430,7 +8331,137 @@ static PSValue ps_stmt_bc_execute(PSVM *vm, PSEnv *env, PSFunction *func, PSStmt
     size_t handler_cap = 8;
     int pending_throw = 0;
     PSValue pending_throw_value = ps_value_undefined();
+#if !PS_DISABLE_UNBOXED_SPEC
+    double unboxed_d[PS_SPECIALIZATION_SLOT_MAX];
+    PSValue unboxed_slot_values[PS_SPECIALIZATION_SLOT_MAX];
+    int unboxed_mode = 0;
+#endif
+#if !PS_DISABLE_UNBOXED_SPEC
+    if (func) {
+        func->unboxed_hot_count++;
+        if (func->unboxed_bc_state == 0 &&
+            func->unboxed_hot_count >= PS_HOT_THRESHOLD) {
+            PSStmtBC *spec = ps_stmt_bc_build_unboxed_spec(func, func->stmt_bc);
+            if (spec) {
+                func->unboxed_bc = spec;
+                func->unboxed_bc_state = 1;
+#if PS_ENABLE_PERF
+                if (ps_unboxed_dump_enabled()) {
+                    ps_stmt_bc_dump(spec, "UNBOXED_SPEC");
+                }
+#endif
+            } else {
+                func->unboxed_bc_state = 2;
+            }
+        }
+#if PS_ENABLE_PERF
+        if (func->unboxed_bc_state == 2) {
+            ps_unboxed_trace_log_once("build failed", &ps_unboxed_trace_fail_printed);
+        }
+#endif
+        if (func->unboxed_bc_state == 1 && func->unboxed_bc &&
+            func->slot_count > 0 &&
+            func->slot_count <= PS_SPECIALIZATION_SLOT_MAX) {
+            int guard_ok = 1;
+            for (uint8_t i = 0; i < func->unboxed_guard_count; i++) {
+                uint8_t slot = func->unboxed_guard_slots[i];
+                if (slot >= func->slot_count) {
+                    guard_ok = 0;
+                    break;
+                }
+                PSString *name = func->slot_names[slot];
+                int found = 0;
+                PSValue v = name ? ps_env_get(env, name, &found) : ps_value_undefined();
+                unboxed_slot_values[slot] = v;
+                if (v.type != PS_T_NUMBER) {
+                    guard_ok = 0;
+                    break;
+                }
+            }
+            if (guard_ok) {
+                for (uint8_t i = 0; i < func->unboxed_used_count; i++) {
+                    uint8_t slot = func->unboxed_used_slots[i];
+                    if (slot >= func->slot_count) continue;
+                    unboxed_d[slot] = unboxed_slot_values[slot].as.number;
+                }
+                unboxed_mode = 1;
+                bc = func->unboxed_bc;
+#if PS_ENABLE_PERF
+                ps_unboxed_trace_log_once("executed", &ps_unboxed_trace_exec_printed);
+#endif
+            }
+        }
+    }
+#endif
+#if !PS_DISABLE_SPECIALIZATION
+    PSValue slot_buf[PS_SPECIALIZATION_SLOT_MAX];
+    PSValue *slot_values = NULL;
+    size_t slot_count = 0;
+    int use_spec = 0;
+    if (func
+#if !PS_DISABLE_UNBOXED_SPEC
+        && !unboxed_mode
+#endif
+        ) {
+        func->spec_hot_count++;
+        if (func->spec_bc_state == 0 &&
+            func->spec_hot_count >= PS_HOT_THRESHOLD) {
+            PSStmtBC *spec = ps_stmt_bc_build_spec(func, func->stmt_bc,
+                                                  func->spec_guard_slots,
+                                                  &func->spec_guard_count);
+            if (spec) {
+                func->spec_bc = spec;
+                func->spec_bc_state = 1;
+            } else {
+                func->spec_bc_state = 2;
+            }
+        }
+#if PS_ENABLE_PERF
+        if (func->spec_bc_state == 2) {
+            ps_spec_trace_log_once("build failed", &ps_spec_trace_fail_printed);
+        }
+#endif
+        if (func->spec_bc_state == 1 && func->spec_bc &&
+            func->slot_count > 0 &&
+            func->slot_count <= PS_SPECIALIZATION_SLOT_MAX) {
+            PSString **slot_names = func->spec_slot_names ? func->spec_slot_names : func->slot_names;
+            size_t load_count = func->spec_slot_names ? func->spec_slot_count : func->slot_count;
+            if (slot_names && load_count > 0 && load_count <= PS_SPECIALIZATION_SLOT_MAX) {
+                slot_values = slot_buf;
+                slot_count = load_count;
+                for (size_t i = 0; i < slot_count; i++) {
+                    int found = 0;
+                    PSString *name = slot_names[i];
+                    slot_values[i] = name ? ps_env_get(env, name, &found) : ps_value_undefined();
+                }
+                use_spec = 1;
+                for (uint8_t i = 0; i < func->spec_guard_count; i++) {
+                    uint8_t slot = func->spec_guard_slots[i];
+                    if (slot >= slot_count || slot_values[slot].type != PS_T_NUMBER) {
+                        use_spec = 0;
+                        break;
+                    }
+                }
+                if (use_spec) {
+#if PS_ENABLE_PERF
+                    ps_spec_trace_log_once("executed", &ps_spec_trace_exec_printed);
+#endif
+                    bc = func->spec_bc;
+                }
+            }
+        }
+    }
+#endif
     size_t ip = 0;
+#if !PS_DISABLE_UNBOXED_SPEC
+#define UNBOXED_WRITEBACK() do { \
+        if (unboxed_mode && func && env) { \
+            ps_unboxed_writeback(env, func, unboxed_d); \
+        } \
+    } while (0)
+#else
+#define UNBOXED_WRITEBACK() do { } while (0)
+#endif
 #define UNWIND_ENVS() do { \
         while (env_sp > 0) { \
             PSEnv *prev = env_stack[--env_sp]; \
@@ -7505,7 +8536,35 @@ static PSValue ps_stmt_bc_execute(PSVM *vm, PSEnv *env, PSFunction *func, PSStmt
         &&op_bad,
 #endif
         &&op_return_value,
-        &&op_return_void
+        &&op_return_void,
+#if !PS_DISABLE_SPECIALIZATION
+        &&op_load_slot_num,
+        &&op_store_slot_num,
+        &&op_add_num
+#else
+        &&op_bad,
+        &&op_bad,
+        &&op_bad
+#endif
+#if !PS_DISABLE_UNBOXED_SPEC
+        ,
+        &&op_unbox_load_slot_d,
+        &&op_unbox_store_slot_d,
+        &&op_unbox_add_slot_d_slot_d,
+        &&op_unbox_add_slot_d_const,
+        &&op_unbox_jlt_slot_d_const,
+        &&op_unbox_jbitand_eqz_slot_d_const,
+        &&op_unbox_jump_add_slot_d_const
+#else
+        ,
+        &&op_bad,
+        &&op_bad,
+        &&op_bad,
+        &&op_bad,
+        &&op_bad,
+        &&op_bad,
+        &&op_bad
+#endif
     };
     PSStmtBCInstr *ins = NULL;
     #define DISPATCH() do { \
@@ -8601,6 +9660,7 @@ static PSValue ps_stmt_bc_execute(PSVM *vm, PSEnv *env, PSFunction *func, PSStmt
             if (sp == 0) goto fail;
             PSValue v = stack[--sp];
             ctl->did_return = 1;
+            UNBOXED_WRITEBACK();
             UNWIND_ENVS();
             FREE_HANDLER_STACK();
             if (stack != stack_buf) free(stack);
@@ -8608,10 +9668,96 @@ static PSValue ps_stmt_bc_execute(PSVM *vm, PSEnv *env, PSFunction *func, PSStmt
         }
         op_return_void:
             ctl->did_return = 1;
+            UNBOXED_WRITEBACK();
             UNWIND_ENVS();
             FREE_HANDLER_STACK();
             if (stack != stack_buf) free(stack);
             return ps_value_undefined();
+#if !PS_DISABLE_SPECIALIZATION
+        op_load_slot_num:
+            stack[sp++] = slot_values[ins->a];
+            ip++;
+            DISPATCH();
+        op_store_slot_num:
+            if (sp == 0) goto fail;
+            slot_values[ins->a] = stack[sp - 1];
+            ip++;
+            DISPATCH();
+        op_add_num: {
+            int lhs = (int)(intptr_t)ins->ptr;
+            PSValue left = slot_values[lhs];
+            PSValue right = ps_value_undefined();
+            if (ins->flags) {
+                int const_idx = (int)(intptr_t)ins->ptr2;
+                if (const_idx < 0 || (size_t)const_idx >= bc->const_count) goto fail;
+                right = bc->consts[const_idx];
+            } else {
+                int rhs = (int)(intptr_t)ins->ptr2;
+                right = slot_values[rhs];
+            }
+            PSValue out = ps_value_number(left.as.number + right.as.number);
+            slot_values[ins->a] = out;
+            stack[sp++] = out;
+            ip++;
+            DISPATCH();
+        }
+#endif
+#if !PS_DISABLE_UNBOXED_SPEC
+        op_unbox_load_slot_d:
+            stack[sp++] = ps_value_number(unboxed_d[ins->a]);
+            ip++;
+            DISPATCH();
+        op_unbox_store_slot_d:
+            if (sp == 0) goto fail;
+            unboxed_d[ins->a] = stack[sp - 1].as.number;
+            ip++;
+            DISPATCH();
+        op_unbox_add_slot_d_slot_d: {
+            int dst = ins->a;
+            int lhs = (int)(intptr_t)ins->ptr;
+            int rhs = (int)(intptr_t)ins->ptr2;
+            unboxed_d[dst] = unboxed_d[lhs] + unboxed_d[rhs];
+            ip++;
+            DISPATCH();
+        }
+        op_unbox_add_slot_d_const: {
+            int dst = ins->a;
+            int lhs = (int)(intptr_t)ins->ptr;
+            int const_idx = (int)(intptr_t)ins->ptr2;
+            unboxed_d[dst] = unboxed_d[lhs] + bc->consts[const_idx].as.number;
+            ip++;
+            DISPATCH();
+        }
+        op_unbox_jlt_slot_d_const: {
+            int slot = (int)(intptr_t)ins->ptr;
+            int const_idx = ins->a;
+            if (unboxed_d[slot] < bc->consts[const_idx].as.number) {
+                ip = (size_t)(intptr_t)ins->ptr2;
+            } else {
+                ip++;
+            }
+            DISPATCH();
+        }
+        op_unbox_jbitand_eqz_slot_d_const: {
+            int slot = (int)(intptr_t)ins->ptr;
+            int const_idx = ins->a;
+            int32_t ln = (int32_t)unboxed_d[slot];
+            int32_t rn = (int32_t)bc->consts[const_idx].as.number;
+            if ((ln & rn) != 0) {
+                ip = (size_t)(intptr_t)ins->ptr2;
+            } else {
+                ip++;
+            }
+            DISPATCH();
+        }
+        op_unbox_jump_add_slot_d_const: {
+            int slot = (int)(intptr_t)ins->ptr;
+            int const_idx = ins->a;
+            unboxed_d[slot] += bc->consts[const_idx].as.number;
+            ip = (size_t)(intptr_t)ins->ptr2;
+            DISPATCH();
+        }
+#endif
     }
 handle_throw:
     if (handler_sp == 0) goto fail;
@@ -8633,6 +9779,7 @@ handle_throw:
     }
     goto fail;
 fail:
+    UNBOXED_WRITEBACK();
     UNWIND_ENVS();
     FREE_HANDLER_STACK();
     if (stack != stack_buf) free(stack);
@@ -9718,6 +10865,7 @@ loop_top:
                 if (sp == 0) goto fail;
                 PSValue v = stack[--sp];
                 ctl->did_return = 1;
+                UNBOXED_WRITEBACK();
                 UNWIND_ENVS();
                 FREE_HANDLER_STACK();
                 if (stack != stack_buf) free(stack);
@@ -9725,10 +10873,96 @@ loop_top:
             }
             case STMT_BC_RETURN_VOID:
                 ctl->did_return = 1;
+                UNBOXED_WRITEBACK();
                 UNWIND_ENVS();
                 FREE_HANDLER_STACK();
                 if (stack != stack_buf) free(stack);
                 return ps_value_undefined();
+#if !PS_DISABLE_SPECIALIZATION
+            case STMT_BC_EXPR_LOAD_SLOT_NUM:
+                stack[sp++] = slot_values[ins->a];
+                ip++;
+                break;
+            case STMT_BC_EXPR_STORE_SLOT_NUM:
+                if (sp == 0) goto fail;
+                slot_values[ins->a] = stack[sp - 1];
+                ip++;
+                break;
+            case STMT_BC_EXPR_ADD_NUM: {
+                int lhs = (int)(intptr_t)ins->ptr;
+                PSValue left = slot_values[lhs];
+                PSValue right = ps_value_undefined();
+                if (ins->flags) {
+                    int const_idx = (int)(intptr_t)ins->ptr2;
+                    if (const_idx < 0 || (size_t)const_idx >= bc->const_count) goto fail;
+                    right = bc->consts[const_idx];
+                } else {
+                    int rhs = (int)(intptr_t)ins->ptr2;
+                    right = slot_values[rhs];
+                }
+                PSValue out = ps_value_number(left.as.number + right.as.number);
+                slot_values[ins->a] = out;
+                stack[sp++] = out;
+                ip++;
+                break;
+            }
+#endif
+#if !PS_DISABLE_UNBOXED_SPEC
+            case STMT_BC_UNBOX_LOAD_SLOT_D:
+                stack[sp++] = ps_value_number(unboxed_d[ins->a]);
+                ip++;
+                break;
+            case STMT_BC_UNBOX_STORE_SLOT_D:
+                if (sp == 0) goto fail;
+                unboxed_d[ins->a] = stack[sp - 1].as.number;
+                ip++;
+                break;
+            case STMT_BC_UNBOX_ADD_SLOT_D_SLOT_D: {
+                int dst = ins->a;
+                int lhs = (int)(intptr_t)ins->ptr;
+                int rhs = (int)(intptr_t)ins->ptr2;
+                unboxed_d[dst] = unboxed_d[lhs] + unboxed_d[rhs];
+                ip++;
+                break;
+            }
+            case STMT_BC_UNBOX_ADD_SLOT_D_CONST: {
+                int dst = ins->a;
+                int lhs = (int)(intptr_t)ins->ptr;
+                int const_idx = (int)(intptr_t)ins->ptr2;
+                unboxed_d[dst] = unboxed_d[lhs] + bc->consts[const_idx].as.number;
+                ip++;
+                break;
+            }
+            case STMT_BC_UNBOX_JLT_SLOT_D_CONST: {
+                int slot = (int)(intptr_t)ins->ptr;
+                int const_idx = ins->a;
+                if (unboxed_d[slot] < bc->consts[const_idx].as.number) {
+                    ip = (size_t)(intptr_t)ins->ptr2;
+                } else {
+                    ip++;
+                }
+                break;
+            }
+            case STMT_BC_UNBOX_JBITAND_EQZ_SLOT_D_CONST: {
+                int slot = (int)(intptr_t)ins->ptr;
+                int const_idx = ins->a;
+                int32_t ln = (int32_t)unboxed_d[slot];
+                int32_t rn = (int32_t)bc->consts[const_idx].as.number;
+                if ((ln & rn) != 0) {
+                    ip = (size_t)(intptr_t)ins->ptr2;
+                } else {
+                    ip++;
+                }
+                break;
+            }
+            case STMT_BC_UNBOX_JUMP_ADD_SLOT_D_CONST: {
+                int slot = (int)(intptr_t)ins->ptr;
+                int const_idx = ins->a;
+                unboxed_d[slot] += bc->consts[const_idx].as.number;
+                ip = (size_t)(intptr_t)ins->ptr2;
+                break;
+            }
+#endif
             default:
                 goto fail;
         }
@@ -9757,6 +10991,7 @@ handle_throw:
     if (stack != stack_buf) free(stack);
     return ps_value_undefined();
 fail:
+    UNBOXED_WRITEBACK();
     UNWIND_ENVS();
     FREE_HANDLER_STACK();
     if (stack != stack_buf) free(stack);

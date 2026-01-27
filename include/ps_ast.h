@@ -62,6 +62,7 @@ typedef struct PSAstNode PSAstNode;
 struct PSObject;
 struct PSProperty;
 struct PSEnv;
+struct PSExprBC;
 
 /* --------------------------------------------------------- */
 /* AST node definition                                       */
@@ -72,6 +73,8 @@ struct PSAstNode {
     size_t line;
     size_t column;
     const char *source_path;
+    struct PSExprBC *expr_bc;
+    uint8_t expr_bc_state;
 
     union {
         /* Program / Block */
@@ -267,6 +270,16 @@ struct PSAstNode {
             PSAstNode **args;
             size_t      argc;
             uint8_t     fast_num_math_id;
+            uint8_t     cache_kind;
+            struct PSEnv *cache_env;
+            struct PSEnv *cache_fast_env;
+            size_t      cache_fast_index;
+            struct PSObject *cache_record;
+            struct PSProperty *cache_prop;
+            uint32_t    cache_shape;
+            struct PSObject *cache_obj;
+            struct PSProperty *cache_member_prop;
+            uint32_t    cache_member_shape;
         } call;
 
         /* member access: obj.prop */

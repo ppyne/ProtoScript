@@ -88,7 +88,11 @@ struct PSString *ps_value_to_string(const PSValue *v) {
             } else if (isinf(v->as.number)) {
                 snprintf(buf, sizeof(buf), "%sInfinity", v->as.number < 0 ? "-" : "");
             } else {
-                snprintf(buf, sizeof(buf), "%.15g", v->as.number);
+                double num = v->as.number;
+                if (num == 0.0 && signbit(num)) {
+                    num = 0.0;
+                }
+                snprintf(buf, sizeof(buf), "%.15g", num);
             }
             return ps_string_from_cstr(buf);
         }

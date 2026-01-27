@@ -14,6 +14,7 @@
 #include "ps_buffer.h"
 #include "ps_display.h"
 #include "ps_config.h"
+#include "ps_stmt_bc.h"
 #if PS_ENABLE_MODULE_IMG
 #include "ps_img.h"
 #endif
@@ -275,6 +276,16 @@ static void ps_gc_mark_ast_node(PSVM *vm, PSAstNode *node) {
             for (size_t i = 0; i < node->as.call.argc; i++) {
                 ps_gc_mark_ast_node(vm, node->as.call.args[i]);
             }
+            node->as.call.cache_kind = 0;
+            node->as.call.cache_env = NULL;
+            node->as.call.cache_fast_env = NULL;
+            node->as.call.cache_fast_index = 0;
+            node->as.call.cache_record = NULL;
+            node->as.call.cache_prop = NULL;
+            node->as.call.cache_shape = 0;
+            node->as.call.cache_obj = NULL;
+            node->as.call.cache_member_prop = NULL;
+            node->as.call.cache_member_shape = 0;
             break;
         case AST_MEMBER:
             node->as.member.cache_obj = NULL;
@@ -609,6 +620,9 @@ static void ps_gc_finalize_function(PSFunction *fn) {
     fn->fast_count = 0;
     free(fn->fast_param_index);
     fn->fast_param_index = NULL;
+    free(fn->fast_local_index);
+    fn->fast_local_index = NULL;
+    fn->fast_local_index_count = 0;
     fn->fast_local_count = 0;
     fn->fast_this_index = 0;
     free(fn->fast_num_inits);
@@ -617,8 +631,16 @@ static void ps_gc_finalize_function(PSFunction *fn) {
     fn->fast_num_names = NULL;
     fn->fast_num_count = 0;
     fn->fast_num_return = NULL;
+    fn->fast_num_if_cond = NULL;
+    fn->fast_num_if_return = NULL;
+    free(fn->fast_num_ops);
+    fn->fast_num_ops = NULL;
+    fn->fast_num_ops_count = 0;
     fn->fast_env = NULL;
     fn->fast_env_in_use = 0;
+    ps_stmt_bc_free(fn->stmt_bc);
+    fn->stmt_bc = NULL;
+    fn->stmt_bc_state = 0;
     /* Function references are owned by AST or env; nothing to free here. */
 }
 

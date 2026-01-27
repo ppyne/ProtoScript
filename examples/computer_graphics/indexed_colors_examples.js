@@ -11,7 +11,7 @@ f.close();
 var img = Image.decodeJPEG(buf);
 
 Io.stderr.write("indexed_colors_examples: indexedColor start\n");
-var out = CG.indexedColor(img, 16, "ada", "FloydSteinberg", false);
+var out = CG.indexedColor(img, 256, "ada", "FloydSteinberg", false);
 Io.stderr.write("indexed_colors_examples: indexedColor done\n");
 
 var png = Image.encodePNG(out);

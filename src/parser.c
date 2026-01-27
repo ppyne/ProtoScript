@@ -17,6 +17,7 @@
 typedef struct {
     PSLexer  lexer;
     PSToken current;
+    PSToken prev;
     const char *source_path;
     struct PSIncludeStack *include_stack;
     int context_level;
@@ -126,6 +127,7 @@ static PSAstNode *set_pos_from_node(PSAstNode *node, PSAstNode *source) {
 /* --------------------------------------------------------- */
 
 static void advance(PSParser *p) {
+    p->prev = p->current;
     p->current = ps_lexer_next(&p->lexer);
     if (p->lexer.error) {
         parse_error(p->lexer.error_msg ? p->lexer.error_msg : "Parse error");
@@ -243,6 +245,26 @@ static void expect(PSParser *p, PSTokenType type, const char *msg) {
         snprintf(buf, sizeof(buf), "Parse error: expected %s but found %s", msg, got);
         parse_error(buf);
     }
+}
+
+static int can_insert_semi(PSParser *p) {
+    if (p->current.type == TOK_EOF || p->current.type == TOK_RBRACE) {
+        return 1;
+    }
+    if (p->prev.line < p->current.line) {
+        return 1;
+    }
+    return 0;
+}
+
+static void expect_semi(PSParser *p) {
+    if (match(p, TOK_SEMI)) {
+        return;
+    }
+    if (can_insert_semi(p)) {
+        return;
+    }
+    expect(p, TOK_SEMI, "';'");
 }
 
 static int hex_value(unsigned char c) {
@@ -598,6 +620,7 @@ static PSAstNode *parse_include_statement(PSParser *p, PSToken include_tok);
 
 static PSAstNode *parse_source_with_path(const char *source, const char *path, PSIncludeStack *stack) {
     PSParser p;
+    memset(&p, 0, sizeof(p));
     ps_lexer_init(&p.lexer, source);
     p.source_path = intern_source_path(path);
     p.include_stack = stack;
@@ -742,6 +765,13 @@ static PSAstNode *parse_statement(PSParser *p) {
         p->saw_non_include = 1;
     }
 
+    /* empty statement */
+    if (p->current.type == TOK_SEMI) {
+        PSToken tok = p->current;
+        advance(p);
+        return set_pos(ps_ast_expr_stmt(ps_ast_literal(ps_value_undefined())), tok);
+    }
+
     /* label */
     if (p->current.type == TOK_IDENTIFIER) {
         PSParser saved = *p;
@@ -788,7 +818,7 @@ static PSAstNode *parse_statement(PSParser *p) {
         PSToken tok = p->current;
         advance(p);
         PSAstNode *decls = parse_var_decl_list(p);
-        expect(p, TOK_SEMI, "';'");
+        expect_semi(p);
         return set_pos(decls, tok);
     }
 
@@ -861,7 +891,7 @@ static PSAstNode *parse_statement(PSParser *p) {
         expect(p, TOK_LPAREN, "'('");
         PSAstNode *cond = parse_expression(p);
         expect(p, TOK_RPAREN, "')'");
-        expect(p, TOK_SEMI, "';'");
+        expect_semi(p);
         return set_pos(ps_ast_do_while(body, cond), tok);
     }
 
@@ -952,7 +982,7 @@ static PSAstNode *parse_statement(PSParser *p) {
             advance(p);
             label = parse_identifier_token(id);
         }
-        expect(p, TOK_SEMI, "';'");
+        expect_semi(p);
         return set_pos(ps_ast_break(label), tok);
     }
 
@@ -966,7 +996,7 @@ static PSAstNode *parse_statement(PSParser *p) {
             advance(p);
             label = parse_identifier_token(id);
         }
-        expect(p, TOK_SEMI, "';'");
+        expect_semi(p);
         return set_pos(ps_ast_continue(label), tok);
     }
 
@@ -992,7 +1022,7 @@ static PSAstNode *parse_statement(PSParser *p) {
         if (p->current.type != TOK_SEMI) {
             expr = parse_expression(p);
         }
-        expect(p, TOK_SEMI, "';'");
+        expect_semi(p);
         return set_pos(ps_ast_return(expr), tok);
     }
 
@@ -1001,7 +1031,7 @@ static PSAstNode *parse_statement(PSParser *p) {
         PSToken tok = p->current;
         advance(p);
         PSAstNode *expr = parse_expression(p);
-        expect(p, TOK_SEMI, "';'");
+        expect_semi(p);
         return set_pos(ps_ast_throw(expr), tok);
     }
 
@@ -1043,7 +1073,7 @@ static PSAstNode *parse_statement(PSParser *p) {
 
     /* expression statement */
     PSAstNode *expr = parse_expression(p);
-    expect(p, TOK_SEMI, "';'");
+    expect_semi(p);
     return set_pos_from_node(ps_ast_expr_stmt(expr), expr);
 }
 

@@ -20,6 +20,7 @@ typedef struct PSEnv {
     PSString    **param_names;
     size_t        param_count;
     int           param_names_owned;
+    int           is_with;
 } PSEnv;
 
 PSEnv  *ps_env_new(PSEnv *parent, PSObject *record, int owns_record);

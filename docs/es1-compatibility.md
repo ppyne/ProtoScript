@@ -112,10 +112,10 @@ From `docs/es1-notes.md` plus current implementation checks:
 Implemented:
 - `undefined`
 - `NaN`
+- `Infinity`
 
 Notes:
-- `Infinity` is supported when parsing numbers (e.g. `Number("Infinity")`), but
-  there is no global `Infinity` property yet.
+None.
 
 ### 4.2 Global functions
 
@@ -157,6 +157,11 @@ Boolean:
 
 Number:
 - `Number(value)`
+- `Number.MAX_VALUE`
+- `Number.MIN_VALUE`
+- `Number.NaN`
+- `Number.POSITIVE_INFINITY`
+- `Number.NEGATIVE_INFINITY`
 - `Number.prototype.toString`
 - `Number.prototype.valueOf`
 - `Number.prototype.toFixed`

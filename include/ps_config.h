@@ -3,9 +3,17 @@
 
 /* Compile-time feature flags (0 = disabled, 1 = enabled) */
 
-#define PS_ENABLE_WITH 0
-#define PS_ENABLE_EVAL 0
-#define PS_ENABLE_ARGUMENTS_ALIASING 0
+#ifndef PS_ENABLE_WITH
+#define PS_ENABLE_WITH 1
+#endif
+
+#ifndef PS_ENABLE_EVAL
+#define PS_ENABLE_EVAL 1
+#endif
+
+#ifndef PS_ENABLE_ARGUMENTS_ALIASING
+#define PS_ENABLE_ARGUMENTS_ALIASING 1
+#endif
 
 #ifndef PS_ENABLE_UNICODE_IDENTIFIERS
 #define PS_ENABLE_UNICODE_IDENTIFIERS 1

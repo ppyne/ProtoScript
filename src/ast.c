@@ -1,4 +1,5 @@
 #include "ps_ast.h"
+#include "ps_expr_bc.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -11,6 +12,8 @@ static PSAstNode *alloc_node(PSAstKind kind) {
     PSAstNode *n = (PSAstNode *)calloc(1, sizeof(PSAstNode));
     if (!n) return NULL;
     n->kind = kind;
+    n->expr_bc = NULL;
+    n->expr_bc_state = 0;
     return n;
 }
 
@@ -311,6 +314,12 @@ PSAstNode *ps_ast_object_literal(PSAstProperty *props, size_t count) {
 
 void ps_ast_free(PSAstNode *node) {
     if (!node) return;
+
+    if (node->expr_bc) {
+        ps_expr_bc_free(node->expr_bc);
+        node->expr_bc = NULL;
+        node->expr_bc_state = 0;
+    }
 
     switch (node->kind) {
         case AST_PROGRAM:

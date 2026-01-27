@@ -275,14 +275,45 @@ PSToken ps_lexer_next(PSLexer *lx) {
     if (c == '"' || c == '\'') {
         char quote = c;
         start = lx->src + lx->pos;
+        size_t start_line = line;
+        size_t start_column = column;
+        int closed = 0;
         while (peek(lx)) {
-            if (peek(lx) == quote) break;
-            if (peek(lx) == '\\') {
+            char ch = peek(lx);
+            if (ch == quote) {
+                closed = 1;
+                break;
+            }
+            if (ch == '\n' || ch == '\r') {
+                break;
+            }
+            if (ch == '\\') {
                 advance(lx);
-                if (peek(lx)) advance(lx);
+                ch = peek(lx);
+                if (ch == '\r') {
+                    advance(lx);
+                    if (peek(lx) == '\n') {
+                        advance(lx);
+                    }
+                    continue;
+                }
+                if (ch == '\n') {
+                    advance(lx);
+                    continue;
+                }
+                if (peek(lx)) {
+                    advance(lx);
+                }
                 continue;
             }
             advance(lx);
+        }
+        if (!closed) {
+            lx->error = 1;
+            lx->error_msg = "Parse error: unterminated string";
+            lx->error_line = start_line;
+            lx->error_column = start_column;
+            return make_token(TOK_STRING, start, 0, start_line, start_column);
         }
         size_t len = lx->src + lx->pos - start;
         match(lx, quote);

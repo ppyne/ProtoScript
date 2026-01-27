@@ -90,6 +90,9 @@ $(BIN): $(OBJ)
 test: $(BIN)
 	./tests/run-tests.sh
 
+test262: $(BIN)
+	./test262/test262.sh
+
 web: $(WEB_OUT)
 
 $(WEB_OUT): $(WEB_SRCS)
@@ -110,4 +113,4 @@ image-deps:
 clean:
 	rm -f $(OBJ) $(BIN)
 
-.PHONY: all test clean web web-clean image-deps
+.PHONY: all test test262 clean web web-clean image-deps

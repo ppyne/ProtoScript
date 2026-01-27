@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
+#include <float.h>
 #include <string.h>
 #include <ctype.h>
 #include <stdint.h>
@@ -771,7 +772,8 @@ static PSValue ps_native_parse_int(PSVM *vm, PSValue this_val, int argc, PSValue
 
 static PSValue ps_native_escape(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
     (void)this_val;
-    PSString *s = (argc > 0) ? ps_to_string(vm, argv[0]) : ps_string_from_cstr("");
+    PSValue arg = (argc > 0 && argv) ? argv[0] : ps_value_undefined();
+    PSString *s = ps_to_string(vm, arg);
     if (!s || s->glyph_count == 0) {
         return ps_value_string(ps_string_from_cstr(""));
     }
@@ -848,7 +850,8 @@ static PSValue ps_native_escape(PSVM *vm, PSValue this_val, int argc, PSValue *a
 
 static PSValue ps_native_unescape(PSVM *vm, PSValue this_val, int argc, PSValue *argv) {
     (void)this_val;
-    PSString *s = (argc > 0) ? ps_to_string(vm, argv[0]) : ps_string_from_cstr("");
+    PSValue arg = (argc > 0 && argv) ? argv[0] : ps_value_undefined();
+    PSString *s = ps_to_string(vm, arg);
     if (!s || s->byte_len == 0) {
         return ps_value_string(ps_string_from_cstr(""));
     }
@@ -3264,7 +3267,7 @@ static PSValue ps_native_array_join(PSVM *vm, PSValue this_val, int argc, PSValu
         return ps_value_string(ps_string_from_cstr(""));
     }
     PSString *sep = ps_string_from_cstr(",");
-    if (argc > 0) {
+    if (argc > 0 && argv && argv[0].type != PS_T_UNDEFINED) {
         sep = ps_to_string(vm, argv[0]);
     }
     size_t len = ps_object_length(this_val.as.object);
@@ -3440,10 +3443,19 @@ static PSValue ps_native_array_slice(PSVM *vm, PSValue this_val, int argc, PSVal
     }
     PSObject *obj = this_val.as.object;
     size_t len = ps_object_length(obj);
-    double start_num = (argc > 0) ? ps_to_number(vm, argv[0]) : 0.0;
-    double end_num = (argc > 1) ? ps_to_number(vm, argv[1]) : (double)len;
+    double start_num = 0.0;
+    if (argc > 0 && argv) {
+        start_num = ps_to_number(vm, argv[0]);
+        if (argv[0].type == PS_T_UNDEFINED) start_num = 0.0;
+    }
+    double end_num = (double)len;
+    if (argc > 1 && argv) {
+        if (argv[1].type != PS_T_UNDEFINED) {
+            end_num = ps_to_number(vm, argv[1]);
+        }
+    }
     if (isnan(start_num)) start_num = 0.0;
-    if (isnan(end_num)) end_num = (double)len;
+    if (isnan(end_num)) end_num = 0.0;
     if (start_num < 0.0) start_num = (double)len + start_num;
     if (end_num < 0.0) end_num = (double)len + end_num;
     if (start_num < 0.0) start_num = 0.0;
@@ -3618,7 +3630,11 @@ static PSValue ps_native_array_splice(PSVM *vm, PSValue this_val, int argc, PSVa
     }
     PSObject *obj = this_val.as.object;
     size_t len = ps_object_length(obj);
-    double start_num = (argc > 0) ? ps_to_number(vm, argv[0]) : 0.0;
+    double start_num = 0.0;
+    if (argc > 0 && argv) {
+        start_num = ps_to_number(vm, argv[0]);
+        if (argv[0].type == PS_T_UNDEFINED) start_num = 0.0;
+    }
     if (isnan(start_num)) start_num = 0.0;
     if (start_num < 0.0) start_num = (double)len + start_num;
     if (start_num < 0.0) start_num = 0.0;
@@ -3628,7 +3644,10 @@ static PSValue ps_native_array_splice(PSVM *vm, PSValue this_val, int argc, PSVa
     if (argc < 2) {
         delete_count = len - start;
     } else {
-        double del_num = ps_to_number(vm, argv[1]);
+        double del_num = 0.0;
+        if (argv[1].type != PS_T_UNDEFINED) {
+            del_num = ps_to_number(vm, argv[1]);
+        }
         if (isnan(del_num) || del_num < 0.0) del_num = 0.0;
         if (del_num > (double)(len - start)) del_num = (double)(len - start);
         delete_count = (size_t)del_num;
@@ -6024,6 +6043,10 @@ void ps_vm_init_builtins(PSVM *vm) {
                          ps_string_from_cstr("NaN"),
                          ps_value_number(NAN),
                          PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+        ps_object_define(vm->global,
+                         ps_string_from_cstr("Infinity"),
+                         ps_value_number(INFINITY),
+                         PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
     }
 
     PSObject *is_finite_fn = ps_function_new_native(ps_native_is_finite);
@@ -6426,6 +6449,26 @@ void ps_vm_init_builtins(PSVM *vm) {
     if (number_ctor) {
         ps_function_setup(number_ctor, vm->function_proto, vm->object_proto, vm->number_proto);
         ps_define_function_props(number_ctor, "Number", 1);
+        ps_object_define(number_ctor,
+                         ps_string_from_cstr("MAX_VALUE"),
+                         ps_value_number(DBL_MAX),
+                         PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+        ps_object_define(number_ctor,
+                         ps_string_from_cstr("MIN_VALUE"),
+                         ps_value_number(DBL_MIN),
+                         PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+        ps_object_define(number_ctor,
+                         ps_string_from_cstr("NaN"),
+                         ps_value_number(NAN),
+                         PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+        ps_object_define(number_ctor,
+                         ps_string_from_cstr("POSITIVE_INFINITY"),
+                         ps_value_number(INFINITY),
+                         PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
+        ps_object_define(number_ctor,
+                         ps_string_from_cstr("NEGATIVE_INFINITY"),
+                         ps_value_number(-INFINITY),
+                         PS_ATTR_DONTENUM | PS_ATTR_READONLY | PS_ATTR_DONTDELETE);
         if (vm->number_proto) {
             ps_object_define(vm->number_proto,
                              ps_string_from_cstr("constructor"),

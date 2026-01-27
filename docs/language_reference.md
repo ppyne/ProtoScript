@@ -91,6 +91,7 @@ Rules:
 
 - `undefined` (read-only)
 - `NaN` (read-only)
+- `Infinity` (read-only)
 
 ### 5.1 Global functions
 

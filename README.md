@@ -1,5 +1,8 @@
 ## ProtoScript became ProtoScript2 [github.com/ppyne/ProtoScript2](https://github.com/ppyne/ProtoScript2)
 
+### This repository is no longer maintained.
+
+---
 
 ![ProtoScript](header.png)
 
